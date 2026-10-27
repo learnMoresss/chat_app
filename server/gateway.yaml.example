@@ -1,0 +1,33 @@
+# 复制为 gateway.yaml（或设 GATEWAY_CONFIG 指向该文件）。
+# 第一批：配置文件驱动；网页管理台第二批再做。
+
+workers:
+  - id: local
+    name: 本机算力
+    base_url: http://127.0.0.1:9108
+    token: dev-worker-token
+    enabled: true
+
+# 哪些能力开放给用户（第一批全员可用）
+grants:
+  - capability: echo
+    mode: all          # all | admins | users
+    user_ids: []
+    daily_limit: 100
+  - capability: media.download
+    mode: all
+    user_ids: []
+    daily_limit: 20
+  - capability: video.understand
+    mode: all
+    user_ids: []
+    daily_limit: 10
+
+# 远程 API 实例预留（第一批不调度，仅占位）
+remote_instances: []
+  # - id: cloud-asr
+  #   capability: asr
+  #   kind: openai_compatible
+  #   base_url: https://example.com/v1
+  #   api_key: ""
+  #   enabled: false

@@ -1,0 +1,25 @@
+id: video-mage
+name: Mage-VL 视频理解
+version: "0.1.0"
+capabilities:
+  - video.understand
+  - vision
+runtime: process
+command:
+  - "{python}"
+  - main.py
+  - --host
+  - "127.0.0.1"
+  - --port
+  - "{port}"
+  - --token
+  - "{token}"
+health_path: /health
+manifest_path: /manifest
+unload_path: /unload
+# 抽帧兜底阶段不占 GPU；切到 Mage-VL 后改回 ~20000 + heavy
+vram_mb: 0
+max_concurrency: 1
+idle_tier: light
+idle_ttl_seconds: 600
+cold_start_seconds: 3

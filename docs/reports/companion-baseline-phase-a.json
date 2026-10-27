@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-10-26T04:20:04.334Z",
+  "dsh_lock": "@deepseek-ai/dsh@0.2.1-rc.3",
+  "product_budget_soft_limit": 16384,
+  "findings": [
+    "续聊路径 buildTurnPrompt(isNew=false) 只推本轮+可选 instructions，避免每轮重放完整历史。",
+    "新会话仍可能塞 history.slice(-20)+system；产品侧 ContextBudgeter 限制近文 6 轮 + 记忆 1.2k。",
+    "chat_app 已收敛为单一装配：记忆只进 instructions；system include_memory_in_system=false。"
+  ],
+  "measurements": {
+    "new_session_prompt_chars": 801,
+    "new_session_approx_tokens": 380,
+    "resume_prompt_chars": 163,
+    "resume_prompt_approx_tokens": 94,
+    "history_lines_in_new": 20,
+    "estimate_marked": true
+  },
+  "companion_plugin": {
+    "path": "packages/product-companion/src/index.js",
+    "registered_in": "profiles/companion.product.patch.yml",
+    "snapshot_api": "/api/v1/companion/personas/{id}/snapshot"
+  },
+  "status": {
+    "phase_a": "done",
+    "phase_b_single_assembly": "done",
+    "live_dsh_turn": "requires_gateway"
+  }
+}

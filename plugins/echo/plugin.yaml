@@ -1,0 +1,23 @@
+id: echo
+name: 回声示例
+version: "0.1.0"
+capabilities:
+  - echo
+runtime: process
+command:
+  - "{python}"
+  - main.py
+  - --host
+  - "127.0.0.1"
+  - --port
+  - "{port}"
+  - --token
+  - "{token}"
+health_path: /health
+manifest_path: /manifest
+unload_path: /unload
+vram_mb: 0
+max_concurrency: 4
+idle_tier: light
+idle_ttl_seconds: 600
+cold_start_seconds: 2

@@ -1,0 +1,21 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: #f1f5f9;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Ant Header 默认 height/line-height:64 会把多行标题挤叠在一起 */
+.ant-layout-header {
+  height: auto !important;
+  line-height: normal !important;
+}

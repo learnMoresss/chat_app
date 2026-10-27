@@ -1,0 +1,55 @@
+# 在 AI 主机上跑 DSH；本机只写 packages/ + profiles/ 再 push。
+# 首次：把 joy 加入 docker 组后 relogin：sudo usermod -aG docker joy
+#
+#   cd /path/to/chat_app/dsh-product
+#   docker compose -f docker/compose.yml up -d --build
+
+name: chat-dsh
+
+services:
+  dsh:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: chat-app-dsh:0.2.1-rc.3
+    restart: unless-stopped
+    environment:
+      PRODUCT_ROOT: /app
+      DSH_HOME: /dsh-home
+      # 密钥优先读 volume 内 .credentials.yaml；也可用 env 注入
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      CHAT_APP_PRODUCT_DB: /dsh-home/product-chat.sqlite
+    volumes:
+      # 插件热更新：本机 rsync packages/ 后重启容器即可（不必 rebuild）
+      - ../packages:/app/packages:ro
+      - ../profiles:/app/profiles:ro
+      - ../scripts:/app/scripts:ro
+      - dsh_home:/dsh-home
+    # 默认挂起 companion 进程；gateway/smoke 用 docker compose run
+    command: ["companion", "--dump-config"]
+    # dump-config 只验证组装；常驻服务后续改成 gateway 进程
+    profiles: ["verify"]
+
+  # P0 冒烟：在服务器容器内跑，不占用本机算力
+  smoke:
+    image: chat-app-dsh:0.2.1-rc.3
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      PRODUCT_ROOT: /app
+      DSH_HOME: /dsh-home
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      P0_PROVIDER: deepseek-official
+      P0_MODEL: deepseek-flash
+    volumes:
+      - ../packages:/app/packages:ro
+      - ../profiles:/app/profiles:ro
+      - ../scripts:/app/scripts:ro
+      - dsh_home:/dsh-home
+    entrypoint: ["tini", "--", "node", "/app/scripts/p0-smoke.mjs"]
+    command: ["run"]
+    profiles: ["smoke"]
+
+volumes:
+  dsh_home:

@@ -1,0 +1,19 @@
+{
+  "name": "chat-app-dsh-product",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "scripts": {
+    "dsh": "dsh",
+    "dsh:version": "dsh --help",
+    "smoke": "node scripts/p0-smoke.mjs",
+    "turn": "node packages/product-gateway/src/p0-turn.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-sdk-client": "^0.2.1-rc.3",
+    "better-sqlite3": "^13.0.3"
+  }
+}

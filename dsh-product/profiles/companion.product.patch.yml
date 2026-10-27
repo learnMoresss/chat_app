@@ -1,0 +1,35 @@
+# Product overlay for companion (sdk-based) profile.
+# 插件路径相对 PRODUCT_ROOT（Docker 默认 /app；本机可 export PRODUCT_ROOT=本仓库 dsh-product）。
+# P0 模型：deepseek-official + 产品渠道 DEEPSEEK_API_KEY（挂进 $DSH_HOME/.credentials.yaml）。
+
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-flash
+
+# 闲聊人设：产品提示会再覆盖；此处避免 coding-agent 默认腔
+- id: system-prompt
+  config:
+    personaPrefix: >-
+      你在和一个熟人微信私聊。口语短句，可接话反问；不要助手腔，不要
+      emoji/颜文字，不要 Markdown，不要说自己是 AI 或「有什么可以帮你」。
+
+- insert:
+    - id: product-chat
+      name: !!js >-
+        String(process.getBuiltinModule('node:path').resolve(
+          process.env.PRODUCT_ROOT || '/app',
+          'packages/product-chat/src/index.js'
+        ))
+    - id: product-devices
+      name: !!js >-
+        String(process.getBuiltinModule('node:path').resolve(
+          process.env.PRODUCT_ROOT || '/app',
+          'packages/product-devices/src/index.js'
+        ))
+    - id: product-companion
+      name: !!js >-
+        String(process.getBuiltinModule('node:path').resolve(
+          process.env.PRODUCT_ROOT || '/app',
+          'packages/product-companion/src/index.js'
+        ))

@@ -1,0 +1,79 @@
+# DSH upstream checkout (pin via gh; do not commit the tree)
+/vendor/deepseek-harness/
+/vendor/
+
+# Secrets & local runtime
+server/.env
+server/.env.*
+!server/.env.example
+server/gateway.yaml
+server/data/
+**/*.pem
+**/*.p12
+**/mapkey
+**/secrets/
+
+# Python
+**/__pycache__/
+*.py[cod]
+*$py.class
+.Python
+**/.venv/
+**/venv/
+
+# Node
+**/node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Flutter / Dart
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+app.*.symbols
+app.*.map.json
+/android/app/debug
+/android/app/profile
+/android/app/release
+.widget_preview/
+*.class
+*.log
+*.swp
+
+# Native / IDE
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+*.iml
+*.ipr
+*.iws
+.idea/
+# .vscode/
+
+# Android / iOS local
+android/.gradle/
+android/local.properties
+android/**/Captured*
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+macos/Flutter/ephemeral/
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+
+# Project scratch
+/tmp/
+/output/
+.DS_Store
+**/.DS_Store

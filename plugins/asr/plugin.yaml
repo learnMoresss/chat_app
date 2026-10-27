@@ -1,0 +1,24 @@
+id: asr
+name: 语音识别
+version: "0.1.0"
+capabilities:
+  - asr
+runtime: process
+command:
+  - "{python}"
+  - main.py
+  - --host
+  - "127.0.0.1"
+  - --port
+  - "{port}"
+  - --token
+  - "{token}"
+health_path: /health
+manifest_path: /manifest
+unload_path: /unload
+vram_mb: 0
+max_concurrency: 2
+idle_tier: light
+idle_ttl_seconds: 600
+cold_start_seconds: 5
+# stub 阶段不占显卡；挂上真实模型后再改回 medium / 4096

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>管理台 · 未读</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/web/styles.css" />
+</head>
+<body>
+  <div id="loginPage" class="login-shell">
+    <aside class="login-brand" aria-hidden="true">
+      <div class="login-brand-inner">
+        <div class="mark">己</div>
+        <p class="brand-name">未读</p>
+        <p class="brand-line">人设 · 记忆 · 渠道 · 提取 · 用量</p>
+      </div>
+    </aside>
+    <main class="login-main">
+      <form class="login-panel" id="loginForm" autocomplete="on">
+        <h1>管理台</h1>
+        <p class="lede">与 App 共用后端。登录后配置聊天对象与提取档案。</p>
+
+        <label for="baseUrl">后端地址</label>
+        <input id="baseUrl" name="baseUrl" type="url" placeholder="留空＝当前站点" />
+
+        <label for="username">用户名</label>
+        <input id="username" name="username" autocomplete="username" required />
+
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+
+        <label class="check">
+          <input type="checkbox" id="rememberMe" checked />
+          <span>记住登录（下次自动进入）</span>
+        </label>
+
+        <button class="btn btn-block" type="submit" id="loginBtn">登录</button>
+        <p class="err" id="loginErr" role="alert"></p>
+      </form>
+    </main>
+  </div>
+
+  <div id="adminPage" class="admin hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">己</span>
+        <div>
+          <strong>未读</strong>
+          <small id="sideVer">管理台</small>
+        </div>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <button type="button" data-page="overview" class="active">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4V4zm9 0h7v5h-7V4zM4 13h7v7H4v-7zm9 3h7v4h-7v-4z"/></svg>
+          总览
+        </button>
+        <button type="button" data-page="partner">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4zm0 2c-4.4 0-8 2.2-8 5v1h16v-1c0-2.8-3.6-5-8-5z"/></svg>
+          聊天对象
+        </button>
+        <button type="button" data-page="personas">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.4 4.9 5.4.8-3.9 3.8.9 5.4L12 15.9 7.2 18l.9-5.4L4.2 8.7l5.4-.8L12 3z"/></svg>
+          人设
+        </button>
+        <button type="button" data-page="memories">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12a2 2 0 0 1 2 2v14l-8-3.2L4 20V6a2 2 0 0 1 2-2z"/></svg>
+          记忆
+        </button>
+        <button type="button" data-page="channels">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v2H7V7zm0 4h10v2H7v-2zm0 4h6v2H7v-2zM4 4h16v16H4V4z"/></svg>
+          渠道 / Key
+        </button>
+        <button type="button" data-page="extract">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10.2l3.4-3.4 1.4 1.4L12 17l-4.8-4.8 1.4-1.4 3.4 3.4V3h2zM5 19h14v2H5v-2z"/></svg>
+          提取
+        </button>
+        <button type="button" data-page="usage">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19h16v2H4v-2zm2-3h2V9H6v7zm5 0h2V5h-2v11zm5 0h2v-4h-2v4z"/></svg>
+          用量
+        </button>
+      </nav>
+      <div class="side-foot">
+        <div id="sideUser" class="side-user">—</div>
+        <button type="button" id="logoutBtn" class="btn-ghost">退出登录</button>
+      </div>
+    </aside>
+    <div class="main">
+      <header class="topbar">
+        <div>
+          <h2 id="pageTitle">总览</h2>
+          <p class="muted" id="pageHint"></p>
+        </div>
+      </header>
+      <div class="content" id="pageRoot"></div>
+    </div>
+  </div>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>
