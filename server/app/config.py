@@ -138,6 +138,11 @@ class Settings(BaseSettings):
     android_public_path: str = "/vd/android/"
     # 腾讯位置 WebService（逆地理/周边）；空则 place 能力不可用
     tencent_map_key: str = ""
+    # 公网跳板上传暂存：手机 → 跳板磁盘，chat-api 再经 LocalForward 拉取
+    # 空则 App 仍走 /chat-upload（经 SSH 反向隧道，易超时）
+    media_staging_pull_url: str = "http://127.0.0.1:18091"
+    media_staging_key: str = ""
+    media_staging_public_url: str = "https://119.45.30.73:8443/chat-staging"
 
 
 

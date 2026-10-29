@@ -1,0 +1,18 @@
+[Unit]
+Description=Chat upload staging on public jump (phone → jump disk)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/chat-upload-staging
+EnvironmentFile=-/etc/chat-upload-staging.env
+ExecStart=/opt/chat-upload-staging/.venv/bin/uvicorn staging_app:app --host 127.0.0.1 --port 18091 --workers 1
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

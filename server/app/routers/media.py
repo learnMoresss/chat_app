@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from .. import db
 from ..config import get_settings
@@ -12,6 +15,7 @@ from ..gateway.signed_urls import make_download_url, verify_download, verify_upl
 from ..media_store import files_root, put_bytes
 from ..security import current_user, iso, new_id
 
+log = logging.getLogger("media")
 router = APIRouter(prefix="/api/v1/media", tags=["media"])
 
 
@@ -115,6 +119,72 @@ async def chat_upload(
         "content_type": ctype,
         "name": name,
         "deduped": deduped,
+        "url": make_download_url(file_id=file_id, user_id=user["id"], ttl_seconds=86400 * 7),
+        "auth_url": f"/api/v1/media/files/{file_id}",
+    }
+
+
+class ChatCommitBody(BaseModel):
+    staging_id: str = Field(min_length=8, max_length=80)
+
+
+@router.get("/upload-route")
+def upload_route(user=Depends(current_user)) -> Dict[str, Any]:
+    """App 询问是否走跳板直传。"""
+    s = get_settings()
+    enabled = bool((s.media_staging_key or "").strip() and (s.media_staging_public_url or "").strip())
+    return {
+        "staging": enabled,
+        "staging_url": (s.media_staging_public_url or "").rstrip("/") if enabled else "",
+    }
+
+
+@router.post("/chat-commit")
+async def chat_commit(body: ChatCommitBody, user=Depends(current_user)) -> Dict[str, Any]:
+    """从跳板暂存拉取文件入库并删除暂存。大包不经手机→隧道。"""
+    s = get_settings()
+    base = (s.media_staging_pull_url or "").rstrip("/")
+    key = (s.media_staging_key or "").strip()
+    if not base or not key:
+        raise HTTPException(status_code=503, detail="暂存拉取未配置")
+    sid = body.staging_id.strip()
+    url = f"{base}/internal/take/{sid}"
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.get(
+                url,
+                params={"user_id": user["id"]},
+                headers={"X-Staging-Key": key},
+            )
+    except Exception as e:
+        log.warning("staging pull failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"拉取暂存失败：{e}") from e
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="暂存不存在或已过期，请重新上传")
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"拉取暂存失败（{r.status_code}）")
+    data = r.content
+    if not data:
+        raise HTTPException(status_code=400, detail="空文件")
+    ctype = r.headers.get("X-Staging-Content-Type") or r.headers.get("content-type") or "application/octet-stream"
+    name = r.headers.get("X-Staging-Filename") or "bin"
+    kind = r.headers.get("X-Staging-Kind") or "file"
+    if kind == "image" and not ctype.startswith("image/"):
+        ctype = "image/jpeg"
+    file_id, deduped = put_bytes(
+        user_id=user["id"],
+        data=data,
+        content_type=ctype,
+        source="chat",
+        filename=name,
+    )
+    return {
+        "file_id": file_id,
+        "size": len(data),
+        "content_type": ctype,
+        "name": name,
+        "deduped": deduped,
+        "staging": True,
         "url": make_download_url(file_id=file_id, user_id=user["id"], ttl_seconds=86400 * 7),
         "auth_url": f"/api/v1/media/files/{file_id}",
     }

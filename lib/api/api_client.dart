@@ -455,10 +455,25 @@ class ApiClient {
     );
   }
 
+  /// 公网跳板直传基址（大文件不经 SSH 反向隧道）。
+  static const publicStagingBase = 'https://119.45.30.73:8443/chat-staging';
+
+  bool get _preferPublicStaging {
+    final u = baseUrl.toLowerCase();
+    return u.contains('119.45.30.73') || u.contains('/chat-api');
+  }
+
+  HttpClient _uploadHttpClient() {
+    return HttpClient()
+      ..connectionTimeout = const Duration(seconds: 30)
+      ..idleTimeout = const Duration(minutes: 3)
+      ..badCertificateCallback = (cert, host, port) => host == '119.45.30.73';
+  }
+
   /// 聊天媒体上传，返回 file_id / auth_url。
   ///
-  /// 走公网反向隧道时偶发卡顿：独立 HttpClient、更长 idle、超时强制掐线，
-  /// 401 先续签再重试，避免「看起来一直转圈最后超时」。
+  /// 公网优先跳板直传；未部署则直传 /chat-upload。
+  /// 反向隧道偶发拥堵时自动重试（同内容服务端会去重）。
   Future<Map<String, dynamic>> uploadChatMedia({
     required Uint8List bytes,
     required String filename,
@@ -470,6 +485,156 @@ class ApiClient {
     if (accessToken == null || accessToken!.isEmpty) {
       throw ApiException('未登录', statusCode: 401, authNoise: true);
     }
+    Object? last;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (_preferPublicStaging) {
+          try {
+            return await _uploadViaPublicStaging(
+              bytes: bytes,
+              filename: filename,
+              kind: kind,
+              contentType: contentType,
+              allowAuthRetry: allowAuthRetry,
+              timeout: timeout,
+            );
+          } on ApiException catch (e) {
+            // 跳板未部署 → 本轮改直传；其它错误交给重试逻辑
+            if (e.statusCode == 404 ||
+                e.statusCode == 502 ||
+                e.statusCode == 503 ||
+                e.message.contains('跳板')) {
+              return await _uploadDirectChat(
+                bytes: bytes,
+                filename: filename,
+                kind: kind,
+                contentType: contentType,
+                allowAuthRetry: allowAuthRetry,
+                timeout: timeout,
+              );
+            }
+            rethrow;
+          }
+        }
+        return await _uploadDirectChat(
+          bytes: bytes,
+          filename: filename,
+          kind: kind,
+          contentType: contentType,
+          allowAuthRetry: allowAuthRetry,
+          timeout: timeout,
+        );
+      } on ApiException catch (e) {
+        last = e;
+        final retryable = e.statusCode == 408 ||
+            e.message.contains('超时') ||
+            e.message.contains('网络') ||
+            e.message.contains('Connection') ||
+            e.message.contains('Broken pipe');
+        if (!retryable || attempt >= 2) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 400 * (attempt + 1)));
+      } catch (e) {
+        last = e;
+        if (attempt >= 2) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 400 * (attempt + 1)));
+      }
+    }
+    if (last is ApiException) throw last;
+    throw ApiException(_netFailMessage(last ?? 'unknown', action: '上传'));
+  }
+
+  Future<Map<String, dynamic>> _uploadViaPublicStaging({
+    required Uint8List bytes,
+    required String filename,
+    required String kind,
+    required String contentType,
+    required bool allowAuthRetry,
+    required Duration timeout,
+  }) async {
+    final stagingUri = Uri.parse('$publicStagingBase/upload');
+    final req = MultipartRequest('POST', stagingUri);
+    req.headers['Authorization'] = 'Bearer $accessToken';
+    req.headers['Accept'] = 'application/json';
+    req.fields['kind'] = kind;
+    MediaType? mt;
+    try {
+      mt = MediaType.parse(contentType);
+    } catch (_) {
+      mt = null;
+    }
+    req.files.add(MultipartFile.fromBytes('file', bytes, filename: filename, contentType: mt));
+
+    late final String stagingId;
+    final io = _uploadHttpClient();
+    final client = IOClient(io);
+    try {
+      final streamed = await client.send(req).timeout(timeout);
+      final res = await http.Response.fromStream(streamed).timeout(const Duration(seconds: 30));
+      Map<String, dynamic>? data;
+      if (res.body.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(res.body);
+          if (decoded is Map<String, dynamic>) data = decoded;
+        } catch (_) {}
+      }
+      if (res.statusCode == 401 && allowAuthRetry && (refreshToken ?? '').isNotEmpty) {
+        if (await trySilentRefresh()) {
+          return await _uploadViaPublicStaging(
+            bytes: bytes,
+            filename: filename,
+            kind: kind,
+            contentType: contentType,
+            allowAuthRetry: false,
+            timeout: timeout,
+          );
+        }
+        throw ApiException('登录已失效，请重新登录', statusCode: 401, authNoise: true);
+      }
+      if (res.statusCode >= 400) {
+        final detail = data?['detail'];
+        final msg = detail is String && detail.trim().isNotEmpty
+            ? detail.trim()
+            : '跳板上传失败（${res.statusCode}）';
+        throw ApiException(msg, statusCode: res.statusCode);
+      }
+      stagingId = data?['staging_id']?.toString() ?? '';
+      if (stagingId.isEmpty) {
+        throw ApiException('跳板未返回 staging_id', statusCode: 502);
+      }
+    } on ApiException {
+      rethrow;
+    } on TimeoutException {
+      try {
+        io.close(force: true);
+      } catch (_) {}
+      throw ApiException('上传超时，请再试一次', statusCode: 408);
+    } catch (e) {
+      throw ApiException(_netFailMessage(e, action: '上传'));
+    } finally {
+      try {
+        client.close();
+      } catch (_) {}
+    }
+
+    // 小 JSON 经隧道通知 AI 拉取（服务端再从跳板 LocalForward 取文件）
+    return _json(
+      'POST',
+      '/api/v1/media/chat-commit',
+      auth: true,
+      body: {'staging_id': stagingId},
+      allowAuthRetry: allowAuthRetry,
+      timeout: const Duration(seconds: 90),
+    );
+  }
+
+  Future<Map<String, dynamic>> _uploadDirectChat({
+    required Uint8List bytes,
+    required String filename,
+    required String kind,
+    required String contentType,
+    required bool allowAuthRetry,
+    required Duration timeout,
+  }) async {
     final uri = _u('/api/v1/media/chat-upload');
     final req = MultipartRequest('POST', uri);
     req.headers['Authorization'] = 'Bearer $accessToken';
@@ -483,12 +648,7 @@ class ApiClient {
     }
     req.files.add(MultipartFile.fromBytes('file', bytes, filename: filename, contentType: mt));
 
-    final io = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 30)
-      // 隧道卡顿时不能 30s 就当空闲掐线
-      ..idleTimeout = const Duration(minutes: 3)
-      // 与 main.dart HttpOverrides 一致，独立 client 也放行跳板自签
-      ..badCertificateCallback = (cert, host, port) => host == '119.45.30.73';
+    final io = _uploadHttpClient();
     final client = IOClient(io);
     try {
       final streamed = await client.send(req).timeout(timeout);
@@ -504,7 +664,7 @@ class ApiClient {
       }
       if (res.statusCode == 401 && allowAuthRetry && (refreshToken ?? '').isNotEmpty) {
         if (await trySilentRefresh()) {
-          return await uploadChatMedia(
+          return await _uploadDirectChat(
             bytes: bytes,
             filename: filename,
             kind: kind,

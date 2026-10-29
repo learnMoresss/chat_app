@@ -316,6 +316,7 @@ def inbound_from_message(
 
     if kind == "image":
         caption = ""
+        ocr = ""
         n = 1
         try:
             meta = json.loads(raw) if raw.strip().startswith("{") else None
@@ -323,9 +324,17 @@ def inbound_from_message(
                 files = meta.get("files") or []
                 n = max(1, len(files)) if isinstance(files, list) else 1
                 caption = (meta.get("caption") or "").strip()
+                # send_message 识图后写入，供连发合并/历史回放，避免模型只看到 JSON 壳
+                ocr = (meta.get("ocr") or meta.get("model_caption") or "").strip()
         except (json.JSONDecodeError, TypeError):
             caption = ""
+            ocr = ""
         base = f"[对方发来{n}张图片]" if mine else f"[你发了{n}张图片]"
+        if ocr:
+            out = f"{base} {ocr}"
+            if caption and caption not in ocr:
+                out += f"（附言：{caption}）"
+            return out
         return f"{base}：{caption}" if caption else base
 
     if kind == "video":

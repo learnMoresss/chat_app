@@ -38,7 +38,11 @@ def _generation_alive(conv_id: str, gen: int) -> bool:
 
 
 def _pending_user_texts(user_id: str, conv_id: str) -> str:
-    """合并上一轮 bot 之后尚未被回答的用户消息（最新意图优先）。"""
+    """合并上一轮 bot 之后尚未被回答的用户消息（最新意图优先）。
+
+    必须走 inbound 整形：图片/语音在库里是 JSON 壳，直接拼会把 OCR 结果盖掉，
+    模型只看到 files/caption，就会幻觉「图是糊的」。
+    """
     try:
         last_bot = db.fetchone(
             """
@@ -61,9 +65,13 @@ def _pending_user_texts(user_id: str, conv_id: str) -> str:
         )
         parts: List[str] = []
         for r in rows:
-            t = (r["text"] or "").strip()
-            if t:
-                parts.append(t)
+            shaped = inbound_from_message(
+                kind=(r["kind"] or "text"),
+                text=(r["text"] or ""),
+                mine=True,
+            )
+            if shaped and shaped.strip():
+                parts.append(shaped.strip())
         if not parts:
             return ""
         if len(parts) == 1:
@@ -528,9 +536,17 @@ async def _generate_reply(
     display = persona["remark"] or persona["name"] or "对方"
     # 连发：合并上一轮 bot 之后的用户消息，回答最新意图
     if not internal:
+        caller_text = (user_text or "").strip()
         merged = _pending_user_texts(user_id, conv_id)
         if merged:
-            user_text = merged
+            # 调用方已带 OCR/整形（[对方发来…]），合并结果若仍是 JSON 壳或更短，保留调用方
+            merged_s = merged.strip()
+            caller_rich = caller_text.startswith("[对方发来") or "图中文字" in caller_text
+            merged_raw_shell = merged_s.startswith("{") and '"files"' in merged_s
+            if caller_rich and (merged_raw_shell or len(merged_s) < len(caller_text)):
+                user_text = caller_text
+            else:
+                user_text = merged
 
     # qq-bridge：免打扰时段可跳过模型（prefs.quiet_blocks_chat=1）→ 只记缓冲
     if not internal:
@@ -1745,6 +1761,7 @@ async def send_message(
                 f"（附言：{cap}）" if cap and cap not in joined else ""
             )
         else:
+            joined = ""
             user_text_for_model = f"[对方发来{n}张图片]" + (f"：{cap}" if cap else "")
         if ocr_meta_lines:
             # 坐标写入 instructions，不污染气泡正文
@@ -1759,6 +1776,20 @@ async def send_message(
                 user_text_for_model += (
                     "\n[OCR坐标] " + "；".join(box_hint[:24])
                 )
+        # 把 OCR 摘要写回消息 JSON，供连发合并 / 历史回放；客户端忽略未知字段
+        if joined:
+            try:
+                payload_obj = json.loads(text) if text.startswith("{") else {
+                    "v": 1,
+                    "files": media_ids,
+                    "caption": cap,
+                    "seconds": body.seconds,
+                }
+                if isinstance(payload_obj, dict):
+                    payload_obj["ocr"] = joined[:4000]
+                    text = json.dumps(payload_obj, ensure_ascii=False)
+            except Exception:
+                pass
     elif kind == "video" and media_ids:
         cap = body.text.strip()
         desc = ""
