@@ -27,8 +27,10 @@ function deviceHint(userId, personaId, convId) {
 const DEVICE_HINT = deviceHint('', '', '')
 
 const STICKER_HINT = (
-  '【表情】配图写 ⟦表情：图上文字或场景短描述⟧；实景写 ⟦图：一句话⟧。禁止 Unicode emoji。'
-  + '系统按标签检索发送，不要罗列库。收包/建组仅 agent 轨按需调用 stickers API。'
+  '【表情】单张配图写 ⟦表情：图上文字或场景短描述⟧；要「一组/一包」时先问用户主题，'
+  + '确认后再写 ⟦表情组：主题⟧（或 agent 轨 POST /api/v1/stickers/packs/web_collect，notify=1+conv_id）。'
+  + '禁止把一组需求只丢一张单图应付。实景写 ⟦图：一句话⟧。禁止 Unicode emoji。'
+  + '系统按标签检索/收组，不要罗列库。'
 )
 
 /**

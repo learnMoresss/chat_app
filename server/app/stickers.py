@@ -6,6 +6,7 @@ owner_kind=library 为账号共享池；历史 persona/user 行仍计入同一�
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import re
 from pathlib import Path
@@ -72,11 +73,44 @@ def _refine_ocr_label(texts: List[str]) -> str:
     return label[:64]
 
 
+def _tags_json(tags: List[str]) -> str:
+    cleaned: List[str] = []
+    for t in tags:
+        s = re.sub(r"\s+", "", (t or "").strip())
+        if not s or s in cleaned:
+            continue
+        cleaned.append(s[:24])
+        if len(cleaned) >= 8:
+            break
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned else ""
+
+
+def _parse_tags(raw: str) -> List[str]:
+    t = (raw or "").strip()
+    if not t:
+        return []
+    if t.startswith("["):
+        try:
+            arr = json.loads(t)
+            if isinstance(arr, list):
+                return [str(x).strip() for x in arr if str(x).strip()][:8]
+        except Exception:
+            pass
+    return [x.strip() for x in re.split(r"[,，、|/]", t) if x.strip()][:8]
+
+
 def annotate_sticker_image(*, user_id: str, file_id: str) -> Dict[str, str]:
-    """OCR 提炼描述：label=图上文字摘要；emotion 仅作可选短别名（有明确词才填）。"""
+    """语义标注：优先本地 VL label/tags；OCR 有字时并入 tags。"""
     path = _media_path(user_id, file_id)
     if path is None:
-        return {"label": "", "emotion": "", "ocr": ""}
+        return {"label": "", "emotion": "", "ocr": "", "tags": ""}
+    vl_label = ""
+    try:
+        from .vision_gen import caption_sticker_path
+
+        vl_label = (caption_sticker_path(path) or "").strip()
+    except Exception:
+        vl_label = ""
     try:
         from .vision_gen import ocr_image_path
 
@@ -84,17 +118,58 @@ def annotate_sticker_image(*, user_id: str, file_id: str) -> Dict[str, str]:
     except Exception:
         lines = []
     texts = [str(x.get("text") or "").strip() for x in (lines or []) if (x.get("text") or "").strip()]
+    # 过滤水印站名
+    texts = [
+        t
+        for t in texts
+        if t
+        and "nipic" not in t.lower()
+        and "www." not in t.lower()
+        and not re.search(r"ID:\d+", t, flags=re.I)
+    ]
     ocr_join = "；".join(texts[:16])
-    label = _refine_ocr_label(texts)
+    ocr_label = _refine_ocr_label(texts)
+    label = ""
+    if vl_label:
+        # 去掉模板腔「主体：…动作：…」
+        cleaned = re.sub(r"[主体动作情绪场景背景][：:]\s*", "", vl_label)
+        cleaned = re.sub(r"\s+", "", cleaned)
+        cleaned = cleaned.strip("「」【】\"'“”‘’《》[]()（）")
+        cleaned = re.sub(r"[。！？.!,，、]+$", "", cleaned)
+        # 截到第一句短段
+        for sep in ("。", "！", "?", "，", ",", "；"):
+            if sep in cleaned:
+                cleaned = cleaned.split(sep)[0]
+                break
+        if len(cleaned) > 16:
+            cleaned = cleaned[:16]
+        # 重复字压缩（眼睛眼睛眼睛…）
+        cleaned = re.sub(r"(.)\1{2,}", r"\1\1", cleaned)
+        label = cleaned[:64] if cleaned else vl_label[:16]
+    elif ocr_label:
+        label = ocr_label
     if not label:
-        label = "无字表情"
-    # 不再用含糊「开心」当主标签；仅当图上字本身就是这些词时才写入 emotion 便于旧逻辑兼容
+        label = "未识别表情"
+    tags: List[str] = []
+    if label and label not in ("未识别表情", "无字表情"):
+        tags.append(label[:24])
+    if ocr_label and ocr_label not in tags:
+        tags.append(ocr_label[:24])
+    for t in texts[:4]:
+        tt = re.sub(r"\s+", "", t)[:16]
+        if tt and tt not in tags and "www" not in tt.lower():
+            tags.append(tt)
     emotion = ""
     for key in ("翻白眼", "无语", "嫌弃", "委屈", "开心", "好的", "加油", "晚安", "早安", "哈哈哈", "哭"):
-        if key in label:
+        if key in label or key in ocr_join:
             emotion = key[:32]
             break
-    return {"label": label[:64], "emotion": emotion, "ocr": ocr_join[:200]}
+    return {
+        "label": label[:64],
+        "emotion": emotion,
+        "ocr": ocr_join[:200],
+        "tags": _tags_json(tags),
+    }
 
 
 def reannotate_sticker(*, user_id: str, sticker_id: str, overwrite: bool = True) -> Optional[Dict[str, Any]]:
@@ -104,16 +179,18 @@ def reannotate_sticker(*, user_id: str, sticker_id: str, overwrite: bool = True)
     )
     if row is None:
         return None
-    if not overwrite and (row["label"] or "").strip() and (row["label"] or "") != "无字表情":
+    if not overwrite and (row["label"] or "").strip() and (row["label"] or "") not in (
+        "无字表情",
+        "未识别表情",
+    ):
         return _out(row)
     ann = annotate_sticker_image(user_id=user_id, file_id=row["file_id"])
     db.execute(
-        "UPDATE stickers SET label = ?, emotion = ? WHERE id = ?",
-        (ann["label"], ann["emotion"], sticker_id),
+        "UPDATE stickers SET label = ?, emotion = ?, tags = ? WHERE id = ?",
+        (ann["label"], ann["emotion"], ann.get("tags") or "", sticker_id),
     )
     r2 = db.fetchone("SELECT * FROM stickers WHERE id = ?", (sticker_id,))
     return {**_out(r2), "ocr": ann.get("ocr", "")} if r2 else None
-
 
 def reannotate_library(*, user_id: str, limit: int = 200) -> Dict[str, int]:
     rows = db.fetchall(
@@ -169,7 +246,7 @@ def maybe_augment_sticker_intents(
 ) -> list:
     """模型没写表情标记时，按正文里的词/梗补一条 sticker 意图（优先命中库内 OCR 描述）。"""
     out = list(intents or [])
-    if cooled or any(i.get("kind") == "sticker" for i in out):
+    if cooled or any(i.get("kind") in ("sticker", "sticker_pack") for i in out):
         return out
     q = suggest_sticker_query(text) or suggest_sticker_query(extra_text)
     # 若库里有与正文重叠的描述，优先用那条 label
@@ -273,23 +350,25 @@ def add_sticker(
 
     lab = (label or "").strip()
     emo = (emotion or "").strip()
-    # 默认 OCR：描述以图上文字为准，调用方空标签或只给了含糊情绪时覆盖
-    vague = {"", "开心", "委屈", "嫌弃", "元气", "翻白眼", "高兴", "难过"}
+    tags_s = ""
+    # 默认 VL+OCR：空标签或含糊情绪时重标
+    vague = {"", "开心", "委屈", "嫌弃", "元气", "翻白眼", "高兴", "难过", "无字表情", "未识别表情"}
     if not skip_ocr and (not lab or lab in vague or (emo in vague and not lab)):
         ann = annotate_sticker_image(user_id=user_id, file_id=file_id)
         if ann.get("label"):
             lab = ann["label"]
         if not emo and ann.get("emotion"):
             emo = ann["emotion"]
+        tags_s = ann.get("tags") or ""
     if not lab:
-        lab = emo or "无字表情"
+        lab = emo or "未识别表情"
 
     sid = new_id("stk_")
     now = iso()
     db.execute(
         """
-        INSERT INTO stickers(id, user_id, owner_kind, owner_id, file_id, label, emotion, created_at, file_hash, pack_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO stickers(id, user_id, owner_kind, owner_id, file_id, label, emotion, created_at, file_hash, pack_id, tags)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             sid,
@@ -302,6 +381,7 @@ def add_sticker(
             now,
             fhash,
             pid,
+            tags_s[:512],
         ),
     )
     row = db.fetchone("SELECT * FROM stickers WHERE id = ?", (sid,))
@@ -578,6 +658,11 @@ def _out(row) -> Dict[str, Any]:
         pack_id = ""
     if not pack_id and "pack_id" in keys:
         pack_id = row["pack_id"] or ""
+    tags_raw = ""
+    try:
+        tags_raw = row["tags"] or ""
+    except Exception:
+        tags_raw = ""
     return {
         "id": row["id"],
         "owner_kind": row["owner_kind"],
@@ -585,6 +670,7 @@ def _out(row) -> Dict[str, Any]:
         "file_id": row["file_id"],
         "label": row["label"] or "",
         "emotion": row["emotion"] or "",
+        "tags": _parse_tags(tags_raw),
         "pack_id": pack_id or "",
         "created_at": row["created_at"],
     }
@@ -616,7 +702,7 @@ def create_pack(
     if sc not in ("global", "account"):
         raise ValueError("scope 须为 global 或 account")
     src = (source or "user").strip().lower()
-    if src not in ("ai", "user"):
+    if src not in ("ai", "user", "web"):
         src = "user"
     pid = new_id("spk_")
     now = iso()
@@ -772,7 +858,7 @@ def suggest_stickers(*, user_id: str, q: str, limit: int = 12) -> List[Dict[str,
             OR (IFNULL(s.pack_id,'') = '' AND s.user_id = ?)
         )
         AND (
-            s.label LIKE ? OR s.emotion LIKE ?
+            s.label LIKE ? OR s.emotion LIKE ? OR IFNULL(s.tags,'') LIKE ?
             OR IFNULL(p.tags,'') LIKE ? OR IFNULL(p.title,'') LIKE ?
         )
         ORDER BY
@@ -780,9 +866,59 @@ def suggest_stickers(*, user_id: str, q: str, limit: int = 12) -> List[Dict[str,
           s.created_at DESC
         LIMIT ?
         """,
-        (user_id, user_id, like, like, like, like, query, like, limit),
+        (user_id, user_id, like, like, like, like, like, query, like, limit),
     )
     return [_out(r) for r in rows]
+
+
+def fork_pack(*, user_id: str, pack_id: str, title: str = "") -> Dict[str, Any]:
+    """把 global/他人可见组复制成账号组，并订阅。"""
+    src = get_pack(pack_id)
+    if src is None:
+        raise ValueError("组不存在")
+    if not can_access_pack(pack=src, user_id=user_id):
+        raise ValueError("无权复制该组")
+    new_title = (title or "").strip() or f"{src.get('title') or '表情包'}（我的）"
+    new_pack = create_pack(
+        scope="account",
+        owner_user_id=user_id,
+        title=new_title[:64],
+        tags=src.get("tags") or "",
+        source="user",
+    )
+    items = list_pack_items(pack_id=pack_id, limit=200)
+    added = 0
+    for it in items:
+        try:
+            tags_list = it.get("tags") or []
+            tags_s = _tags_json(tags_list) if isinstance(tags_list, list) else ""
+            row = add_sticker(
+                user_id=user_id,
+                file_id=str(it.get("file_id") or ""),
+                label=str(it.get("label") or ""),
+                emotion=str(it.get("emotion") or ""),
+                owner_kind=LIBRARY_KIND,
+                owner_id=user_id,
+                pack_id=new_pack["id"],
+                skip_ocr=True,
+            )
+            if tags_s and not row.get("deduped"):
+                db.execute(
+                    "UPDATE stickers SET tags = ? WHERE id = ?",
+                    (tags_s[:512], row["id"]),
+                )
+            if not row.get("deduped"):
+                added += 1
+        except Exception:
+            continue
+    subscribe_pack(user_id=user_id, pack_id=new_pack["id"], pinned=False)
+    # 也订阅原组，便于「已加入」状态
+    try:
+        subscribe_pack(user_id=user_id, pack_id=pack_id, pinned=False)
+    except Exception:
+        pass
+    out = get_pack(new_pack["id"]) or new_pack
+    return {**out, "forked_from": pack_id, "copied": added}
 
 
 def subscribe_pack(*, user_id: str, pack_id: str, pinned: bool = False) -> Dict[str, Any]:

@@ -82,11 +82,16 @@ class Settings(BaseSettings):
     baidu_ocr_api_key: str = ""
     baidu_ocr_secret_key: str = ""
     baidu_ocr_timeout_seconds: float = 120.0
-    # 本地 VL（可选兜底）；入站默认走 DeepSeek 官方识图
-    vision_chat_url: str = ""
+    # 本地 VL（SmolVLM2 侧车 :9293）；贴纸语义标注优先
+    vision_chat_url: str = "http://127.0.0.1:9293/v1"
     vision_api_token: str = ""
-    vision_model: str = ""
-    vision_timeout_seconds: float = 90.0
+    vision_model: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+    vision_timeout_seconds: float = 20.0
+    # 网络搜图（Bing / DuckDuckGo）
+    image_search_engine: str = "bing"
+    image_search_limit: int = 9
+    image_search_timeout_seconds: float = 25.0
+    image_search_filter: str = "clipart"
     # DeepSeek 官方多模态识图（api.deepseek.com）
     deepseek_api_key_official: str = ""
     deepseek_api_key: str = ""

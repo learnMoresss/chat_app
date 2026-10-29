@@ -1452,6 +1452,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         conn.execute("UPDATE meta SET value = '34' WHERE key = 'schema_version'")
         conn.commit()
+        version = 34
+
+    if version < 35:
+        st_cols = {r[1] for r in conn.execute("PRAGMA table_info(stickers)").fetchall()}
+        if "tags" not in st_cols:
+            conn.execute(
+                "ALTER TABLE stickers ADD COLUMN tags TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute("UPDATE meta SET value = '35' WHERE key = 'schema_version'")
+        conn.commit()
 
 
 def reset_connection() -> None:

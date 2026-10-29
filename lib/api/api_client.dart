@@ -1084,6 +1084,12 @@ class ApiClient {
     });
   }
 
+  Future<Map<String, dynamic>> forkStickerPack(String packId, {String title = ''}) {
+    return _json('POST', '/api/v1/stickers/packs/$packId/fork', auth: true, body: {
+      if (title.isNotEmpty) 'title': title,
+    });
+  }
+
   Future<List<dynamic>> suggestStickers({required String q, int limit = 12}) async {
     final j = await _json('GET', '/api/v1/stickers/suggest', auth: true, query: {
       'q': q,

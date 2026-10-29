@@ -117,6 +117,107 @@ def _deepseek_vision_key() -> str:
     )
 
 
+def _describe_via_local_vl(path: Path, *, hint: str = "", prompt: str = "") -> Optional[str]:
+    """本机 VL 侧车（默认 SmolVLM2 @ :9293）OpenAI chat+image。"""
+    s = get_settings()
+    base = (s.vision_chat_url or "").strip().rstrip("/")
+    if not base:
+        return None
+    model = (s.vision_model or "").strip()
+    if not model:
+        return None
+    token = (s.vision_api_token or "").strip()
+    timeout = float(s.vision_timeout_seconds or 45)
+    raw = _prepare_image_bytes(path)
+    if len(raw) < 32:
+        return None
+    mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    b64 = base64.b64encode(raw).decode("ascii")
+    text_prompt = (prompt or "").strip() or (
+        "这是表情包贴纸。只用中文输出一个短标签，最多12个字，"
+        "例如「橘猫歪头」「小狗哭哭」。不要写「主体/动作/情绪」，不要解释。"
+    )
+    if hint:
+        text_prompt += f"\n参考：{hint[:80]}"
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 64,
+        "temperature": 0.2,
+    }
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        if r.status_code >= 400:
+            log.warning(
+                "local vl http %s: %s",
+                r.status_code,
+                (r.text or "")[:200],
+            )
+            return None
+        j = r.json() if r.content else {}
+        msg = ((j.get("choices") or [{}])[0].get("message") or {})
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            return None
+        # 压成短标签
+        content = content.replace("\n", " ").strip()
+        return content[:120]
+    except Exception as exc:
+        log.warning("local vl failed: %s", exc)
+        return None
+
+
+def _local_vl_ready() -> bool:
+    """侧车是否可响应（避免模型下载中把标注拖死）。"""
+    s = get_settings()
+    base = (s.vision_chat_url or "").strip().rstrip("/")
+    if not base:
+        return False
+    # .../v1 -> healthz on root
+    root = base[:-3] if base.endswith("/v1") else base
+    token = (s.vision_api_token or "").strip()
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with httpx.Client(timeout=1.5) as client:
+            r = client.get(f"{root}/healthz", headers=headers)
+        return r.status_code < 400
+    except Exception:
+        return False
+
+
+def caption_sticker_path(path: str | Path, *, hint: str = "") -> Optional[str]:
+    """贴纸语义短标签：本地 VL。"""
+    p = Path(path)
+    if not p.is_file() or p.stat().st_size < 32:
+        return None
+    if not _local_vl_ready():
+        return None
+    return _describe_via_local_vl(p, hint=hint)
+
+
 def _describe_via_deepseek_official(path: Path, *, hint: str = "") -> Optional[str]:
     """DeepSeek 官方 chat/completions 多模态识图。"""
     key = _deepseek_vision_key()

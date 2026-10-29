@@ -170,6 +170,12 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
             intents.append({"kind": "sticker", "prompt": tag[:40]})
         return ""
 
+    def _sticker_pack(m: re.Match) -> str:
+        tag = (m.group(1) or m.group(2) or "").strip()
+        if tag:
+            intents.append({"kind": "sticker_pack", "prompt": tag[:40]})
+        return ""
+
     def _voice(m: re.Match) -> str:
         line = (m.group(1) or m.group(2) or "").strip()
         if line:
@@ -222,6 +228,13 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
         return ""
 
     out = re.sub(r"⟦图[:：]\s*(.+?)⟧|\[\[图[:：]\s*(.+?)\]\]", _img, out, flags=re.S)
+    # 表情组须先于单张表情匹配
+    out = re.sub(
+        r"⟦表情组[:：]\s*(.+?)⟧|\[\[表情组[:：]\s*(.+?)\]\]",
+        _sticker_pack,
+        out,
+        flags=re.S,
+    )
     out = re.sub(r"⟦表情[:：]\s*(.+?)⟧|\[\[表情[:：]\s*(.+?)\]\]", _sticker, out, flags=re.S)
     out = re.sub(r"⟦唱[:：]\s*(.+?)⟧|\[\[唱[:：]\s*(.+?)\]\]", _sing, out, flags=re.S)
     out = re.sub(

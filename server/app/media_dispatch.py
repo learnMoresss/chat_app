@@ -216,6 +216,120 @@ async def resolve_sticker_file(
     return fid, prompt
 
 
+async def resolve_sticker_pack(*, ctx: DispatchCtx, prompt: str, need: int = 9) -> bool:
+    """表情组：库内检索 → 网络搜图 → 生图补齐 → 发 sticker_pack_added 卡片。"""
+    from .image_search import search_image_urls
+    from .media_cards import generate_or_mood, save_image_bytes
+    from .routers.stickers_api import _download_image, _emit_pack_added_card
+
+    need = max(4, min(int(need), 12))
+    theme = (prompt or "").strip()[:40]
+    if not theme:
+        return False
+
+    candidates = search_stickers(user_id=ctx.user_id, query=theme, limit=need)
+    file_ids: List[str] = []
+    for c in candidates:
+        fid = str(c.get("file_id") or "").strip()
+        if fid and fid not in file_ids:
+            file_ids.append(fid)
+
+    # 网络补齐
+    if len(file_ids) < need:
+        try:
+            urls = await asyncio.to_thread(
+                search_image_urls, f"{theme} 表情包", limit=need - len(file_ids)
+            )
+        except Exception:
+            logger.exception("web search for pack failed")
+            urls = []
+        for url in urls or []:
+            if len(file_ids) >= need:
+                break
+            try:
+                data, ctype = await asyncio.to_thread(_download_image, url)
+                suf = (
+                    "png"
+                    if "png" in ctype
+                    else ("webp" if "webp" in ctype else ("gif" if "gif" in ctype else "jpg"))
+                )
+                fid = (
+                    save_image_bytes(
+                        user_id=ctx.user_id,
+                        data=data,
+                        source="sticker_url",
+                        suffix=suf,
+                        content_type=ctype,
+                    )
+                    or ""
+                )
+                if fid and fid not in file_ids:
+                    file_ids.append(fid)
+            except Exception:
+                continue
+
+    # 生图补齐
+    while len(file_ids) < max(4, need // 2):
+        try:
+            fid = (
+                generate_or_mood(
+                    user_id=ctx.user_id,
+                    caption=f"可爱表情包贴纸，主题：{theme}，干净背景，方形构图",
+                    persona_name=ctx.display,
+                    backend="zimage",
+                    width=512,
+                    height=512,
+                )
+                or ""
+            )
+        except Exception:
+            break
+        if not fid:
+            break
+        if fid not in file_ids:
+            file_ids.append(fid)
+        else:
+            break
+
+    if not file_ids:
+        return False
+
+    pack = stk.create_pack(
+        scope="global",
+        owner_user_id=ctx.user_id,
+        title=f"{theme}表情",
+        tags=theme,
+        source="web" if len(candidates) < need else "ai",
+    )
+    added = 0
+    for fid in file_ids[:need]:
+        try:
+            row = stk.add_sticker(
+                user_id=ctx.user_id,
+                file_id=fid,
+                label="",
+                emotion="",
+                owner_kind="library",
+                owner_id=ctx.user_id,
+                pack_id=pack["id"],
+            )
+            if not row.get("deduped"):
+                added += 1
+        except Exception:
+            continue
+
+    pack2 = stk.get_pack(pack["id"]) or pack
+    if added <= 0 and not (pack2.get("item_count") or 0):
+        return False
+    await _emit_pack_added_card(
+        user_id=ctx.user_id,
+        conv_id=ctx.conv_id,
+        pack=pack2,
+        added=added or int(pack2.get("item_count") or len(file_ids)),
+    )
+    return True
+
+
 async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> DispatchCtx:
     """执行最多 3 条媒体意图（注册表风格分支）。"""
     # sticker/image 分支直接用这些符号；不可依赖其它 handler 的局部 import
@@ -228,6 +342,8 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
         if kind != "device" and not prompt:
             continue
         if kind == "sticker" and ctx.sticker_cooled:
+            continue
+        if kind == "sticker_pack" and ctx.sticker_cooled:
             continue
 
         if kind == "device":
@@ -272,6 +388,29 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
                     await hub.send_user(ctx.user_id, "message", img_msg.model_dump())
                 else:
                     note = f"（想发表情：{prompt}）"
+                    note_msg = _insert_message(
+                        user_id=ctx.user_id,
+                        conv_id=ctx.conv_id,
+                        client_id=new_id("botcli_"),
+                        sender_id=ctx.persona_id,
+                        mine=False,
+                        kind="text",
+                        text=note,
+                        state="sent",
+                    )
+                    await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
+            finally:
+                await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
+            continue
+        if kind == "sticker_pack":
+            await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
+            try:
+                await asyncio.sleep(0.35)
+                ok = await resolve_sticker_pack(ctx=ctx, prompt=prompt)
+                if ok:
+                    ctx.sticker_cooled = True
+                else:
+                    note = f"（想找一组表情：{prompt}）"
                     note_msg = _insert_message(
                         user_id=ctx.user_id,
                         conv_id=ctx.conv_id,

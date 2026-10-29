@@ -1,0 +1,21 @@
+[Unit]
+Description=SmolVLM2-500M local vision sidecar (:9293)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/chat_app/server
+Environment=SMOLVLM_HOST=127.0.0.1
+Environment=SMOLVLM_PORT=9293
+Environment=SMOLVLM_DEVICE=cuda:0
+Environment=HF_HOME=/data/ai/cache/huggingface
+Environment=TRANSFORMERS_CACHE=/data/ai/cache/huggingface/hub
+Environment=HUGGINGFACE_HUB_CACHE=/data/ai/cache/huggingface/hub
+# 复用 Comfy 环境的 torch/transformers（chat-api venv 无 CUDA torch）
+EnvironmentFile=-%h/chat_app/server/.env
+ExecStart=/data/ai/envs/comfy-cu128/bin/python %h/chat_app/server/scripts/smolvlm_sidecar.py --host 127.0.0.1 --port 9293
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

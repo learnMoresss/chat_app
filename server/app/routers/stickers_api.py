@@ -91,6 +91,23 @@ class SubscribeIn(BaseModel):
     pinned: bool = False
 
 
+class WebCollectIn(BaseModel):
+    """网络搜图收成一组。"""
+    query: str = Field(..., min_length=1, max_length=64)
+    title: str = Field(default="", max_length=64)
+    tags: str = Field(default="", max_length=256)
+    limit: int = Field(default=9, ge=1, le=24)
+    pack_id: str = Field(default="", max_length=64)
+    user_id: str = Field(default="", max_length=64)
+    conv_id: str = Field(default="", max_length=64)
+    notify: bool = True
+    engine: str = Field(default="", max_length=16)
+
+
+class ForkIn(BaseModel):
+    title: str = Field(default="", max_length=64)
+
+
 def _download_image(url: str) -> tuple[bytes, str]:
     u = (url or "").strip()
     parsed = urlparse(u)
@@ -427,6 +444,116 @@ def subscribe_pack(
     if not stk.can_access_pack(pack=pack, user_id=user["id"]):
         raise HTTPException(403, "无权订阅")
     return stk.subscribe_pack(user_id=user["id"], pack_id=pack_id, pinned=body.pinned)
+
+
+@router.post("/packs/{pack_id}/fork")
+def fork_pack(
+    pack_id: str,
+    body: ForkIn,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """复制到账号组（我的一组）。"""
+    try:
+        return stk.fork_pack(user_id=user["id"], pack_id=pack_id, title=body.title)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/packs/web_collect")
+async def web_collect_pack(
+    body: WebCollectIn,
+    actor: Dict[str, Any] = Depends(_actor),
+) -> Dict[str, Any]:
+    """Bing/DDG 搜图 → 下载 → 建组/追加 → 可选发组卡片。"""
+    from ..image_search import search_image_urls
+
+    uid = _resolve_uid(actor, body.user_id)
+    q = (body.query or "").strip()
+    if not q:
+        raise HTTPException(400, "需要 query")
+    # 多搜一些直链，下载失败时有余量
+    want = max(1, min(int(body.limit), 24))
+    urls = search_image_urls(
+        q, limit=min(24, want * 3), engine=(body.engine or None)
+    )
+    if not urls:
+        raise HTTPException(404, "搜图无结果")
+
+    pack_id = (body.pack_id or "").strip()
+    if pack_id:
+        pack = stk.get_pack(pack_id)
+        if pack is None:
+            raise HTTPException(404, "组不存在")
+        if not stk.can_append_pack(
+            pack=pack, user_id=uid, is_service=bool(actor.get("is_service"))
+        ):
+            raise HTTPException(403, "无权往该组追加")
+    else:
+        title = (body.title or "").strip() or f"{q}表情"
+        tags = (body.tags or "").strip() or q
+        if actor.get("is_service"):
+            pack = stk.create_pack(
+                scope="global",
+                owner_user_id=uid,
+                title=title[:64],
+                tags=tags[:256],
+                source="web",
+            )
+        else:
+            pack = stk.create_pack(
+                scope="account",
+                owner_user_id=uid,
+                title=title[:64],
+                tags=tags[:256],
+                source="web",
+            )
+        pack_id = pack["id"]
+
+    added: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for url in urls:
+        if len(added) >= want:
+            break
+        try:
+            file_id = _save_url_as_file(uid, url)
+            row = stk.add_sticker(
+                user_id=uid,
+                file_id=file_id,
+                label="",
+                emotion="",
+                owner_kind=stk.LIBRARY_KIND,
+                owner_id=uid,
+                pack_id=pack_id,
+            )
+            added.append(row)
+        except Exception as exc:
+            errors.append(f"{url[:60]}: {exc}")
+            continue
+
+    if not added:
+        detail = "下载全部失败"
+        if errors:
+            detail = f"{detail}；{errors[0]}"
+        raise HTTPException(502, detail)
+
+    pack2 = stk.get_pack(pack_id) or pack
+    fresh = sum(1 for x in added if not x.get("deduped"))
+    if body.notify and body.conv_id:
+        await _emit_pack_added_card(
+            user_id=uid,
+            conv_id=body.conv_id.strip(),
+            pack=pack2,
+            added=fresh or len(added),
+        )
+    return {
+        "pack": pack2,
+        "items": added,
+        "added": fresh,
+        "total": len(added),
+        "urls": urls[:want],
+        "errors": errors[:5],
+        "query": q,
+    }
 
 
 @router.post("/collect")

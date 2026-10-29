@@ -49,6 +49,18 @@ def test_no_video_intent():
     assert "视频" not in text
 
 
+def test_sticker_pack_intent():
+    from app.media_cards import extract_media_intents
+
+    text, intents = extract_media_intents("好呀\n⟦表情组：橘猫⟧\n⟦表情：翻白眼⟧")
+    kinds = [i["kind"] for i in intents]
+    assert "sticker_pack" in kinds
+    assert "sticker" in kinds
+    pack = next(i for i in intents if i["kind"] == "sticker_pack")
+    assert pack["prompt"] == "橘猫"
+    assert "表情组" not in text
+
+
 def test_sticker_collect_and_pick(client: TestClient):
     from app.media_cards import make_mood_card
     from app import stickers as stk

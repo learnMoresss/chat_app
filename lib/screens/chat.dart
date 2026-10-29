@@ -2724,17 +2724,18 @@ class _LinkCardBody extends StatelessWidget {
           : const <String>[];
       final subscribed = meta['subscribed'] == true;
       return SizedBox(
-        width: 228,
+        width: 248,
         child: InkWell(
           onTap: () async {
             final s = store;
             final api = s?.api;
             if (s == null || api == null || packId.isEmpty) return;
             try {
-              await api.subscribeStickerPack(packId);
+              // fork 成账号组，聊天「我」Tab 立即可见
+              await api.forkStickerPack(packId);
               if (context.mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text(subscribed ? '已在「我的组」' : '已加入我的组')),
+                  SnackBar(content: Text(subscribed ? '已复制到「我的组」' : '已加为我的一组')),
                 );
               }
               unawaited(s.refreshStickersFromApi());
@@ -2754,35 +2755,34 @@ class _LinkCardBody extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('表情包加入', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                Text(
+                  subscribed ? '表情组（点按复制到我的）' : '表情组 · 点按加为我的',
+                  style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                ),
                 const SizedBox(height: 6),
                 Text(packTitle, style: const TextStyle(color: Color(0xFFF2F2F7), fontSize: 14)),
                 if (tags.isNotEmpty)
                   Text(tags, style: const TextStyle(color: Color(0xFFAEAEB2), fontSize: 11)),
                 if (covers.isNotEmpty && store?.api != null) ...[
                   const SizedBox(height: 8),
-                  SizedBox(
-                    height: 48,
-                    child: Row(
-                      children: [
-                        for (final fid in covers.take(4))
-                          Padding(
-                            padding: const EdgeInsets.only(right: 4),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(4),
-                              child: SizedBox(
-                                width: 48,
-                                height: 48,
-                                child: AuthFileImage(
-                                  api: store!.api,
-                                  fileId: fid,
-                                  placeholder: const ColoredBox(color: Color(0xFF3A3A3C)),
-                                ),
-                              ),
+                  Wrap(
+                    spacing: 4,
+                    runSpacing: 4,
+                    children: [
+                      for (final fid in covers.take(9))
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: SizedBox(
+                            width: 40,
+                            height: 40,
+                            child: AuthFileImage(
+                              api: store!.api,
+                              fileId: fid,
+                              placeholder: const ColoredBox(color: Color(0xFF3A3A3C)),
                             ),
                           ),
-                      ],
-                    ),
+                        ),
+                    ],
                   ),
                 ],
                 const SizedBox(height: 8),
@@ -2800,7 +2800,7 @@ class _LinkCardBody extends StatelessWidget {
                         borderRadius: BorderRadius.circular(12),
                       ),
                       child: Text(
-                        subscribed ? '已在库' : '加入',
+                        subscribed ? '再复制' : '加为我的',
                         style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
                       ),
                     ),
