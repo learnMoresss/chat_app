@@ -1,8 +1,9 @@
-"""入站图片/视频描述：优先本机 Unlimited-OCR，回落 Paddle/Rapid；无字再启发式。"""
+"""入站图片/视频描述：本机 Unlimited-OCR + Rapid/飞桨（无云端）。"""
 from __future__ import annotations
 
 import base64
 import logging
+import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,10 +15,15 @@ log = logging.getLogger("vision_gen")
 
 
 def describe_image_path(path: str | Path, *, hint: str = "") -> Optional[str]:
-    """返回给人看的短摘要（含 OCR 文本）；详细坐标见 ocr_image_path。"""
+    """入站识图：本机 Unlimited 看内容；无结果再飞桨抠字。"""
     p = Path(path)
     if not p.is_file() or p.stat().st_size < 32:
         return None
+    engine = (get_settings().inbound_image_engine or "unlimited").strip().lower()
+    if engine in ("unlimited", "uocr", "baidu-unlimited", "auto"):
+        summary = _describe_via_unlimited(p, hint=hint)
+        if summary:
+            return summary
     summary, _lines = ocr_image_path(p, hint=hint)
     if summary:
         return summary
@@ -25,13 +31,11 @@ def describe_image_path(path: str | Path, *, hint: str = "") -> Optional[str]:
 
 
 def ocr_image_path(path: str | Path, *, hint: str = "") -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """OCR：返回 (摘要文本, lines[{text, box, score}])。优先 Unlimited。"""
+    """OCR：返回 (摘要文本, lines[{text, box, score}])。飞桨/Rapid（:9899）。"""
     p = Path(path)
     if not p.is_file() or p.stat().st_size < 32:
         return None, []
-    lines = _ocr_via_unlimited(p)
-    if not lines:
-        lines = _ocr_via_paddle(p)
+    lines = _ocr_via_paddle(p)
     if lines:
         texts = [str(x.get("text") or "").strip() for x in lines if (x.get("text") or "").strip()]
         joined = "；".join(texts[:24])
@@ -43,11 +47,152 @@ def ocr_image_path(path: str | Path, *, hint: str = "") -> Tuple[Optional[str], 
         elif not summary:
             summary = "图中无明显文字"
         return summary, lines
-    # OCR 服务不可用或无结果
     if hint:
         return f"图中无明显文字，对方说：{hint[:100]}", []
     h = _heuristic(p, hint=hint)
     return (h or "图中无明显文字"), []
+
+
+def _strip_uocr_markup(raw: str) -> str:
+    """去掉 Unlimited 的 <|det|> / <|ref|> 壳，留下可读正文。"""
+    import re
+
+    t = raw or ""
+    # <|det|>text [box]<|/det|>正文 或纯 det
+    t = re.sub(
+        r"<\|det\|>\w+\s*\[[^\]]*\]<\|/det\|>",
+        " ",
+        t,
+    )
+    t = re.sub(r"<\|/?[^|]+\|>", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    # 无有效内容的占位
+    if not t or t in {"image", "Image"}:
+        return ""
+    if "无法进行准确的文本识别" in t and len(t) < 80:
+        return ""
+    return t
+
+
+def _describe_via_unlimited(path: Path, *, hint: str = "") -> Optional[str]:
+    """本机 Unlimited-OCR：优先抠字；自然图若无字则返回空让上层回落。"""
+    try:
+        from . import unlimited_ocr
+
+        if not unlimited_ocr.configured():
+            return None
+        # 先走文档解析（强项）；自然图通常只有 det 框
+        lines = unlimited_ocr.ocr_image_lines(path)
+        texts = [str(x.get("text") or "").strip() for x in lines if (x.get("text") or "").strip()]
+        texts = [x for x in texts if x.lower() not in {"image", "non-text", "[non-text]"}]
+        if texts:
+            text = "图中文字：" + "；".join(texts[:24])
+            if hint:
+                text = f"{text}（对方说：{hint[:80]}）"
+            return text[:800]
+        # 再试自定义描述；若仍是空壳 det，视为无结果
+        prompt = (
+            "<image>请用中文简要描述画面主体、场景和关键文字。"
+            "若几乎无字，就一句话说明看见了什么。"
+        )
+        if hint:
+            prompt += f" 对方附言：{hint[:100]}"
+        raw = unlimited_ocr.describe_image(path, prompt=prompt)
+        text = _strip_uocr_markup(raw or "")
+        if not text:
+            return None
+        if hint and hint not in text:
+            text = f"{text}（对方说：{hint[:80]}）"
+        return text[:800]
+    except Exception as exc:
+        log.warning("unlimited describe failed: %s", exc)
+        return None
+
+
+def _deepseek_vision_key() -> str:
+    s = get_settings()
+    return (
+        (s.deepseek_api_key_official or "").strip()
+        or (s.deepseek_api_key or "").strip()
+    )
+
+
+def _describe_via_deepseek_official(path: Path, *, hint: str = "") -> Optional[str]:
+    """DeepSeek 官方 chat/completions 多模态识图。"""
+    key = _deepseek_vision_key()
+    if not key:
+        log.warning("deepseek vision: missing DEEPSEEK_API_KEY_OFFICIAL")
+        return None
+    s = get_settings()
+    base = (s.deepseek_vision_base_url or "https://api.deepseek.com").rstrip("/")
+    model = (s.deepseek_vision_model or "deepseek-chat").strip() or "deepseek-chat"
+    timeout = float(s.deepseek_vision_timeout_seconds or 45)
+    raw = _prepare_image_bytes(path)
+    if len(raw) < 32:
+        return None
+    mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    b64 = base64.b64encode(raw).decode("ascii")
+    prompt = (
+        "请用中文简要描述这张图片：主体、场景、以及图中可见的关键文字。"
+        "控制在 120 字以内，不要客套。"
+    )
+    if hint:
+        prompt += f"\n对方附言：{hint[:120]}"
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 280,
+        "temperature": 0.2,
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(
+                f"{base}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if r.status_code >= 400:
+            log.warning(
+                "deepseek vision http %s: %s",
+                r.status_code,
+                (r.text or "")[:240],
+            )
+            return None
+        j = r.json() if r.content else {}
+        msg = ((j.get("choices") or [{}])[0].get("message") or {})
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            # deepseek-flash 等偶发只填 reasoning_content
+            reason = str(msg.get("reasoning_content") or "").strip()
+            if reason:
+                # 取末段非空行作摘要，避免整段思维链灌进气泡
+                lines = [ln.strip() for ln in reason.splitlines() if ln.strip()]
+                content = lines[-1] if lines else reason
+                if len(content) < 12 and len(lines) >= 2:
+                    content = " ".join(lines[-3:])
+        text = content.strip()
+        if not text:
+            return None
+        return text[:800]
+    except Exception as exc:
+        log.warning("deepseek vision failed: %s", exc)
+        return None
 
 
 def _ocr_via_unlimited(path: Path) -> List[Dict[str, Any]]:

@@ -1139,14 +1139,29 @@ class AppStore extends ChangeNotifier {
     // 同 id 一律覆盖（一起听卡 ended、设备申请状态等依赖更新）
     final i = list.indexWhere((e) => e.id == m.id || (clientId != null && e.id == clientId));
     if (i >= 0) {
-      // 保留本地「转文字」显隐，避免 sync/WS 覆盖后气泡文字又消失
-      final prevVisible = list[i].meta?['asr_visible'] == true;
-      final prevBytes = list[i].meta?['local_bytes'];
-      if (prevVisible || prevBytes != null) {
+      // 保留本地预览/转文字，避免 sync/WS 覆盖后图片气泡变灰、ASR 又消失
+      final prev = list[i].meta;
+      final prevVisible = prev?['asr_visible'] == true;
+      final prevBytes = prev?['local_bytes'];
+      final prevPreviews = prev?['local_previews'];
+      final prevFiles = prev?['files'];
+      final prevAuth = prev?['auth_urls'];
+      final needKeep = prevVisible ||
+          prevBytes != null ||
+          prevPreviews != null ||
+          ((m.meta?['files'] is! List || (m.meta!['files'] as List).isEmpty) &&
+              prevFiles is List &&
+              prevFiles.isNotEmpty);
+      if (needKeep) {
         m.meta = {
           ...?m.meta,
           if (prevVisible) 'asr_visible': true,
           if (prevBytes != null) 'local_bytes': prevBytes,
+          if (prevPreviews != null) 'local_previews': prevPreviews,
+          if ((m.meta?['files'] is! List || (m.meta!['files'] as List).isEmpty) &&
+              prevFiles is List)
+            'files': prevFiles,
+          if (prevAuth != null && m.meta?['auth_urls'] == null) 'auth_urls': prevAuth,
         };
       }
       list[i] = m;
@@ -1753,6 +1768,15 @@ class AppStore extends ChangeNotifier {
         }
       }
       optimistic.bytes = totalBytes;
+      // 上传已完成：先消掉转圈，再等服务端落库/OCR（OCR 可能较慢，不应拖住气泡）
+      optimistic.meta = {
+        ...?optimistic.meta,
+        'files': ids,
+        'auth_urls': [for (final id in ids) api!.mediaAuthUrl(id)],
+      };
+      optimistic.state = SendState.sent;
+      ping();
+      final prevPreviews = optimistic.meta?['local_previews'];
       final raw = await api!.sendMessage(
         convId: c.id,
         clientId: clientId,
@@ -1765,7 +1789,6 @@ class AppStore extends ChangeNotifier {
       _upsertRemoteMessage(message, replaceClientId: clientId);
       final i = msgs(c.id).indexWhere((m) => m.id == clientId || m.id == message['id']);
       if (i >= 0) {
-        final prevPreviews = msgs(c.id)[i].meta?['local_previews'];
         msgs(c.id)[i].meta = {
           ...?msgs(c.id)[i].meta,
           'files': ids,
@@ -1777,10 +1800,13 @@ class AppStore extends ChangeNotifier {
       unawaited(_persistCache());
       ping();
     } catch (e) {
-      optimistic.state = SendState.failed;
-      final msg = e is ApiException ? e.message : '$e';
-      // 避免「发送失败：上传失败：…」叠两层
-      optimistic.text = msg.startsWith('发送失败') ? msg : '发送失败：$msg';
+      // 上传已成功则保留已发送态，仅落库失败时标失败
+      if (optimistic.state != SendState.sent) {
+        optimistic.state = SendState.failed;
+        final msg = e is ApiException ? e.message : '$e';
+        // 避免「发送失败：上传失败：…」叠两层
+        optimistic.text = msg.startsWith('发送失败') ? msg : '发送失败：$msg';
+      }
       ping();
     }
   }

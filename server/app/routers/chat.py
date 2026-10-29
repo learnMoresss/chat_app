@@ -1721,7 +1721,8 @@ async def send_message(
         raise HTTPException(status_code=400, detail="消息不能为空")
 
     # 喂给模型的文案：媒体/表情/注入一律入站整形，不把 JSON 塞进上下文、不改气泡
-    ocr_meta_lines: list = []
+    # 入站识图默认 DeepSeek 官方多模态；超时用占位，气泡先返回。
+    _VISION_SEND_TIMEOUT_S = 20.0
     if kind == "image" and media_ids:
         n = len(media_ids)
         cap = body.text.strip()
@@ -1729,36 +1730,30 @@ async def send_message(
         try:
             from pathlib import Path
 
-            from ..vision_gen import ocr_image_path
+            from ..vision_gen import describe_image_path
 
-            for mid in media_ids[:4]:
+            async def _vision_one(mid: str) -> Optional[str]:
                 row = db.fetchone(
                     "SELECT path FROM media_files WHERE id = ? AND user_id = ?",
                     (mid, user["id"]),
                 )
-                if row and (row["path"] or ""):
-                    d, lines = await asyncio.to_thread(
-                        ocr_image_path, Path(row["path"]), hint=cap
+                if not row or not (row["path"] or ""):
+                    return None
+                return await asyncio.to_thread(
+                    describe_image_path, Path(row["path"]), hint=cap
+                )
+
+            for mid in media_ids[:4]:
+                try:
+                    d = await asyncio.wait_for(
+                        _vision_one(mid), timeout=_VISION_SEND_TIMEOUT_S
                     )
-                    if d:
-                        descs.append(d)
-                    if lines:
-                        ocr_meta_lines.append(
-                            {
-                                "file_id": mid,
-                                "lines": [
-                                    {
-                                        "text": x.get("text"),
-                                        "score": x.get("score"),
-                                        "box": x.get("box"),
-                                    }
-                                    for x in lines[:40]
-                                ],
-                            }
-                        )
+                except asyncio.TimeoutError:
+                    continue
+                if d:
+                    descs.append(d)
         except Exception:
             descs = []
-            ocr_meta_lines = []
         if descs:
             joined = "；".join(descs)
             user_text_for_model = f"[对方发来{n}张图片] {joined}" + (
@@ -1767,20 +1762,7 @@ async def send_message(
         else:
             joined = ""
             user_text_for_model = f"[对方发来{n}张图片]" + (f"：{cap}" if cap else "")
-        if ocr_meta_lines:
-            # 坐标写入 instructions，不污染气泡正文
-            box_hint = []
-            for block in ocr_meta_lines:
-                for ln in block.get("lines") or []:
-                    t = (ln.get("text") or "").strip()
-                    if not t:
-                        continue
-                    box_hint.append(f"{t}@{ln.get('box')}")
-            if box_hint:
-                user_text_for_model += (
-                    "\n[OCR坐标] " + "；".join(box_hint[:24])
-                )
-        # 把 OCR 摘要写回消息 JSON，供连发合并 / 历史回放；客户端忽略未知字段
+        # 把识图摘要写回消息 JSON，供连发合并 / 历史回放；客户端忽略未知字段
         if joined:
             try:
                 payload_obj = json.loads(text) if text.startswith("{") else {

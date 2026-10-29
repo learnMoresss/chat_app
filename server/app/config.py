@@ -73,18 +73,29 @@ class Settings(BaseSettings):
     # 入站识图/文档：优先本机 Unlimited-OCR（vLLM）；不可用时回落 Paddle/Rapid。
     ocr_base_url: str = "http://127.0.0.1:9899"
     ocr_timeout_seconds: float = 30.0
+    # 本机 Unlimited-OCR HTTP（:9898）；空=关闭
     unlimited_ocr_base_url: str = "http://127.0.0.1:9898/v1"
     unlimited_ocr_model: str = "baidu/Unlimited-OCR"
-    unlimited_ocr_timeout_seconds: float = 180.0
+    # 入站识图预算（已限制 max_new_tokens，不宜再拉太长）
+    unlimited_ocr_timeout_seconds: float = 60.0
     # 兼容旧 .env（忽略）
     baidu_ocr_api_key: str = ""
     baidu_ocr_secret_key: str = ""
     baidu_ocr_timeout_seconds: float = 120.0
-    # 旧 VL 配置保留字段以免 .env 报错，代码不再使用
+    # 本地 VL（可选兜底）；入站默认走 DeepSeek 官方识图
     vision_chat_url: str = ""
     vision_api_token: str = ""
     vision_model: str = ""
     vision_timeout_seconds: float = 90.0
+    # DeepSeek 官方多模态识图（api.deepseek.com）
+    deepseek_api_key_official: str = ""
+    deepseek_api_key: str = ""
+    deepseek_vision_base_url: str = "https://api.deepseek.com"
+    # flash 识图常把正文放进 reasoning_content；chat 更稳
+    deepseek_vision_model: str = "deepseek-chat"
+    deepseek_vision_timeout_seconds: float = 45.0
+    # inbound image: unlimited | paddle
+    inbound_image_engine: str = "unlimited"
     # 出站语音：同会话冷却（秒）、标记内最长字数
     voice_reply_cooldown_seconds: float = 45.0
     voice_reply_max_chars: int = 80

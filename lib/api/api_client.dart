@@ -455,80 +455,33 @@ class ApiClient {
     );
   }
 
-  /// 公网跳板直传基址（大文件不经 SSH 反向隧道）。
+  /// 公网跳板直传基址（未部署时勿探测，避免每次上传空等）。
   static const publicStagingBase = 'https://119.45.30.73:8443/chat-staging';
-
-  bool get _preferPublicStaging {
-    final u = baseUrl.toLowerCase();
-    return u.contains('119.45.30.73') || u.contains('/chat-api');
-  }
-
-  Future<bool> _publicStagingAlive() async {
-    final io = _uploadHttpClient();
-    final client = IOClient(io);
-    try {
-      final res = await client
-          .get(Uri.parse('$publicStagingBase/health'))
-          .timeout(const Duration(seconds: 4));
-      return res.statusCode == 200 && res.body.contains('chat-upload-staging');
-    } catch (_) {
-      return false;
-    } finally {
-      try {
-        client.close();
-      } catch (_) {}
-    }
-  }
 
   HttpClient _uploadHttpClient() {
     return HttpClient()
-      ..connectionTimeout = const Duration(seconds: 30)
-      ..idleTimeout = const Duration(minutes: 3)
+      ..connectionTimeout = const Duration(seconds: 20)
+      ..idleTimeout = const Duration(seconds: 90)
       ..badCertificateCallback = (cert, host, port) => host == '119.45.30.73';
   }
 
   /// 聊天媒体上传，返回 file_id / auth_url。
   ///
-  /// 公网优先跳板直传；未部署则直传 /chat-upload。
-  /// 反向隧道偶发拥堵时自动重试（同内容服务端会去重）。
+  /// 经公网反代直传 /chat-upload；隧道偶发拥堵时自动重试（同内容服务端会去重）。
   Future<Map<String, dynamic>> uploadChatMedia({
     required Uint8List bytes,
     required String filename,
     String kind = 'image',
     String contentType = 'application/octet-stream',
     bool allowAuthRetry = true,
-    Duration timeout = const Duration(seconds: 120),
+    Duration timeout = const Duration(seconds: 45),
   }) async {
     if (accessToken == null || accessToken!.isEmpty) {
       throw ApiException('未登录', statusCode: 401, authNoise: true);
     }
     Object? last;
-    final useStaging = _preferPublicStaging && await _publicStagingAlive();
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
-        if (useStaging) {
-          try {
-            return await _uploadViaPublicStaging(
-              bytes: bytes,
-              filename: filename,
-              kind: kind,
-              contentType: contentType,
-              allowAuthRetry: allowAuthRetry,
-              timeout: timeout,
-            );
-          } on ApiException catch (e) {
-            // 跳板异常 → 本轮改直传（隧道路径）
-            if (e.statusCode == 408 || e.message.contains('超时')) rethrow;
-            return await _uploadDirectChat(
-              bytes: bytes,
-              filename: filename,
-              kind: kind,
-              contentType: contentType,
-              allowAuthRetry: allowAuthRetry,
-              timeout: timeout,
-            );
-          }
-        }
         return await _uploadDirectChat(
           bytes: bytes,
           filename: filename,

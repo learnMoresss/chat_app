@@ -119,7 +119,13 @@ def _lines_from_grounding(raw: str) -> List[Dict[str, Any]]:
     ][:200]
 
 
-def _chat(images: List[Path], *, multi: bool = False) -> str:
+def _chat(
+    images: List[Path],
+    *,
+    multi: bool = False,
+    prompt: str = "",
+    max_tokens: int = 1024,
+) -> str:
     if not images:
         return ""
     base = _base_url()
@@ -127,18 +133,18 @@ def _chat(images: List[Path], *, multi: bool = False) -> str:
         raise RuntimeError("unlimited_ocr_not_configured")
     n = len(images)
     if multi or n > 1:
-        prompt = ("<image>" * n) + "Multi page parsing."
+        use_prompt = (prompt or "").strip() or (("<image>" * n) + "Multi page parsing.")
         window = 1024
     else:
-        prompt = "<image>document parsing."
+        use_prompt = (prompt or "").strip() or "<image>document parsing."
         window = 128
-    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content: List[Dict[str, Any]] = [{"type": "text", "text": use_prompt}]
     for p in images:
         content.append({"type": "image_url", "image_url": {"url": _data_url(p)}})
     payload = {
         "model": _model(),
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": 8192,
+        "max_tokens": max(64, min(int(max_tokens or 1024), 2048)),
         "temperature": 0.0,
         "skip_special_tokens": False,
         "vllm_xargs": {"ngram_size": 35, "window_size": window},
@@ -153,6 +159,22 @@ def _chat(images: List[Path], *, multi: bool = False) -> str:
         return str(j["choices"][0]["message"]["content"] or "")
     except Exception as exc:
         raise RuntimeError(f"unlimited_ocr_bad_response:{j}") from exc
+
+
+def describe_image(path: str | Path, *, prompt: str = "") -> str:
+    """本机 Unlimited 通用描述（自定义 prompt；限制 max_tokens）。"""
+    p = Path(path)
+    if not p.is_file():
+        return ""
+    return (
+        _chat(
+            [p],
+            prompt=prompt
+            or "<image>用中文简要描述画面主体、场景和关键文字。",
+            max_tokens=512,
+        )
+        or ""
+    ).strip()
 
 
 def _pdf_to_images(path: Path, *, max_pages: int = 20) -> List[Path]:

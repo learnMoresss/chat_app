@@ -62,23 +62,37 @@ def _save_data_url(url: str, dest: Path) -> None:
     dest.write_bytes(base64.b64decode(m.group(2)))
 
 
-def _infer(images: List[Path], prompt: str) -> str:
+def _infer(images: List[Path], prompt: str, *, max_tokens: int = 1024) -> str:
     _load()
     model = _bundle["model"]
     tok = _bundle["tok"]
     out_dir = Path(tempfile.mkdtemp(prefix="uocr_out_"))
+    # UnlimitedOCR.infer 参数名是 max_length；但 generation_config.max_new_tokens
+    # 默认 32768 会优先生效，必须一起压住，否则单次推理可卡数分钟。
+    max_new = max(64, min(int(max_tokens or 1024), 2048))
+    try:
+        gc = getattr(model, "generation_config", None)
+        if gc is not None:
+            gc.max_new_tokens = max_new
+            if hasattr(gc, "max_length"):
+                gc.max_length = None
+    except Exception:
+        pass
+    prompt = (prompt or "").strip() or "<image>document parsing."
+    # 文档解析才开 crop；自然图关掉，避免裁空
+    crop = "document parsing" in prompt.lower() or "multi page" in prompt.lower()
     try:
         # eval_mode=True 才会 return 文本；save_results 只写盘不返回
         if len(images) <= 1:
             text = model.infer(
                 tok,
-                prompt=prompt or "<image>document parsing.",
+                prompt=prompt,
                 image_file=str(images[0]),
                 output_path=str(out_dir),
                 base_size=1024,
                 image_size=640,
-                crop_mode=True,
-                max_length=8192,
+                crop_mode=crop,
+                max_length=max_new,
                 no_repeat_ngram_size=35,
                 ngram_window=128,
                 eval_mode=True,
@@ -91,7 +105,7 @@ def _infer(images: List[Path], prompt: str) -> str:
                 image_files=[str(p) for p in images],
                 output_path=str(out_dir),
                 image_size=1024,
-                max_length=8192,
+                max_length=max_new,
                 no_repeat_ngram_size=35,
                 ngram_window=1024,
                 eval_mode=True,
@@ -149,7 +163,7 @@ def chat(req: ChatReq):
                 prompt = "".join(texts)
         if not images:
             raise HTTPException(status_code=400, detail="no_image")
-        text = _infer(images, prompt)
+        text = _infer(images, prompt, max_tokens=int(req.max_tokens or 1024))
         return {
             "id": "uocr-local",
             "object": "chat.completion",
