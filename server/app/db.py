@@ -127,10 +127,9 @@ CREATE TABLE IF NOT EXISTS channels (
 CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id);
 """
 
-# 预设模板（无 Key）；同一厂商可有多条（官方订阅 / 日卡等），管理员填公共 Key
+# 预设模板（无 Key）；日卡已过期，不再预置
 DEFAULT_CHANNEL_PRESETS = [
-    ("DeepSeek官方订阅", "deepseek-flash", "https://api.deepseek.com"),
-    ("DeepSeek日卡", "deepseek-v4.1-flash", "https://8888ok.cc/v1"),
+    ("DeepSeek官方订阅", "deepseek-chat", "https://api.deepseek.com"),
     ("通义千问", "qwen-plus", "https://dashscope.aliyuncs.com/compatible-mode"),
     ("智谱", "glm-4-flash", "https://open.bigmodel.cn/api/paas"),
     ("Kimi", "moonshot-v1-8k", "https://api.moonshot.cn"),

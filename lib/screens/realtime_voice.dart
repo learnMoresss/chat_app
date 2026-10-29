@@ -64,6 +64,9 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   bool _inCall = false;
   bool _busyTurn = false;
   bool _hangingUp = false;
+  /// 本页是否仍拥有通话（被 voice_replaced 顶替后为 false，dispose 不再 hangup）
+  bool _ownsCall = true;
+  String? _callId;
   String? _turnId;
   bool _turnIdPending = false; // HTTP 尚未返回 turn_id，先收事件
   final Set<String> _ignoredTurns = <String>{};
@@ -98,19 +101,22 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   bool _floorReady = false;
   double _speechDb = -42;
   double _silenceDb = -48;
-  // 50ms 采样：6 tick ≈ 300ms 乐观切句
-  static const int _silenceNeeded = 6;
-  static const int _minSpeechMs = 250;
+  // 50ms 采样：11 tick ≈ 550ms 静音再切句（单次上传，避免乐观连发触发限流）
+  static const int _silenceNeeded = 11;
+  static const int _minSpeechMs = 400;
+  // 连续 4 tick（≈200ms）超过阈值才算开口，单次咔哒/回声尾音不触发
+  static const int _speechStartTicks = 4;
+  int _voicedTicks = 0;
+  static const int _bargeStartDelayMs = 600;
+  Future<void> _audioChain = Future<void>.value();
   static const int _maxListenSec = 15;
-  static const int _maxAfterSpeechSec = 2;
+  static const int _maxAfterSpeechSec = 8;
   static const int _floorMs = 300;
-  static const int _tailListenMs = 700; // 乐观发送后再听一会儿有没有接着说
-  bool _optimisticSent = false;
-  Uint8List? _optimisticBytes;
-  Timer? _tailTimer;
+  Uint8List? _pendingHead; // 合并续录时的前半段 WAV
+  bool _uploadInFlight = false;
   bool _bargeMonitoring = false;
   int _bargeTicks = 0;
-  static const int _bargeNeedTicks = 4; // ~200ms 持续人声才打断，防残回声
+  static const int _bargeNeedTicks = 6; // ~300ms 持续人声才打断，防残回声
 
   ApiClient? get _api => widget.store.api;
 
@@ -129,7 +135,6 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   void dispose() {
     _hangingUp = true;
     _bargeMonitoring = false;
-    _tailTimer?.cancel();
     unawaited(_ampSub?.cancel());
     widget.store.removeVoiceRealtimeListener(_onVoiceEvent);
     _playerDone?.cancel();
@@ -144,13 +149,18 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       unawaited(VoiceRecorder.stop(cancel: true));
     }
     unawaited(AppAudio.leaveCallAudioMode());
-    // dispose 时若未正常挂断，补一次（时长可能为 0）
+    // 仅本页仍拥有通话时补 hangup；被顶替的旧页绝不能误杀最新一路
     final api = _api;
-    if (api != null && _callStartedAt != null) {
+    if (_ownsCall && api != null && _callStartedAt != null) {
       final sec = DateTime.now().difference(_callStartedAt!).inSeconds;
+      final cid = _callId ?? '';
       unawaited(
         api
-            .voiceRealtimeHangup(convId: widget.convId, durationSec: sec)
+            .voiceRealtimeHangup(
+              convId: widget.convId,
+              durationSec: sec,
+              callId: cid,
+            )
             .catchError((_) => <String, dynamic>{}),
       );
     }
@@ -174,9 +184,12 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       return;
     }
     try {
-      // 1) 插入通话气泡
+      // 1) 插入通话气泡（服务端会先清空该账号旧通话，只留最新一路）
       try {
-        await api.voiceRealtimeStart(convId: widget.convId);
+        final started = await api.voiceRealtimeStart(convId: widget.convId);
+        final cid = (started['call_id'] ?? '').toString();
+        if (cid.isNotEmpty) _callId = cid;
+        _ownsCall = true;
       } catch (e) {
         if (mounted) {
           setState(() {
@@ -191,10 +204,11 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       // 通话音频通路：VOICE_COMMUNICATION + 外放，打开系统 AEC
       await AppAudio.enterCallAudioMode(speakerOn: _speakerOn);
 
-      // 2) 立刻 warm：乐观拉起 SenseVoice + CosyVoice（不常驻），loading 盖住冷启动
-      setState(() => _statusOverride = '接通中…');
+      // 2) warm：ASR + CosyVoice 预热完成前 ready=false，保持 loading 阻塞开麦
+      setState(() => _statusOverride = '接通中，正在准备语音…');
       unawaited(api.voiceRealtimeWarm(convId: widget.convId));
-      for (var i = 0; i < 60; i++) {
+      // 最长约 3 分钟（模型冷启动）
+      for (var i = 0; i < 360; i++) {
         final r = await api.voiceRealtimeReady(convId: widget.convId);
         if (!mounted || _hangingUp) return;
 
@@ -208,11 +222,14 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         }
 
         final reason = (r['reason'] ?? '').toString();
-        if (reason.isNotEmpty && mounted) {
-          setState(() => _statusOverride = reason);
+        if (mounted) {
+          setState(() {
+            _phase = VoiceUiPhase.connecting;
+            _statusOverride = reason.isNotEmpty ? reason : '接通中，正在准备语音…';
+          });
         }
 
-        if (r['ready'] == true) {
+        if (r['ready'] == true && r['tts_warmed'] != false) {
           setState(() {
             _ready = true;
             _inCall = true;
@@ -224,13 +241,24 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
           await _startListenLoop();
           return;
         }
+        // 预热明确失败：停止空转，提示重试
+        final warming = r['tts_warming'] == true;
+        final warmed = r['tts_warmed'] == true;
+        if (!warming && !warmed && reason.contains('预热失败') && i > 4) {
+          setState(() {
+            _ready = false;
+            _phase = VoiceUiPhase.blocked;
+            _statusOverride = reason;
+          });
+          return;
+        }
         await Future<void>.delayed(const Duration(milliseconds: 500));
       }
       if (mounted) {
         setState(() {
           _ready = false;
           _phase = VoiceUiPhase.blocked;
-          _statusOverride = '连接超时，点球体重试';
+          _statusOverride = '语音准备超时，点球体重试';
         });
       }
     } catch (e) {
@@ -253,9 +281,13 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   }
 
   void _onVoiceEvent(String event, Map<String, dynamic> payload) {
+    if (event == 'voice_replaced') {
+      _onCallReplaced(payload);
+      return;
+    }
     final tid = payload['turn_id']?.toString();
     if (_isIgnoredTurn(tid)) return;
-    if (!mounted || _hangingUp) return;
+    if (!mounted || _hangingUp || !_ownsCall) return;
 
     switch (event) {
       case 'voice_cancelled':
@@ -263,6 +295,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         unawaited(_interruptPlayback());
         _busyTurn = false;
         _turnIdPending = false;
+        _uploadInFlight = false;
         if (!_muted && _inCall && !_recording) {
           unawaited(_startListenLoop());
         }
@@ -275,8 +308,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         }
         _busyTurn = false;
         _turnIdPending = false;
-        _optimisticSent = false;
-        _optimisticBytes = null;
+        _uploadInFlight = false;
         if (mounted) {
           setState(() {
             _phase = VoiceUiPhase.listening;
@@ -316,12 +348,31 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
           _statusOverride = '';
         });
       case 'voice_audio':
-        unawaited(_onVoiceAudioChunk(payload));
+        // 串行处理：prepare 未完成时后续块不能抢先写入
+        _audioChain = _audioChain.then((_) => _onVoiceAudioChunk(payload)).catchError((_) {});
       case 'voice_audio_end':
         break;
+      case 'voice_ignored':
+        // 底噪/空识别：撤掉「…」占位，安静地继续听
+        _turnIdPending = false;
+        _uploadInFlight = false;
+        setState(() {
+          if (_captions.isNotEmpty &&
+              _captions.last.mine &&
+              (_captions.last.full == '…' || _captions.last.full == '（识别中）')) {
+            _captions.removeLast();
+          }
+          _busyTurn = false;
+          _phase = VoiceUiPhase.inCall;
+          _statusOverride = '';
+        });
+        if (!_muted && _inCall && !_recording) {
+          unawaited(_startListenLoop());
+        }
       case 'voice_done':
         _serverTurnDone = true;
         _turnIdPending = false;
+        _uploadInFlight = false;
         _holdPrefix = '';
         setState(() => _busyTurn = false);
         unawaited(_finishStreamAndMaybeListen());
@@ -331,6 +382,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         _streamingAudio = false;
         _serverTurnDone = true;
         _turnIdPending = false;
+        _uploadInFlight = false;
         setState(() {
           if (_captions.isNotEmpty &&
               _captions.last.mine &&
@@ -374,10 +426,15 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     if (!_streamingAudio) {
       _streamingAudio = true;
       _serverTurnDone = false;
-      await _streamPlayer.prepare(sampleRate: sr);
+      await _streamPlayer.prepare(sampleRate: sr, speaker: _speakerOn);
+      if (_isIgnoredTurn(tid) || !mounted || _hangingUp) return;
       if (mounted) setState(() => _phase = VoiceUiPhase.speaking);
-      // 通话模式 AEC 下开插话监听：持续人声才打断
-      unawaited(_ensureBargeMonitor());
+      // 等播放稳定后再开插话监听，避免开麦切路由打断刚起播的声音
+      final gen = _listenGen;
+      Future<void>.delayed(const Duration(milliseconds: _bargeStartDelayMs), () {
+        if (!mounted || _hangingUp || gen != _listenGen || !_streamingAudio) return;
+        unawaited(_ensureBargeMonitor());
+      });
     }
     await _streamPlayer.addPcm(pcm, sampleRate: sr);
   }
@@ -406,8 +463,8 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         if (!mounted || _hangingUp || gen != _listenGen) return;
         if (!_bargeMonitoring) return;
         if (_phase != VoiceUiPhase.speaking && !_streamingAudio && !_playing) return;
-        // 阈值略高于听筒说话阈值，外放残回声更难误触
-        final thr = (_speechDb + 8).clamp(-40.0, -22.0);
+        // 阈值明显高于听筒说话阈值，外放残回声更难误触
+        final thr = (_speechDb + 10).clamp(-34.0, -20.0);
         if (amp.current >= thr) {
           _bargeTicks += 1;
           if (_bargeTicks >= _bargeNeedTicks) {
@@ -424,6 +481,9 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   }
 
   /// 打断对方（插话或点球体）：停播并听你说。
+  ///
+  /// 关键：插话监听已在录音，不能 `stop(cancel:true)` 丢掉这段；
+  /// 直接升级为本轮用户发言，沿用底噪阈值，说完静音再上传。
   Future<void> _bargeIn() async {
     if (_hangingUp || !_inCall || _muted) return;
     if (_phase != VoiceUiPhase.speaking && !_streamingAudio && !_playing && !_busyTurn) {
@@ -433,11 +493,12 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     if (tid != null && tid.isNotEmpty) _ignoredTurns.add(tid);
     _busyTurn = false;
     _turnIdPending = false;
+    final keepRec = _recording;
     _bargeMonitoring = false;
     _bargeTicks = 0;
-    _tailTimer?.cancel();
-    _optimisticSent = false;
-    _optimisticBytes = null;
+    _pendingHead = null;
+    _uploadInFlight = false;
+    _streamingAudio = false;
     final api = _api;
     if (api != null) {
       unawaited(
@@ -446,17 +507,43 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
             .catchError((_) => <String, dynamic>{}),
       );
     }
-    await _stopAmp();
-    if (_recording) {
-      _recording = false;
-      await VoiceRecorder.stop(cancel: true);
+    unawaited(_interruptPlayback());
+
+    if (keepRec) {
+      // 把插话监听录音直接转成「我在说话」
+      final gen = ++_listenGen;
+      _speechStarted = true;
+      _speechStartedAt = DateTime.now();
+      _voicedTicks = _speechStartTicks;
+      _silenceTicks = 0;
+      _listenStarted ??= DateTime.now();
+      if (!_floorReady) {
+        _floorReady = true;
+        _speechDb = (_noiseFloor + 14).clamp(-42.0, -26.0);
+        _silenceDb = (_noiseFloor + 7).clamp(-50.0, -34.0);
+      }
+      if (mounted) {
+        setState(() {
+          _phase = VoiceUiPhase.listening;
+          _statusOverride = '';
+        });
+      }
+      await _stopAmp();
+      _ampSub = VoiceRecorder.onAmplitude(const Duration(milliseconds: 50)).listen((amp) {
+        if (!mounted || _hangingUp || gen != _listenGen || !_recording) return;
+        _onAmp(amp);
+      });
+      return;
     }
-    await _interruptPlayback();
+
+    await _stopAmp();
     if (!mounted || _hangingUp || _muted) return;
     await _startListenLoop();
   }
 
   Future<void> _finishStreamAndMaybeListen() async {
+    // voice_done 与最后几块音频几乎同时到：先等所有块进播放器
+    await _audioChain;
     if (_streamingAudio) {
       await _streamPlayer.markGenerationDone();
       await _streamPlayer.waitUntilDrained();
@@ -573,9 +660,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     if (!_ready || !_inCall || _muted || _busyTurn || _recording || _hangingUp) return;
     if (_playing || _queue.isNotEmpty || _streamingAudio) return;
     final gen = ++_listenGen;
-    _tailTimer?.cancel();
-    _optimisticSent = false;
-    _optimisticBytes = null;
+    _pendingHead = null;
     await _interruptPlayback();
     try {
       await VoiceRecorder.startCall();
@@ -585,6 +670,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       }
       _recording = true;
       _speechStarted = false;
+      _voicedTicks = 0;
       _silenceTicks = 0;
       _listenStarted = DateTime.now();
       _speechStartedAt = null;
@@ -624,26 +710,18 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         return;
       }
       _floorReady = true;
-      _speechDb = (_noiseFloor + 12).clamp(-45.0, -28.0);
-      _silenceDb = (_noiseFloor + 6).clamp(-52.0, -35.0);
+      _speechDb = (_noiseFloor + 14).clamp(-42.0, -26.0);
+      _silenceDb = (_noiseFloor + 7).clamp(-50.0, -34.0);
     } else if (!_speechStarted && db < _speechDb) {
       // 持续轻量更新底噪
       _noiseFloor = (_noiseFloor * 0.95) + (db * 0.05);
-      _speechDb = (_noiseFloor + 12).clamp(-45.0, -28.0);
-      _silenceDb = (_noiseFloor + 6).clamp(-52.0, -35.0);
-    }
-
-    // 乐观发送后的尾听：又开口了 → 取消本轮、合并重录
-    if (_optimisticSent) {
-      if (db >= _speechDb) {
-        unawaited(_cancelOptimisticAndContinue());
-      }
-      return;
+      _speechDb = (_noiseFloor + 14).clamp(-42.0, -26.0);
+      _silenceDb = (_noiseFloor + 7).clamp(-50.0, -34.0);
     }
 
     if (elapsed.inSeconds >= _maxListenSec) {
       if (_speechStarted) {
-        unawaited(_stopListenAndSend(finalize: true));
+        unawaited(_stopListenAndSend());
       } else {
         unawaited(_restartListenQuiet());
       }
@@ -652,8 +730,10 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
 
     if (db >= _speechDb) {
       if (!_speechStarted) {
+        _voicedTicks += 1;
+        if (_voicedTicks < _speechStartTicks) return;
         _speechStarted = true;
-        _speechStartedAt = now;
+        _speechStartedAt = now.subtract(Duration(milliseconds: 50 * (_speechStartTicks - 1)));
         if (mounted && _statusOverride.isNotEmpty) {
           setState(() => _statusOverride = '');
         }
@@ -662,10 +742,13 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       return;
     }
 
-    if (!_speechStarted) return;
+    if (!_speechStarted) {
+      _voicedTicks = 0;
+      return;
+    }
     final spokenMs = _speechStartedAt == null ? 0 : now.difference(_speechStartedAt!).inMilliseconds;
     if (spokenMs >= _maxAfterSpeechSec * 1000) {
-      unawaited(_stopListenAndSend(finalize: true));
+      unawaited(_stopListenAndSend());
       return;
     }
     if (db > _silenceDb) {
@@ -673,9 +756,9 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       return;
     }
     _silenceTicks += 1;
-    // ~300ms 静音 → 乐观提前发送
+    // ~550ms 静音 → 单次上传（不做乐观提前发，避免 turn/cancel 连发）
     if (_silenceTicks >= _silenceNeeded && spokenMs >= _minSpeechMs) {
-      unawaited(_stopListenAndSend(finalize: false));
+      unawaited(_stopListenAndSend());
     }
   }
 
@@ -691,10 +774,9 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     await _startListenLoop();
   }
 
-  /// finalize=false：乐观发送，再听 [_tailListenMs]；期间又说话则取消合并。
-  Future<void> _stopListenAndSend({required bool finalize}) async {
+  Future<void> _stopListenAndSend() async {
     await _stopAmp();
-    if (!_recording) return;
+    if (!_recording || _uploadInFlight) return;
     _recording = false;
     if (mounted) {
       setState(() {
@@ -702,7 +784,9 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         _phase = VoiceUiPhase.thinking;
         _statusOverride = '';
       });
-      if (_captions.isEmpty || !(_captions.last.mine && (_captions.last.full == '…' || _captions.last.full == '（识别中）'))) {
+      if (_captions.isEmpty ||
+          !(_captions.last.mine &&
+              (_captions.last.full == '…' || _captions.last.full == '（识别中）'))) {
         _pushCaption(mine: true, text: '…');
       }
     }
@@ -716,7 +800,8 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       if (!_muted && _inCall) unawaited(_startListenLoop());
       return;
     }
-    final spokenMs = _speechStartedAt == null ? 0 : DateTime.now().difference(_speechStartedAt!).inMilliseconds;
+    final spokenMs =
+        _speechStartedAt == null ? 0 : DateTime.now().difference(_speechStartedAt!).inMilliseconds;
     if (spokenMs < _minSpeechMs && captured.seconds < 1) {
       try {
         captured.file.deleteSync();
@@ -737,128 +822,23 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       captured.file.deleteSync();
     } catch (_) {}
 
-    if (!finalize) {
-      _optimisticBytes = bytes;
-      _optimisticSent = true;
-      unawaited(_uploadTurn(bytes));
-      // 尾听：再开麦 700ms，看有没有接着说
-      try {
-        await VoiceRecorder.startCall();
-        _recording = true;
-        final gen = _listenGen;
-        await _stopAmp();
-        _ampSub = VoiceRecorder.onAmplitude(const Duration(milliseconds: 50)).listen((amp) {
-          if (!mounted || _hangingUp || gen != _listenGen || !_recording) return;
-          _onAmp(amp);
-        });
-        _tailTimer?.cancel();
-        _tailTimer = Timer(const Duration(milliseconds: _tailListenMs), () {
-          if (!mounted || _hangingUp) return;
-          if (!_optimisticSent) return;
-          // 尾听无再开口：正式关麦，等服务端结果
-          unawaited(_endOptimisticTail());
-        });
-      } catch (_) {
-        _optimisticSent = false;
-      }
-      return;
-    }
-
     await _uploadTurn(bytes);
-  }
-
-  Future<void> _endOptimisticTail() async {
-    await _stopAmp();
-    if (_recording) {
-      _recording = false;
-      await VoiceRecorder.stop(cancel: true);
-    }
-    _optimisticSent = false;
-    _optimisticBytes = null;
-  }
-
-  Future<void> _cancelOptimisticAndContinue() async {
-    _tailTimer?.cancel();
-    final prev = _optimisticBytes;
-    _optimisticSent = false;
-    _optimisticBytes = null;
-    final tid = _turnId;
-    if (tid != null && tid.isNotEmpty) _ignoredTurns.add(tid);
-    _turnIdPending = false;
-    _busyTurn = false;
-    final api = _api;
-    if (api != null) {
-      unawaited(
-        api.voiceRealtimeCancel(convId: widget.convId, turnId: tid ?? '').catchError((_) => <String, dynamic>{}),
-      );
-    }
-    // 去掉占位「…」，继续录；停当前尾听段，把前后 WAV 合并后等下次静音再发
-    await _stopAmp();
-    Uint8List? second;
-    if (_recording) {
-      _recording = false;
-      final cap = await VoiceRecorder.stop();
-      if (cap != null) {
-        second = await cap.file.readAsBytes();
-        try {
-          cap.file.deleteSync();
-        } catch (_) {}
-      }
-    }
-    Uint8List? merged;
-    if (prev != null && second != null) {
-      merged = VoiceRecorder.mergeWavBytes(prev, second);
-    }
-    if (mounted) {
-      setState(() {
-        _phase = VoiceUiPhase.listening;
-        _statusOverride = '';
-      });
-    }
-    // 重新开听；若有合并片段，直接作为下一次上传底稿（再听一会儿补后文）
-    if (merged != null) {
-      _optimisticBytes = merged; // 暂存，下一次 finalize 时拼上
-    }
-    _speechStarted = true;
-    _speechStartedAt = DateTime.now();
-    _silenceTicks = 0;
-    await _startListenLoopAfterMerge(merged);
-  }
-
-  Future<void> _startListenLoopAfterMerge(Uint8List? pendingHead) async {
-    if (!_ready || !_inCall || _muted || _hangingUp) return;
-    final gen = ++_listenGen;
-    try {
-      await VoiceRecorder.startCall();
-      if (!mounted || _hangingUp || gen != _listenGen) {
-        await VoiceRecorder.stop(cancel: true);
-        return;
-      }
-      _recording = true;
-      _busyTurn = false;
-      _listenStarted = DateTime.now();
-      _floorReady = true; // 已校准过
-      _optimisticBytes = pendingHead;
-      setState(() => _phase = VoiceUiPhase.listening);
-      await _stopAmp();
-      _ampSub = VoiceRecorder.onAmplitude(const Duration(milliseconds: 50)).listen((amp) {
-        if (!mounted || _hangingUp || gen != _listenGen || !_recording) return;
-        _onAmp(amp);
-      });
-    } catch (_) {}
   }
 
   Future<void> _uploadTurn(Uint8List bytes) async {
     final api = _api;
     if (api == null) return;
-    // 若有未完成合并头
+    if (_uploadInFlight) return;
+    _uploadInFlight = true;
+
     var payload = bytes;
-    final head = _optimisticBytes;
+    final head = _pendingHead;
     if (head != null && !identical(head, bytes)) {
       final m = VoiceRecorder.mergeWavBytes(head, bytes);
       if (m != null) payload = m;
-      _optimisticBytes = null;
     }
+    _pendingHead = null;
+
     _turnIdPending = true;
     try {
       final r = await api.voiceRealtimeTurn(
@@ -868,11 +848,12 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         contentType: 'audio/wav',
         prefixText: _holdPrefix,
       );
+      if (!mounted || _hangingUp) return;
       _turnId = r['turn_id']?.toString();
       _turnIdPending = false;
     } catch (e) {
       _turnIdPending = false;
-      _optimisticSent = false;
+      _uploadInFlight = false;
       if (mounted) {
         if (_captions.isNotEmpty && _captions.last.mine && _captions.last.full == '…') {
           setState(() => _captions.removeLast());
@@ -920,6 +901,28 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     }
   }
 
+  void _onCallReplaced(Map<String, dynamic> payload) {
+    if (!_ownsCall || _hangingUp) return;
+    final newId = (payload['call_id'] ?? '').toString();
+    final mine = _callId ?? '';
+    // 还没拿到本路 id，或事件就是自己刚 start 的那路 → 忽略
+    if (mine.isEmpty || newId.isEmpty || newId == mine) return;
+
+    _ownsCall = false;
+    _hangingUp = true;
+    _inCall = false;
+    _listenGen++;
+    _callStartedAt = null;
+    unawaited(_stopAmp());
+    if (_recording) {
+      _recording = false;
+      unawaited(VoiceRecorder.stop(cancel: true));
+    }
+    unawaited(_interruptPlayback());
+    unawaited(AppAudio.leaveCallAudioMode());
+    if (mounted) Navigator.of(context).pop();
+  }
+
   Future<void> _hangup() async {
     if (_hangingUp) return;
     _hangingUp = true;
@@ -927,11 +930,13 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     _listenGen++;
     _bargeMonitoring = false;
     _bargeTicks = 0;
-    _tailTimer?.cancel();
-    _optimisticSent = false;
-    _optimisticBytes = null;
+    _pendingHead = null;
+    _uploadInFlight = false;
     final started = _callStartedAt;
     final sec = started == null ? 0 : DateTime.now().difference(started).inSeconds;
+    final cid = _callId ?? '';
+    final shouldHangup = _ownsCall;
+    _ownsCall = false;
     _callStartedAt = null;
     await _stopAmp();
     if (_recording) {
@@ -941,9 +946,13 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     await _interruptPlayback();
     unawaited(AppAudio.leaveCallAudioMode());
     final api = _api;
-    if (api != null) {
+    if (shouldHangup && api != null) {
       try {
-        await api.voiceRealtimeHangup(convId: widget.convId, durationSec: sec);
+        await api.voiceRealtimeHangup(
+          convId: widget.convId,
+          durationSec: sec,
+          callId: cid,
+        );
       } catch (_) {}
     }
     if (mounted) Navigator.pop(context);
@@ -1281,6 +1290,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
               final next = !_speakerOn;
               setState(() => _speakerOn = next);
               unawaited(AppAudio.enterCallAudioMode(speakerOn: next));
+              unawaited(_streamPlayer.setSpeaker(next));
             },
           ),
         ],

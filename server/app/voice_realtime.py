@@ -29,7 +29,10 @@ from .media_cards import (
     save_audio_bytes,
 )
 from .tts_gen import (
+    cancel_cosyvoice,
+    cosyvoice_truly_warm,
     iter_cosyvoice_pcm,
+    keepalive_cosyvoice,
     pcm16_mono_to_wav,
     resolve_tts_engine,
     synthesize_voice_wav,
@@ -43,12 +46,24 @@ _SENTENCE_END = re.compile(r"([。！？!?；;\n])")
 _FIRST_BREAK = re.compile(r"([，、,])")
 _ready_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
 _READY_TTL = 8.0
+# 预热状态：通话必须 warm 成功后才 ready（App 显示 loading 等待）
+_warm_lock = threading.Lock()
+_warm_state: Dict[str, Any] = {
+    "warming": False,
+    "ok": False,
+    "ts": 0.0,
+    "error": "",
+    "engine": "",
+}
+_WARM_OK_TTL = 600.0  # 预热成功后 10 分钟内视为仍热
 _turns_lock = asyncio.Lock()
 _user_turn_ts: Dict[str, float] = {}
-_MIN_TURN_GAP = 0.8
+# 仅防连点刷接口；取消后应立刻允许下一轮，不能卡死成「说太快了」
+_MIN_TURN_GAP = 0.35
 # 语音通话独立上下文（不进文字聊天）
 _voice_sessions: Dict[str, List[Dict[str, str]]] = {}
-_VOICE_SESS_LIMIT = 24
+# 通话上下文过长会拖慢 LLM 首包（体感像「合成变慢」）；保留近几轮即可
+_VOICE_SESS_LIMIT = 12
 # 记忆 snapshot 缓存：key=user:persona → {ts, system, instructions, query}
 _mem_cache: Dict[str, Dict[str, Any]] = {}
 _MEM_TTL = 120.0
@@ -158,12 +173,33 @@ def readiness(*, force: bool = False) -> Dict[str, Any]:
 
     dsh_ok = _dsh()
     mock_on = bool((getattr(settings, "voice_realtime_mock_reply", None) or "").strip())
-    ready = tts_ready and asr_ok and (dsh_ok or mock_on)
+    with _warm_lock:
+        local_warm = bool(_warm_state.get("ok")) and (
+            now - float(_warm_state.get("ts") or 0) < _WARM_OK_TTL
+        )
+        warming = bool(_warm_state.get("warming"))
+        warm_err = str(_warm_state.get("error") or "")
+        warm_prompt = str(_warm_state.get("prompt_wav") or "")
+    # CosyVoice：以网关 model_loaded + spk_cached 为准，防 IDLE 卸载后本地 TTL 仍显示已热
+    if engine == "cosyvoice" and tts_ready:
+        gw_warm = cosyvoice_truly_warm(prompt_wav=warm_prompt)
+        warm_ok = local_warm and gw_warm
+        if local_warm and not gw_warm:
+            warm_ok = False
+            with _warm_lock:
+                _warm_state["ok"] = False
+                if not warming:
+                    warm_err = warm_err or "语音引擎已冷却，需重新预热"
+    else:
+        warm_ok = local_warm
+    ready = tts_ready and asr_ok and warm_ok and (dsh_ok or mock_on)
     reason = ""
     if not asr_ok:
         reason = "识别服务启动中…" if asr_standby else "识别服务未启动"
     elif not tts_ready:
         reason = "语音合成启动中…" if tts_standby else "语音合成未就绪"
+    elif not warm_ok:
+        reason = "语音引擎预热中…" if warming or not warm_err else f"语音预热失败：{warm_err[:40]}"
     elif not (dsh_ok or mock_on):
         reason = "思考服务未就绪"
     payload = {
@@ -171,6 +207,8 @@ def readiness(*, force: bool = False) -> Dict[str, Any]:
         "connecting": not ready,
         "tts": tts_up,
         "tts_standby": tts_standby,
+        "tts_warmed": warm_ok,
+        "tts_warming": warming,
         "asr_configured": bool(asr_url) or asr_standby or asr_live,
         "asr_live": asr_live,
         "asr_standby": asr_standby,
@@ -207,6 +245,28 @@ _HOLD_TRAILERS = (
     "那个",
 )
 _DONE_ENDINGS = ("吗", "呢", "吧", "啊", "了", "呀", "嘛", "哦", "哈", "。", "？", "！", "?", "!", "…", "~")
+
+
+_SENSEVOICE_TAG = re.compile(r"<\|[^|]*\|>")
+_NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
+_NOISE_FILLERS = {
+    "嗯", "嗯嗯", "啊", "啊啊", "呃", "呃呃", "额", "哦", "噢", "唔", "哈", "嘿", "呵", "嗷", "诶",
+}
+
+
+def is_noise_transcript(text: str) -> bool:
+    """ASR 结果是否只是底噪：空、纯标点/符号、或单个语气词。"""
+    core = _NON_WORD.sub("", _SENSEVOICE_TAG.sub("", text or ""))
+    if not core:
+        return True
+    return core in _NOISE_FILLERS
+
+
+def _clear_active_turn(key: str, turn_id: str) -> None:
+    with _call_lock:
+        sess = _call_sessions.get(key)
+        if sess and sess.get("active_turn_id") == turn_id:
+            sess["active_turn_id"] = ""
 
 
 def looks_unfinished(text: str) -> bool:
@@ -262,40 +322,96 @@ def gate_for_conv(*, user_id: str, conv_id: str) -> Dict[str, Any]:
 def warm_in_background(*, user_id: str = "", persona_id: str = "", conv_id: str = "") -> None:
     """进程内预热（同步，宜丢线程池）。
 
-    乐观路径：一点打电话就并行拉起 SenseVoice（不常驻）+ CosyVoice；
-    客户端「接通中」loading 盖住冷启动时间。
+    一点打电话就拉起 SenseVoice + CosyVoice；完成前 ready=false，
+    客户端保持「接通中」loading，绝不在未预热时开麦。
+    单飞：已在预热中则直接返回。跳过条件以网关 model_loaded+spk_cached 为准，
+    不用本地 TTL（IDLE 卸载后 TTL 仍会误判为热）。
     """
     from . import asr_ondemand
+    from .tts_gen import cosyvoice_truly_warm, keepalive_cosyvoice
+
+    prompt_wav = ""
+    pid = (persona_id or "").strip()
+    if not pid and user_id and conv_id:
+        conv = db.fetchone(
+            "SELECT persona_id FROM conversations WHERE id = ? AND user_id = ?",
+            (conv_id, user_id),
+        )
+        if conv:
+            pid = (conv["persona_id"] or "").strip()
+    if user_id and pid:
+        prompt_wav = fixed_voice_wav_path(user_id=user_id, persona_id=pid) or ""
+
+    with _warm_lock:
+        if bool(_warm_state.get("warming")):
+            return
+        # 仅当网关真热且音色已缓存时跳过
+        if cosyvoice_truly_warm(prompt_wav=prompt_wav):
+            _warm_state.update(
+                {
+                    "warming": False,
+                    "ok": True,
+                    "ts": time.time(),
+                    "error": "",
+                    "prompt_wav": prompt_wav,
+                }
+            )
+            try:
+                keepalive_cosyvoice()
+            except Exception:
+                pass
+            readiness(force=True)
+            return
+        _warm_state["warming"] = True
+        _warm_state["error"] = ""
 
     try:
-        # 1) 先踢 ASR（模型加载可能几秒～十几秒）
         asr_ok = asr_ondemand.ensure_asr()
         log.info("asr warm: live=%s", asr_ok)
+        if not asr_ok:
+            with _warm_lock:
+                _warm_state.update({"warming": False, "ok": False, "error": "识别服务启动失败", "ts": time.time()})
+            readiness(force=True)
+            return
     except Exception as e:
         log.warning("asr warm failed: %s", e)
+        with _warm_lock:
+            _warm_state.update({"warming": False, "ok": False, "error": f"识别启动异常: {e}", "ts": time.time()})
+        readiness(force=True)
+        return
 
     try:
-        prompt_wav = ""
-        pid = (persona_id or "").strip()
-        if not pid and user_id and conv_id:
-            conv = db.fetchone(
-                "SELECT persona_id FROM conversations WHERE id = ? AND user_id = ?",
-                (conv_id, user_id),
-            )
-            if conv:
-                pid = (conv["persona_id"] or "").strip()
         if user_id and pid:
-            prompt_wav = fixed_voice_wav_path(user_id=user_id, persona_id=pid) or ""
-            # 通话入口预取记忆上下文，首轮少一次同步等待
             try:
                 prefetch_memory_context(user_id=user_id, persona_id=pid, query="")
             except Exception:
                 log.exception("prefetch memory failed")
         r = warm_tts_engine(prompt_wav=prompt_wav)
         log.info("tts warm: %s", r)
+        ok = bool(r.get("ok"))
+        # 再核一次网关真实状态
+        if ok and not cosyvoice_truly_warm(prompt_wav=prompt_wav):
+            ok = False
+            r = {**r, "error": "预热后网关未就绪"}
+        with _warm_lock:
+            _warm_state.update(
+                {
+                    "warming": False,
+                    "ok": ok,
+                    "ts": time.time(),
+                    "error": "" if ok else str(r.get("error") or "预热失败"),
+                    "engine": str(r.get("engine") or ""),
+                    "prompt_wav": prompt_wav,
+                }
+            )
         readiness(force=True)
     except Exception as e:
         log.warning("tts warm failed: %s", e)
+        with _warm_lock:
+            _warm_state.update(
+                {"warming": False, "ok": False, "error": str(e)[:120], "ts": time.time()}
+            )
+        readiness(force=True)
 
 
 def _fmt_call_dur(sec: int) -> str:
@@ -349,7 +465,7 @@ def is_turn_cancelled(user_id: str, conv_id: str, turn_id: str) -> bool:
 
 
 async def cancel_turn(*, user_id: str, conv_id: str, turn_id: str = "") -> Dict[str, Any]:
-    """打断当前 AI 说话：标记 turn 取消，后续 PCM/LLM 不再推送。"""
+    """打断当前 AI 说话：标记 turn 取消，并通知 CosyVoice 停掉旧合成。"""
     key = _sess_key(user_id, conv_id)
     tid = ""
     with _call_lock:
@@ -368,6 +484,15 @@ async def cancel_turn(*, user_id: str, conv_id: str, turn_id: str = "") -> Dict[
             cancelled: Set[str] = sess.setdefault("cancelled_turns", set())
             cancelled.add(tid)
         sess["active_turn_id"] = ""
+    # 取消后放开限流，允许立刻补发完整一句（乐观切句/续说场景）
+    _user_turn_ts.pop(user_id, None)
+    # 立刻掐 CosyVoice：旧请求不许继续占锁
+    try:
+        from .tts_gen import cancel_cosyvoice
+
+        cancel_cosyvoice()
+    except Exception:
+        log.exception("cancel_cosyvoice failed")
     if tid:
         await _push(
             user_id,
@@ -416,8 +541,76 @@ def find_active_call_for_user(user_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+async def clear_active_calls_for_user(
+    *,
+    user_id: str,
+    reason: str = "superseded",
+) -> List[Dict[str, Any]]:
+    """账号级：清空该用户所有进行中的语音/视频通话，只为给最新一路让位。"""
+    uid = (user_id or "").strip()
+    if not uid:
+        return []
+    prefix = f"{uid}:"
+    pending: List[Tuple[str, str]] = []  # (conv_id, call_id)
+    with _call_lock:
+        for key, sess in list(_call_sessions.items()):
+            if not key.startswith(prefix):
+                continue
+            if sess.get("ended"):
+                continue
+            conv = key.split(":", 1)[-1]
+            pending.append((conv, str(sess.get("call_id") or "")))
+
+    cleared: List[Dict[str, Any]] = []
+    for conv, old_cid in pending:
+        await hangup_call(
+            user_id=uid,
+            conv_id=conv,
+            call_id=old_cid or None,
+            release_asr=False,
+            reason=reason,
+        )
+        cleared.append({"conv_id": conv, "call_id": old_cid, "media": "audio"})
+
+    # 视频/信令通话一并结束，避免账号上残留 ringing/active
+    try:
+        from .security import iso as _iso
+
+        now = _iso()
+        rows = db.fetchall(
+            """
+            SELECT id, conv_id, media FROM call_sessions
+            WHERE user_id = ? AND status IN ('ringing', 'active')
+            """,
+            (uid,),
+        )
+        if rows:
+            db.execute(
+                """
+                UPDATE call_sessions SET status = 'ended', updated_at = ?
+                WHERE user_id = ? AND status IN ('ringing', 'active')
+                """,
+                (now, uid),
+            )
+            for row in rows:
+                cleared.append(
+                    {
+                        "conv_id": row["conv_id"] or "",
+                        "call_id": row["id"] or "",
+                        "media": row["media"] or "video",
+                    }
+                )
+    except Exception:
+        log.exception("clear call_sessions failed user=%s", uid)
+
+    return cleared
+
+
 async def start_call(*, user_id: str, conv_id: str) -> Dict[str, Any]:
-    """点击语音通话：插微信式通话气泡（接听中），AI 默认已接。"""
+    """点击语音通话：先清空该账号旧通话，再插最新一路气泡（AI 默认已接）。
+
+    同一账号永远只保留最新一次；连点/重进不拒绝，而是顶掉旧会话。
+    """
     from .routers.chat import _insert_message
     from .security import new_id
 
@@ -425,29 +618,9 @@ async def start_call(*, user_id: str, conv_id: str) -> Dict[str, Any]:
     if gate.get("need_fixed_voice"):
         return {**gate, "ok": False}
 
+    cleared = await clear_active_calls_for_user(user_id=user_id, reason="superseded")
+
     key = _sess_key(user_id, conv_id)
-    with _call_lock:
-        existing = _call_sessions.get(key)
-        if existing and existing.get("msg_id") and not existing.get("ended"):
-            return {
-                "ok": True,
-                "call_id": existing.get("call_id") or "",
-                "message_id": existing.get("msg_id") or "",
-                "already": True,
-                **gate,
-            }
-
-    busy = find_active_call_for_user(user_id)
-    if busy and (busy.get("conv_id") or "") != conv_id:
-        kind = "视频通话" if (busy.get("media") or "") == "video" else "语音通话"
-        return {
-            "ok": False,
-            "error": f"当前已有{kind}进行中，请先挂断",
-            "error_code": "call_busy",
-            "busy": busy,
-            **gate,
-        }
-
     call_id = new_id("vcall_")
     client_id = new_id("callcli_")
     card = _voice_call_card(status="answered", call_id=call_id, body="语音通话")
@@ -473,11 +646,24 @@ async def start_call(*, user_id: str, conv_id: str) -> Dict[str, Any]:
             "ended": False,
         }
     await hub.send_user(user_id, "message", msg.model_dump())
+    # 通知旧通话页：已被最新一路顶替，本地应静默退出且不要再 hangup
+    await _push(
+        user_id,
+        "voice_replaced",
+        {
+            "conv_id": conv_id,
+            "call_id": call_id,
+            "reason": "superseded",
+            "cleared": cleared,
+        },
+    )
     return {
         "ok": True,
         "call_id": call_id,
         "message_id": msg.id,
         "message": msg.model_dump(),
+        "replaced": len(cleared),
+        "cleared": cleared,
         **gate,
     }
 
@@ -487,28 +673,52 @@ async def hangup_call(
     user_id: str,
     conv_id: str,
     duration_sec: Optional[int] = None,
+    call_id: Optional[str] = None,
+    release_asr: bool = True,
+    reason: str = "hangup",
 ) -> Dict[str, Any]:
-    """挂断：取消进行中 turn、写通话时长到气泡、清语音上下文。"""
+    """挂断：取消进行中 turn、写通话时长到气泡、清语音上下文。
+
+    call_id 若提供且与当前会话不一致 → 视为旧页迟到的 hangup，直接跳过，
+    避免顶替后的新通话被旧 dispose 误杀。
+    """
     from .security import iso as _iso
 
     key = _sess_key(user_id, conv_id)
+    want = (call_id or "").strip()
     with _call_lock:
-        sess = _call_sessions.get(key) or {}
+        sess = _call_sessions.get(key)
+        if sess is None:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "already_cleared",
+                "conv_id": conv_id,
+                "call_id": want,
+            }
+        cur_cid = str(sess.get("call_id") or "")
+        if want and cur_cid and want != cur_cid:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "stale_call",
+                "conv_id": conv_id,
+                "call_id": want,
+            }
         started = float(sess.get("started_at") or 0)
         msg_id = str(sess.get("msg_id") or "")
-        call_id = str(sess.get("call_id") or "")
+        call_id_out = cur_cid or want
         active = str(sess.get("active_turn_id") or "")
         if active:
             sess.setdefault("cancelled_turns", set()).add(active)
-        if sess:
-            sess["ended"] = True
-            sess["active_turn_id"] = ""
+        sess["ended"] = True
+        sess["active_turn_id"] = ""
 
     if active:
         await _push(
             user_id,
             "voice_cancelled",
-            {"conv_id": conv_id, "turn_id": active, "reason": "hangup"},
+            {"conv_id": conv_id, "turn_id": active, "reason": reason or "hangup"},
         )
 
     if duration_sec is None:
@@ -535,7 +745,7 @@ async def hangup_call(
                     "media": "audio",
                     "status": "ended",
                     "duration_sec": duration_sec,
-                    "call_id": call_id or card.get("call_id") or "",
+                    "call_id": call_id_out or card.get("call_id") or "",
                     # 微信文案：通话时长 00:08
                     "body": f"通话时长 {_fmt_call_dur(duration_sec)}"
                     if duration_sec > 0
@@ -566,20 +776,28 @@ async def hangup_call(
     with _call_lock:
         _call_sessions.pop(key, None)
 
-    # 挂断后延迟停 ASR（不常驻）
+    # 挂断立刻停 CosyVoice，避免旧合成继续占锁
     try:
-        from . import asr_ondemand
-
-        asr_ondemand.release_asr()
+        cancel_cosyvoice()
     except Exception:
         pass
+
+    # 顶替场景不放 ASR，留给最新一路继续用
+    if release_asr:
+        try:
+            from . import asr_ondemand
+
+            asr_ondemand.release_asr()
+        except Exception:
+            pass
 
     return {
         "ok": True,
         "conv_id": conv_id,
-        "call_id": call_id,
+        "call_id": call_id_out,
         "duration_sec": duration_sec,
         "message": out_msg.model_dump() if out_msg else None,
+        "reason": reason or "hangup",
     }
 
 
@@ -659,6 +877,8 @@ async def run_greeting(
                     text=spoken,
                     instructions=instr,
                     prompt_wav=prompt_wav,
+                    req_id=f"greet_{turn_id}",
+                    should_cancel=lambda: is_turn_cancelled(user_id, conv_id, turn_id),
                 ):
                     if is_turn_cancelled(user_id, conv_id, turn_id):
                         break
@@ -793,8 +1013,11 @@ def clear_voice_session(*, user_id: str, conv_id: str) -> None:
         _mem_cache.pop(_mem_key(user_id, conv["persona_id"].strip()), None)
 
 
-def _history(user_id: str, conv_id: str, limit: int = 24) -> List[Dict[str, str]]:
-    """文字会话近期上下文 + 本通电话语音回合（语音不入库）。"""
+def _history(user_id: str, conv_id: str, limit: int = 12) -> List[Dict[str, str]]:
+    """文字会话近期上下文 + 本通电话语音回合（语音不入库）。
+
+    limit 控制在近几轮：历史越长 DSH 首 token 越慢，用户会觉得「合成变慢」。
+    """
     import json
 
     rows = db.fetchall(
@@ -803,7 +1026,7 @@ def _history(user_id: str, conv_id: str, limit: int = 24) -> List[Dict[str, str]
         WHERE user_id = ? AND conv_id = ?
         ORDER BY seq DESC LIMIT ?
         """,
-        (user_id, conv_id, max(16, limit)),
+        (user_id, conv_id, max(8, limit)),
     )
     out: List[Dict[str, str]] = []
     for r in reversed(rows or []):
@@ -1016,6 +1239,7 @@ async def run_voice_turn(
     t_turn0 = time.perf_counter()
     timing: Dict[str, Any] = {"turn_id": turn_id, "conv_id": conv_id}
     key = _sess_key(user_id, conv_id)
+    prev_active = ""
     with _call_lock:
         sess = _call_sessions.setdefault(
             key,
@@ -1027,7 +1251,15 @@ async def run_voice_turn(
                 "cancelled_turns": set(),
             },
         )
+        prev_active = str(sess.get("active_turn_id") or "")
+        # 新 turn 覆盖旧 turn：旧的标取消，避免双轨抢限流/双回复
+        if prev_active and prev_active != turn_id:
+            cancelled: Set[str] = sess.setdefault("cancelled_turns", set())
+            cancelled.add(prev_active)
+            _user_turn_ts.pop(user_id, None)
         sess["active_turn_id"] = turn_id
+    if prev_active and prev_active != turn_id:
+        log.info("voice supersede old=%s new=%s", prev_active, turn_id)
 
     conv = db.fetchone(
         "SELECT id, persona_id FROM conversations WHERE id = ? AND user_id = ?",
@@ -1053,7 +1285,18 @@ async def run_voice_turn(
         return
 
     if not await _rate_ok(user_id):
-        await _push(user_id, "voice_error", {"turn_id": turn_id, "error": "说太快了，稍等一下"})
+        # 上一轮刚开始就被取消/重发时不应硬挡；仅极短连发才提示
+        log.info("voice rate soft-skip turn=%s", turn_id)
+        await _push(
+            user_id,
+            "voice_error",
+            {
+                "turn_id": turn_id,
+                "conv_id": conv_id,
+                "error": "还在处理上一句，请稍等",
+                "error_code": "turn_busy",
+            },
+        )
         return
 
     # 通话只用 SenseVoice；未就绪则提示，绝不回退 whisper
@@ -1073,31 +1316,62 @@ async def run_voice_turn(
             )
             return
 
+    if is_turn_cancelled(user_id, conv_id, turn_id):
+        return
+
     await _push(user_id, "voice_status", {"turn_id": turn_id, "phase": "asr", "conv_id": conv_id})
 
+    # 强制 allow_fallback=False：通话路径禁止 whisper 兜底
     asr = await asyncio.to_thread(
         transcribe_audio_path, audio_path, language="zh", allow_fallback=False
     )
     asr = (asr or "").strip()
     timing["asr_ms"] = round((time.perf_counter() - t_turn0) * 1000)
     asr_ondemand.touch_asr()
-    if not asr:
-        await _push(
-            user_id,
-            "voice_error",
-            {"turn_id": turn_id, "conv_id": conv_id, "error": "没听清，再说一次吧"},
-        )
+    if is_turn_cancelled(user_id, conv_id, turn_id):
+        log.info("voice turn cancelled after asr turn=%s asr_ms=%s", turn_id, timing["asr_ms"])
         return
 
     prefix = (prefix_text or "").strip()
+    meaningful = not is_noise_transcript(asr)
+    if not meaningful and not prefix:
+        # 底噪/回声/单个语气词：静默丢弃，不进字幕、不报错
+        log.info(
+            "voice ignored turn=%s asr_ms=%s bytes=%s text=%r",
+            turn_id,
+            timing["asr_ms"],
+            audio_path.stat().st_size if audio_path.is_file() else 0,
+            asr[:40],
+        )
+        _clear_active_turn(key, turn_id)
+        _user_turn_ts.pop(user_id, None)
+        await _push(
+            user_id,
+            "voice_ignored",
+            {"turn_id": turn_id, "conv_id": conv_id, "reason": "noise" if asr else "asr_empty"},
+        )
+        return
+    log.info(
+        "voice asr ok turn=%s asr_ms=%s text=%s",
+        turn_id,
+        timing["asr_ms"],
+        asr[:80],
+    )
+
+    finalize_prefix = False
     if prefix:
-        joiner = "" if prefix[-1] in "，,、。！？!? " else "，"
-        asr = f"{prefix}{joiner}{asr}"
+        if meaningful:
+            joiner = "" if prefix[-1] in "，,、。！？!? " else "，"
+            asr = f"{prefix}{joiner}{asr}"
+        else:
+            # 挂起后只剩静音：前文就是完整的一句
+            asr = prefix
+            finalize_prefix = True
         timing["prefix"] = True
 
     settings = get_settings()
     hold_on = bool(getattr(settings, "voice_turn_hold", True))
-    if hold_on and looks_unfinished(asr):
+    if hold_on and not finalize_prefix and looks_unfinished(asr):
         timing["hold"] = True
         log.info(
             "voice hold turn=%s asr_ms=%s text=%s",
@@ -1115,10 +1389,7 @@ async def run_voice_turn(
                 "reason": "unfinished",
             },
         )
-        with _call_lock:
-            sess = _call_sessions.get(key)
-            if sess and sess.get("active_turn_id") == turn_id:
-                sess["active_turn_id"] = ""
+        _clear_active_turn(key, turn_id)
         return
 
     await _push(
@@ -1220,6 +1491,8 @@ async def run_voice_turn(
                         text=tts_text,
                         instructions=instr,
                         prompt_wav=prompt_wav,
+                        req_id=f"{turn_id}_{idx}",
+                        should_cancel=lambda: is_turn_cancelled(user_id, conv_id, turn_id),
                     ):
                         if is_turn_cancelled(user_id, conv_id, turn_id):
                             break
@@ -1333,6 +1606,8 @@ async def run_voice_turn(
                 "sample_rate": sample_rate,
             },
         )
+        if not pcm_all and not is_turn_cancelled(user_id, conv_id, turn_id):
+            raise RuntimeError("语音合成无输出，请稍后重试")
         if pcm_all:
             try:
                 wav = pcm16_mono_to_wav(bytes(pcm_all), sample_rate)

@@ -68,6 +68,8 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
+  /// 防连点叠多个通话页；真正互斥由服务端「清空旧路、只留最新」保证。
+  bool _voiceLaunching = false;
   final input = TextEditingController();
   final scroll = ScrollController();
   final focus = FocusNode();
@@ -360,6 +362,7 @@ class _ChatPageState extends State<ChatPage> {
             bytes: List<int>.from(s.bytes ?? Uint8List(0)),
             name: s.name,
             kind: s.kind,
+            contentType: s.contentType,
           ),
       ].where((e) => e.bytes.isNotEmpty).toList();
       final caption = text;
@@ -419,6 +422,9 @@ class _ChatPageState extends State<ChatPage> {
           await startListenTogether(context, store, convId: conv.id);
         case 'voice_call':
           setState(() => moreOpen = false);
+          if (_voiceLaunching) return;
+          _voiceLaunching = true;
+          try {
           final p = conv.personaId != null ? store.persona(conv.personaId!) : null;
           final api = store.api;
           if (api == null) {
@@ -498,6 +504,9 @@ class _ChatPageState extends State<ChatPage> {
               ),
             ),
           );
+          } finally {
+            _voiceLaunching = false;
+          }
         case 'video_call':
           setState(() => moreOpen = false);
           final api = store.api;

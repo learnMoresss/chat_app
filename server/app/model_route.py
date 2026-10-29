@@ -1,6 +1,6 @@
 """人设渠道 → DSH provider/model。
 
-默认日卡（daycard-deepseek），避免误烧官方 DEEPSEEK_API_KEY。
+默认官方 DeepSeek（deepseek-official）。日卡已过期，请求日卡一律映射到官方。
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ DAYCARD_MODEL = "deepseek-v4.1-flash"
 LOCAL_QWEN_PROVIDER = "local-qwen"
 LOCAL_QWEN_MODEL = "qwen3.8-flash-next-iq3_xxs"
 OFFICIAL_PROVIDER = "deepseek-official"
+OFFICIAL_MODEL = "deepseek-chat"
 OFFICIAL_MODELS = frozenset({"deepseek-flash", "deepseek-chat", "deepseek-reasoner"})
 
 KNOWN_PROVIDERS = frozenset({DAYCARD_PROVIDER, LOCAL_QWEN_PROVIDER, OFFICIAL_PROVIDER})
@@ -24,7 +25,6 @@ def is_official_route(provider: str, model: str) -> bool:
     if m in OFFICIAL_MODELS:
         return True
     if m.startswith("deepseek-") and not m.startswith("deepseek-v4"):
-        # deepseek-flash / deepseek-chat 等官方 id
         if "v4" not in m and "8888" not in m:
             return m in OFFICIAL_MODELS or m.endswith("-flash") and "v4" not in m
     return False
@@ -42,18 +42,26 @@ def parse_model_spec(spec: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _coerce_away_daycard(provider: str, model: str) -> Tuple[str, str]:
+    """日卡过期：任何 daycard / 8888ok / v4 日卡模型 → 官方 chat。"""
+    p = (provider or "").strip()
+    m = (model or "").strip()
+    if p == DAYCARD_PROVIDER:
+        return OFFICIAL_PROVIDER, OFFICIAL_MODEL
+    if m.startswith("deepseek-v4") or m.startswith("daycard-"):
+        return OFFICIAL_PROVIDER, OFFICIAL_MODEL
+    return p, m
+
+
 def resolve_dsh_route(
     channel: Optional[Mapping[str, Any]] = None,
     *,
     override: str = "",
 ) -> Tuple[str, str]:
-    """返回 (provider, model)。
-
-    override 优先（形如 daycard-deepseek/deepseek-v4.1-flash）。
-    """
+    """返回 (provider, model)。默认官方；日卡强制改官方。"""
     parsed = parse_model_spec(override)
     if parsed:
-        return parsed
+        return _coerce_away_daycard(*parsed)
 
     ch = dict(channel or {})
     model = str(ch.get("model") or "").strip()
@@ -62,10 +70,11 @@ def resolve_dsh_route(
 
     parsed = parse_model_spec(model)
     if parsed:
-        return parsed
+        return _coerce_away_daycard(*parsed)
 
+    # 旧日卡渠道配置：直接官方
     if "8888ok" in base or "日卡" in name or model.startswith("deepseek-v4"):
-        return DAYCARD_PROVIDER, (model or DAYCARD_MODEL)
+        return OFFICIAL_PROVIDER, OFFICIAL_MODEL
 
     if (
         ":9292" in base
@@ -79,23 +88,20 @@ def resolve_dsh_route(
         return LOCAL_QWEN_PROVIDER, (m or LOCAL_QWEN_MODEL)
 
     if "api.deepseek.com" in base or model in OFFICIAL_MODELS:
-        return OFFICIAL_PROVIDER, (model or "deepseek-flash")
+        return OFFICIAL_PROVIDER, (model or OFFICIAL_MODEL)
 
-    # 缺省：日卡，禁止默认落到官方 key
-    return DAYCARD_PROVIDER, DAYCARD_MODEL
+    # 缺省：官方
+    return OFFICIAL_PROVIDER, OFFICIAL_MODEL
 
 
 def usage_model_label(provider: str, model: str) -> str:
-    p = (provider or "").strip() or DAYCARD_PROVIDER
-    m = (model or "").strip() or DAYCARD_MODEL
+    p, m = _coerce_away_daycard(
+        (provider or "").strip() or OFFICIAL_PROVIDER,
+        (model or "").strip() or OFFICIAL_MODEL,
+    )
     return f"{p}/{m}"
 
 
 def assert_not_official_for_stress(provider: str, model: str, *, label: str = "") -> None:
-    """压测守卫：一旦落到官方模型立刻中止。"""
-    if is_official_route(provider, model):
-        raise RuntimeError(
-            f"stress_abort_official_key: got {provider}/{model}"
-            + (f" ({label})" if label else "")
-            + " — 禁止使用官方 DeepSeek key，请改用日卡"
-        )
+    """压测守卫（历史接口保留）：现已默认官方，此函数不再拦截官方。"""
+    return

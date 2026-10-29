@@ -11,6 +11,7 @@ import 'api/session.dart';
 import 'format.dart';
 import 'local_cache.dart';
 import 'media/auth_image.dart';
+import 'media/image_compress.dart';
 import 'models.dart';
 
 enum TopToastKind { message, listenInvite }
@@ -1632,7 +1633,7 @@ class AppStore extends ChangeNotifier {
   /// 多图/视频/文件：上传后合并成一条媒体卡片消息。
   Future<void> sendMediaMessage(
     Conv c, {
-    required List<({List<int> bytes, String name, String kind})> items,
+    required List<({List<int> bytes, String name, String kind, String? contentType})> items,
     String caption = '',
   }) async {
     if (items.isEmpty) return;
@@ -1686,28 +1687,69 @@ class AppStore extends ChangeNotifier {
 
     try {
       final ids = <String>[];
+      var totalBytes = 0;
       for (final it in items) {
-        final bytes = Uint8List.fromList(it.bytes);
-        final up = await api!.uploadChatMedia(
-          bytes: bytes,
-          filename: it.name,
-          kind: it.kind,
-        );
+        var bytes = Uint8List.fromList(it.bytes);
+        var filename = it.name;
+        var ctype = (it.contentType ?? '').trim();
+        if (it.kind == 'image') {
+          // 发送前再压一道，兼容旧暂存/其它入口未压缩的大图
+          final cimg = await compressImageForUpload(bytes, filename: filename);
+          bytes = cimg.bytes;
+          filename = cimg.filename;
+          ctype = cimg.contentType;
+        } else if (ctype.isEmpty) {
+          ctype = 'application/octet-stream';
+        }
+        totalBytes += bytes.length;
+        Map<String, dynamic> up;
+        try {
+          up = await api!.uploadChatMedia(
+            bytes: bytes,
+            filename: filename,
+            kind: it.kind,
+            contentType: ctype,
+          );
+        } on ApiException catch (e) {
+          // 超时/网络：再压一档后重试一次，并确保连接已在 upload 内强制释放
+          final retryable = e.statusCode == 408 ||
+              e.message.contains('超时') ||
+              e.message.contains('网络') ||
+              e.message.contains('失败');
+          if (!retryable || it.kind != 'image') rethrow;
+          final harder = await compressImageForUpload(
+            bytes,
+            filename: filename,
+            maxSide: 960,
+            quality: 55,
+            targetBytes: 280 * 1024,
+            hardMaxBytes: 400 * 1024,
+          );
+          up = await api!.uploadChatMedia(
+            bytes: harder.bytes,
+            filename: harder.filename,
+            kind: it.kind,
+            contentType: harder.contentType,
+            timeout: const Duration(seconds: 120),
+          );
+          bytes = harder.bytes;
+        }
         final fid = up['file_id']?.toString();
         if (fid == null || fid.isEmpty) throw ApiException('上传未返回 file_id');
         ids.add(fid);
         // 上传后立刻进内存+磁盘缓存，退出再进也直接命中
         if (it.kind == 'image' && bytes.isNotEmpty) {
-          AuthImageCache.put(fid, bytes, contentType: up['content_type']?.toString());
+          AuthImageCache.put(fid, bytes, contentType: up['content_type']?.toString() ?? ctype);
         }
       }
+      optimistic.bytes = totalBytes;
       final raw = await api!.sendMessage(
         convId: c.id,
         clientId: clientId,
         text: caption,
         kind: primaryKind.name,
         mediaIds: ids,
-        bytes: optimistic.bytes,
+        bytes: totalBytes,
       );
       final message = Map<String, dynamic>.from(raw['message'] as Map? ?? raw);
       _upsertRemoteMessage(message, replaceClientId: clientId);
@@ -1726,7 +1768,9 @@ class AppStore extends ChangeNotifier {
       ping();
     } catch (e) {
       optimistic.state = SendState.failed;
-      optimistic.text = '发送失败：$e';
+      final msg = e is ApiException ? e.message : '$e';
+      // 避免「发送失败：上传失败：…」叠两层
+      optimistic.text = msg.startsWith('发送失败') ? msg : '发送失败：$msg';
       ping();
     }
   }

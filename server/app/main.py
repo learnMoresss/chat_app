@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,6 +18,15 @@ from .gateway.reaper import start_reaper
 from .gateway.registry import sync_workers_from_config
 from .scheduler_loop import start_scheduler
 from .ws_hub import set_main_loop
+
+_voice_log_handler = logging.StreamHandler()
+_voice_log_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+for _name in ("voice_realtime", "asr_ondemand", "asr_gen"):
+    _lg = logging.getLogger(_name)
+    _lg.setLevel(logging.INFO)
+    _lg.addHandler(_voice_log_handler)
+    _lg.propagate = False
+
 from .routers import (
     admin,
     auth,

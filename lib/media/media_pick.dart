@@ -5,6 +5,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
 
+import 'image_compress.dart';
+
 /// 暂存待发媒体（微信：先选图，点发送再上传）。
 class StagedMedia {
   StagedMedia({
@@ -14,6 +16,7 @@ class StagedMedia {
     this.bytes,
     this.width,
     this.height,
+    this.contentType,
   });
 
   final String path;
@@ -22,6 +25,7 @@ class StagedMedia {
   final Uint8List? bytes;
   final int? width;
   final int? height;
+  final String? contentType;
 
   int get size => bytes?.length ?? File(path).lengthSync();
 }
@@ -32,26 +36,41 @@ class MediaPick {
 
   static const maxImages = 9;
 
+  /// 选图后立刻压成上传友好体积（公网链路默认压缩）。
+  static Future<StagedMedia> _stageImage(XFile x) async {
+    final raw = await x.readAsBytes();
+    if (raw.isEmpty) {
+      throw StateError('空图片');
+    }
+    final name = x.name.isNotEmpty ? x.name : p.basename(x.path);
+    final compressed = await compressImageForUpload(raw, filename: name);
+    return StagedMedia(
+      path: x.path,
+      name: compressed.filename,
+      kind: 'image',
+      bytes: compressed.bytes,
+      contentType: compressed.contentType,
+    );
+  }
+
   /// 相册多选图片（最多 9）。
   static Future<List<StagedMedia>> pickImagesFromGallery({int already = 0}) async {
     final remain = maxImages - already;
     if (remain <= 0) return [];
     final list = await _picker.pickMultiImage(
-      imageQuality: 85,
-      maxWidth: 2048,
-      maxHeight: 2048,
+      // 系统侧先缩到接近上传目标，减轻二次压缩与隧道压力
+      imageQuality: 65,
+      maxWidth: 1280,
+      maxHeight: 1280,
       limit: remain,
     );
     final out = <StagedMedia>[];
     for (final x in list) {
-      final bytes = await x.readAsBytes();
-      if (bytes.isEmpty) continue;
-      out.add(StagedMedia(
-        path: x.path,
-        name: x.name.isNotEmpty ? x.name : p.basename(x.path),
-        kind: 'image',
-        bytes: bytes,
-      ));
+      try {
+        out.add(await _stageImage(x));
+      } catch (_) {
+        continue;
+      }
       if (out.length >= remain) break;
     }
     return out;
@@ -60,19 +79,16 @@ class MediaPick {
   static Future<StagedMedia?> takePhoto() async {
     final x = await _picker.pickImage(
       source: ImageSource.camera,
-      imageQuality: 85,
-      maxWidth: 2048,
-      maxHeight: 2048,
+      imageQuality: 65,
+      maxWidth: 1280,
+      maxHeight: 1280,
     );
     if (x == null) return null;
-    final bytes = await x.readAsBytes();
-    if (bytes.isEmpty) return null;
-    return StagedMedia(
-      path: x.path,
-      name: x.name.isNotEmpty ? x.name : 'camera.jpg',
-      kind: 'image',
-      bytes: bytes,
-    );
+    try {
+      return await _stageImage(x);
+    } catch (_) {
+      return null;
+    }
   }
 
   static Future<StagedMedia?> pickVideo({bool fromCamera = false}) async {

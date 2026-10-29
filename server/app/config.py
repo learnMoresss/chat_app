@@ -36,11 +36,12 @@ class Settings(BaseSettings):
     voice_realtime_mock_reply: str = ""
     # 模拟 LLM 流式吐字间隔（毫秒）；0=整段一次给出
     voice_realtime_mock_stream_ms: int = 18
-    # 语音通话强制走的 DSH provider（避开坏掉的 daycard）
+    # 语音通话强制走官方 DeepSeek（日卡已下线）
     voice_dsh_provider: str = "deepseek-official"
     voice_dsh_model: str = "deepseek-chat"
     # 句与句之间人工停顿（毫秒）：生成可立刻开始，播放时插入静音，避免下句抢话
-    voice_sentence_gap_ms: int = 380
+    # 句间垫静音：过大听感「卡住一下」；流式已有自然气口，保持极短即可
+    voice_sentence_gap_ms: int = 60
     # 首句提前切：按逗号切出的最短字数（仅第 1 句）
     voice_first_phrase_min_chars: int = 6
     # 是否启用逐句情绪标签解析（[轻快] 等）
@@ -59,7 +60,7 @@ class Settings(BaseSettings):
     tts_breeze_url: str = "http://127.0.0.1:8883"
     # IndexTTS-2.5 / Fun-CosyVoice3 按需网关
     tts_indextts_url: str = "http://127.0.0.1:8884"
-    tts_cosyvoice_url: str = "http://127.0.0.1:8885"
+    tts_cosyvoice_url: str = "http://127.0.0.1:18885"
     tts_timeout_seconds: float = 300.0
     tts_default_sample_text: str = "你好呀，我是你的专属陪伴，今天想听我说点什么？"
     # 入站 ASR：OpenAI 兼容 transcriptions；空则走本机 whisper 子进程

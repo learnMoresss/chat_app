@@ -5,12 +5,82 @@ instruction 由固定抽卡文案 + 情绪语气组成（见 media_cards.speak_i
 from __future__ import annotations
 
 import io
+import logging
+import uuid
 import wave
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
 from .config import get_settings
+
+log = logging.getLogger("tts_gen")
+
+
+def cosyvoice_health(*, timeout: float = 2.0) -> dict:
+    """读网关 /health；失败返回空 dict。"""
+    settings = get_settings()
+    base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:18885").rstrip("/")
+    if not base:
+        return {}
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.get(f"{base}/health")
+            if r.status_code >= 400:
+                return {}
+            body = r.json() if r.content else {}
+            return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+def cosyvoice_truly_warm(*, prompt_wav: str = "") -> bool:
+    """模型已加载，且（无指定音色 / 该音色已在 spk_cached）。"""
+    h = cosyvoice_health()
+    if not h.get("model_loaded"):
+        return False
+    ref = (prompt_wav or "").strip()
+    if not ref:
+        return True
+    cached = h.get("spk_cached") or []
+    if not isinstance(cached, list):
+        return False
+    import os
+
+    want = os.path.realpath(ref)
+    return any(os.path.realpath(str(p)) == want for p in cached if p)
+
+
+def cancel_cosyvoice(*, req_id: str = "") -> dict:
+    """打断网关当前（或指定）合成。"""
+    settings = get_settings()
+    base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:18885").rstrip("/")
+    if not base:
+        return {"ok": False, "error": "no url"}
+    try:
+        data = {}
+        if (req_id or "").strip():
+            data["req_id"] = req_id.strip()
+        with httpx.Client(timeout=3.0) as client:
+            r = client.post(f"{base}/v1/cancel", data=data)
+            if r.status_code < 400:
+                return r.json() if r.content else {"ok": True}
+            return {"ok": False, "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+
+def keepalive_cosyvoice() -> dict:
+    settings = get_settings()
+    base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:18885").rstrip("/")
+    if not base:
+        return {"ok": False}
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            r = client.post(f"{base}/v1/keepalive")
+            return r.json() if r.content and r.status_code < 400 else {"ok": r.status_code < 400}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:80]}
 
 
 def _pcm16_mono_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
@@ -118,10 +188,15 @@ def iter_cosyvoice_pcm(
     instructions: str,
     timeout: float = 0,
     prompt_wav: str = "",
+    req_id: str = "",
+    should_cancel: Optional[Callable[[], bool]] = None,
 ):
-    """真流式：yield (pcm_s16le_bytes, sample_rate)。按网关长度帧解析，首块尽早返回。"""
+    """真流式：yield (pcm_s16le_bytes, sample_rate)。按网关长度帧解析，首块尽早返回。
+
+    should_cancel 为真时主动关流并调网关 /v1/cancel，不让旧合成占锁。
+    """
     settings = get_settings()
-    base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:8885").rstrip("/")
+    base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:18885").rstrip("/")
     if not base:
         return
     url = f"{base}/v1/audio/speech/stream"
@@ -129,27 +204,40 @@ def iter_cosyvoice_pcm(
     text = (text or "").strip()
     if not text:
         return
+    rid = (req_id or "").strip() or f"tts_{uuid.uuid4().hex[:12]}"
     data = {
         "text": text[:500],
         "instruction": (instructions or "")[:800],
+        "req_id": rid,
     }
     if (prompt_wav or "").strip():
         data["prompt_wav"] = prompt_wav.strip()
     hop = int(getattr(settings, "voice_cosy_first_hop", 12) or 0)
     if hop > 0:
         data["first_hop"] = str(hop)
+    cancelled = False
     try:
         with httpx.Client(timeout=to) as client:
             with client.stream("POST", url, data=data) as r:
                 if r.status_code >= 400:
+                    log.warning(
+                        "cosyvoice stream http=%s body=%s",
+                        r.status_code,
+                        (r.read()[:200] if hasattr(r, "read") else b"")[:200],
+                    )
                     return
                 sr = int(r.headers.get("x-sample-rate") or "24000")
                 framed = (r.headers.get("x-frame") or "").lower() == "lenprefixed"
                 buf = bytearray()
+                got = 0
                 for chunk in r.iter_bytes():
+                    if should_cancel and should_cancel():
+                        cancelled = True
+                        break
                     if not chunk:
                         continue
                     if not framed:
+                        got += 1
                         yield chunk, sr
                         continue
                     buf.extend(chunk)
@@ -163,9 +251,21 @@ def iter_cosyvoice_pcm(
                         pcm = bytes(buf[4 : 4 + n])
                         del buf[: 4 + n]
                         if pcm:
+                            got += 1
                             yield pcm, sr
-    except Exception:
+                if cancelled:
+                    log.info("cosyvoice stream abort local cancel req=%s", rid)
+                elif got == 0:
+                    log.warning("cosyvoice stream empty text=%s", text[:40])
+    except Exception as e:
+        log.warning("cosyvoice stream exception: %s", e)
         return
+    finally:
+        if cancelled or (should_cancel and should_cancel()):
+            try:
+                cancel_cosyvoice(req_id=rid)
+            except Exception:
+                pass
 
 
 def pcm16_mono_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
@@ -283,11 +383,23 @@ def warm_tts_engine(*, for_realtime: bool = True, prompt_wav: str = "") -> dict:
 
     if engine == "cosyvoice":
         settings = get_settings()
-        base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:8885").rstrip("/")
+        base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:18885").rstrip("/")
+        ref = (prompt_wav or "").strip()
+        # 网关真热（模型+音色缓存）才跳过；本地 TTL 不可信（IDLE 卸载后仍显示 ok）
+        if cosyvoice_truly_warm(prompt_wav=ref):
+            keepalive_cosyvoice()
+            return {
+                "ok": True,
+                "engine": engine,
+                "warmed": True,
+                "via": "cosyvoice_health_hit",
+                "prompt_wav": ref or None,
+                "error": None,
+            }
         try:
             data = {}
-            if (prompt_wav or "").strip():
-                data["prompt_wav"] = prompt_wav.strip()
+            if ref:
+                data["prompt_wav"] = ref
             with httpx.Client(timeout=180.0) as client:
                 r = client.post(f"{base}/v1/warm", data=data)
             if r.status_code < 400:
@@ -297,10 +409,15 @@ def warm_tts_engine(*, for_realtime: bool = True, prompt_wav: str = "") -> dict:
                     "engine": engine,
                     "warmed": True,
                     "via": "cosyvoice_/v1/warm",
-                    "prompt_wav": (prompt_wav or "").strip() or None,
+                    "prompt_wav": ref or None,
                     "detail": body,
                     "error": None,
                 }
+            return {
+                "ok": False,
+                "engine": engine,
+                "error": f"warm http={r.status_code}",
+            }
         except Exception as e:
             return {"ok": False, "engine": engine, "error": f"warm failed: {e}"}
 

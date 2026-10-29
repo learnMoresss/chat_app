@@ -589,16 +589,16 @@ async def _generate_reply(
 
     channel = resolve_channel_for_persona(user_id, persona["channel_id"] or "")
     if channel is None:
-        # 用量展示用；思考环只走 DSH，不要求渠道 Key；默认日卡
+        # 用量展示用；思考环只走 DSH，不要求渠道 Key；默认官方
         channel = {
             "id": "",
             "name": "",
-            "model": "daycard-deepseek/deepseek-v4.1-flash",
-            "base_url": "",
+            "model": "deepseek-official/deepseek-chat",
+            "base_url": "https://api.deepseek.com",
             "key_enc": "",
         }
     dsh_provider, dsh_model = resolve_dsh_route(channel)
-    # 本地 Qwen：健康检查失败直接报错，不回退官方/日卡
+    # 本地 Qwen：健康检查失败直接报错，不回退官方
     if dsh_provider == "local-qwen":
         try:
             import httpx as _httpx

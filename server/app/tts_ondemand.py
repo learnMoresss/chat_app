@@ -31,7 +31,7 @@ def _urls() -> Dict[str, str]:
         "voicedesign": (getattr(s, "tts_voicedesign_url", None) or "http://127.0.0.1:8882").rstrip("/"),
         "customvoice": (s.tts_customvoice_url or "http://127.0.0.1:8881").rstrip("/"),
         "indextts": (getattr(s, "tts_indextts_url", None) or "http://127.0.0.1:8884").rstrip("/"),
-        "cosyvoice": (getattr(s, "tts_cosyvoice_url", None) or "http://127.0.0.1:8885").rstrip("/"),
+        "cosyvoice": (getattr(s, "tts_cosyvoice_url", None) or "http://127.0.0.1:18885").rstrip("/"),
     }
 
 
@@ -42,8 +42,21 @@ def _port_up(base: str, paths: Optional[list] = None, timeout: float = 1.5) -> b
             for p in paths:
                 try:
                     r = client.get(f"{base}{p}")
-                    if r.status_code < 500:
-                        return True
+                    if r.status_code >= 500:
+                        continue
+                    # 8885 上常见 BaseHTTP 假 CosyVoice：health 200 但不会真合成
+                    srv = (r.headers.get("server") or "").lower()
+                    if "basehttp" in srv:
+                        return False
+                    if ":8885" in base or ":18885" in base:
+                        try:
+                            # 真 FastAPI：GET /v1/warm → 405；假桩 → 404
+                            w = client.get(f"{base}/v1/warm")
+                            if w.status_code == 404:
+                                return False
+                        except Exception:
+                            return False
+                    return True
                 except Exception:
                     continue
     except Exception:
@@ -68,8 +81,19 @@ def unload_others(except_engine: str) -> None:
             _post_unload(base)
 
 
-def _run(cmd: list[str], timeout: float = 120.0) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+def _run(
+    cmd: list[str],
+    timeout: float = 120.0,
+    env: Optional[dict] = None,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=env,
+    )
 
 
 def _start_customvoice() -> None:
@@ -192,7 +216,23 @@ def _stop_indextts() -> None:
 
 def _start_cosyvoice() -> None:
     unload_others("cosyvoice")
-    _run(["bash", "/data/ai/services/tts-gateways/start-cosyvoice.sh"], timeout=30.0)
+    # 默认 18885：8885 常被 product-gateway 的 BaseHTTP 假 CosyVoice 占着
+    env = dict(os.environ)
+    if "COSYVOICE_PORT" not in env:
+        # 从 URL 解析端口
+        try:
+            from urllib.parse import urlparse
+
+            u = urlparse(_urls()["cosyvoice"])
+            if u.port:
+                env["COSYVOICE_PORT"] = str(u.port)
+        except Exception:
+            env["COSYVOICE_PORT"] = "18885"
+    _run(
+        ["bash", "/data/ai/services/tts-gateways/start-cosyvoice.sh"],
+        timeout=30.0,
+        env=env,
+    )
 
 
 def _stop_cosyvoice() -> None:

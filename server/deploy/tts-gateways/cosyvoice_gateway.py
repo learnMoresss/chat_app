@@ -3,8 +3,11 @@
 - /v1/audio/speech：整包 WAV（聊天气泡）
 - /v1/audio/speech/stream：长度前缀 PCM 帧流式
 - /v1/warm：通话入口预热（加载模型 + 缓存声线声学特征；不计用户等待）
+- /v1/cancel：打断当前合成（插话/挂断）
+- /v1/keepalive：通话中续命，推迟空闲卸载
 
 声线缓存只存声学特征，情绪 instruct 每轮现算，避免缓存死旧指令。
+每次合成互不保留历史文本；新请求可顶掉旧请求。
 """
 from __future__ import annotations
 
@@ -15,13 +18,14 @@ import struct
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import torch
 import torchaudio
 from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 COSY_ROOT = Path(os.environ.get("COSYVOICE_ROOT", "/data/ai/apps/CosyVoice"))
 MODEL_DIR = os.environ.get(
@@ -30,12 +34,10 @@ MODEL_DIR = os.environ.get(
 PROMPT_WAV = os.environ.get(
     "COSYVOICE_PROMPT_WAV", str(COSY_ROOT / "asset/zero_shot_prompt.wav")
 )
-IDLE = float(os.environ.get("COSYVOICE_IDLE_UNLOAD_SECONDS", "300"))
-# 官方路径：AutoModel(fp16=True) → autocast；不开 TensorRT
+# 通话可能很长；默认 30 分钟空闲才卸。设 0 表示永不空闲卸载。
+IDLE = float(os.environ.get("COSYVOICE_IDLE_UNLOAD_SECONDS", "1800"))
 FP16 = os.environ.get("COSYVOICE_FP16", "0").strip().lower() in ("1", "true", "yes", "on")
-# CosyVoice3：无 load_jit；load_trt 需预编译 .plan（默认关，2080Ti/cuDNN 易失败）
 LOAD_TRT = os.environ.get("COSYVOICE_LOAD_TRT", "0").strip().lower() in ("1", "true", "yes", "on")
-# 首块更小 hop → 更早出声（音质接缝需 A/B）；后续块仍按 stream_scale_factor 放大
 FIRST_HOP = max(8, int(os.environ.get("COSYVOICE_FIRST_HOP", "12") or 12))
 DEFAULT_SPK_ID = "call_default_ref"
 
@@ -45,6 +47,10 @@ _model = None
 _timer: threading.Timer | None = None
 # prompt_wav path -> acoustic-only feats (no prompt_text / instruct)
 _spk_feats: Dict[str, Dict[str, Any]] = {}
+# 当前进行中的合成 req_id；新请求 / cancel 会把旧的加入 cancelled
+_active_req: Optional[str] = None
+_cancelled: Set[str] = set()
+_cancel_lock = threading.Lock()
 
 
 def _arm():
@@ -59,7 +65,7 @@ def _arm():
 
 
 def _unload():
-    global _model, _timer, _spk_feats
+    global _model, _timer, _spk_feats, _active_req
     with _lock:
         if _timer:
             _timer.cancel()
@@ -68,9 +74,41 @@ def _unload():
             del _model
             _model = None
         _spk_feats = {}
+        with _cancel_lock:
+            _active_req = None
+            _cancelled.clear()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def _new_req_id(explicit: str = "") -> str:
+    """注册新合成请求：自动取消上一路，保证一次只跑一路。"""
+    global _active_req
+    rid = (explicit or "").strip() or f"cv_{uuid.uuid4().hex[:16]}"
+    with _cancel_lock:
+        old = _active_req
+        if old and old != rid:
+            _cancelled.add(old)
+            print(f"[cosyvoice] supersede old_req={old} new_req={rid}", flush=True)
+        _active_req = rid
+        _cancelled.discard(rid)
+    return rid
+
+
+def _is_cancelled(req_id: str) -> bool:
+    if not req_id:
+        return False
+    with _cancel_lock:
+        return req_id in _cancelled
+
+
+def _clear_active(req_id: str) -> None:
+    global _active_req
+    with _cancel_lock:
+        if _active_req == req_id:
+            _active_req = None
+        _cancelled.discard(req_id)
 
 
 def _get_model():
@@ -95,7 +133,6 @@ def _get_model():
         _model = AutoModel(
             model_dir=MODEL_DIR, fp16=FP16, load_trt=False, load_vllm=False
         )
-    # 记下官方 base；流式时临时改小首块 hop
     try:
         m = getattr(_model, "model", None)
         if m is not None and not hasattr(m, "token_hop_len_base"):
@@ -127,12 +164,6 @@ def _hop_state(model) -> Dict[str, Any]:
 
 
 def _to_instruct(instruction: str = "", emotion: str = "", tone: str = "", extra: str = "") -> str:
-    """CosyVoice3 instruct2：`<|endofprompt|>` 前是风格指令，不可朗读。
-
-    已知坑（FunAudioLLM/CosyVoice#1733）：若缺少英文角色前缀，模型会把整段
-    instruct（含「必须严格遵从的音色提示词」）合成出来，听起来像循环念提示词。
-    抽卡长文案只适合作 Breeze/VoiceDesign；这里只留短风格句。
-    """
     import re
 
     raw = (instruction or "").strip()
@@ -142,19 +173,15 @@ def _to_instruct(instruction: str = "", emotion: str = "", tone: str = "", extra
         raw = f"用{tn}风格，情绪{emo}，语速正常，像微信语音聊天"
         if (extra or "").strip():
             raw += f"，{extra.strip()}"
-    # 去掉 Breeze 包装与抽卡长描述，避免被念出来
     raw = re.sub(r"【必须严格遵从的音色提示词】", "", raw)
     raw = re.sub(r"<\|endofprompt\|>", "", raw)
-    # 截断过长的音色卡文案，只留风格/情绪
     if len(raw) > 120:
-        # 优先保留「当前口气」之后的短句
         m = re.search(r"(当前口气[:：].+)$", raw)
         if m:
             raw = "像微信语音。" + m.group(1)
         else:
             raw = raw[:120]
     raw = raw.strip(" 。.;；\n") or "语气自然，像微信语音"
-    # 官方/社区约定：英文角色前缀 + 中文风格 + endofprompt
     if not raw.lower().startswith("you are a helpful assistant"):
         raw = "You are a helpful assistant. " + raw
     if "<|endofprompt|>" not in raw:
@@ -163,13 +190,11 @@ def _to_instruct(instruction: str = "", emotion: str = "", tone: str = "", extra
 
 
 def _ensure_spk_feats(model, prompt_wav: str) -> Dict[str, Any]:
-    """缓存参考 wav 的声学特征；不含 prompt_text（情绪每轮现算）。"""
     key = os.path.realpath(prompt_wav)
     cached = _spk_feats.get(key)
     if cached is not None:
         return cached
     t0 = time.perf_counter()
-    # 空文本抽取声学；instruct 文本不进缓存
     mi = model.frontend.frontend_zero_shot("", "", prompt_wav, model.sample_rate, "")
     keep = {
         "llm_prompt_speech_token": mi["llm_prompt_speech_token"],
@@ -191,7 +216,6 @@ def _ensure_spk_feats(model, prompt_wav: str) -> Dict[str, Any]:
 
 
 def _build_instruct2_input(model, text: str, instruct: str, prompt_wav: str) -> Dict[str, Any]:
-    """声学走缓存；text + instruct(prompt_text) 每轮现算。"""
     feats = _ensure_spk_feats(model, prompt_wav)
     tts_text_token, tts_text_token_len = model.frontend._extract_text_token(text)
     prompt_text_token, prompt_text_token_len = model.frontend._extract_text_token(instruct)
@@ -202,7 +226,6 @@ def _build_instruct2_input(model, text: str, instruct: str, prompt_wav: str) -> 
         "prompt_text": prompt_text_token,
         "prompt_text_len": prompt_text_token_len,
     }
-    # 与 frontend_instruct2 一致：去掉 llm 侧 prompt speech token
     model_input.pop("llm_prompt_speech_token", None)
     model_input.pop("llm_prompt_speech_token_len", None)
     return model_input
@@ -215,8 +238,8 @@ def _iter_instruct2_stream(
     prompt_wav: str,
     speed: float = 1.0,
     first_hop: int = 0,
+    req_id: str = "",
 ):
-    """按 CosyVoice text_normalize 分句后流式 tts；首块用更小 hop。"""
     m = getattr(model, "model", None)
     default_hop = 25
     if m is not None:
@@ -227,7 +250,9 @@ def _iter_instruct2_stream(
         )
     use_hop = int(first_hop or FIRST_HOP or 0)
     for piece in model.frontend.text_normalize(text, split=True, text_frontend=True):
-        # 单请求局部：首块更小 hop，结束后恢复，不污染后续请求
+        if req_id and _is_cancelled(req_id):
+            print(f"[cosyvoice] cancelled before piece req={req_id}", flush=True)
+            return
         if m is not None and use_hop > 0 and use_hop < default_hop:
             m.token_hop_len_base = use_hop
             m.token_hop_len = use_hop
@@ -237,7 +262,7 @@ def _iter_instruct2_stream(
         pre_ms = round((time.perf_counter() - t_pre0) * 1000)
         print(
             f"[cosyvoice] piece={piece!r} pre_ms={pre_ms} hop_before={hop_before} "
-            f"first_hop={use_hop}",
+            f"first_hop={use_hop} req={req_id or '-'}",
             flush=True,
         )
         t_infer0 = time.perf_counter()
@@ -246,6 +271,12 @@ def _iter_instruct2_stream(
         audio_total = 0.0
         try:
             for out in model.model.tts(**model_input, stream=True, speed=speed):
+                if req_id and _is_cancelled(req_id):
+                    print(
+                        f"[cosyvoice] cancelled mid-piece req={req_id} chunks={n}",
+                        flush=True,
+                    )
+                    return
                 n += 1
                 now = time.perf_counter()
                 speech = out["tts_speech"]
@@ -287,6 +318,8 @@ def health():
             hop = _hop_state(_model)
     except Exception:
         pass
+    with _cancel_lock:
+        active = _active_req or ""
     return {
         "status": "ok",
         "model_loaded": _model is not None,
@@ -295,6 +328,8 @@ def health():
         "fp16_config": FP16,
         "spk_cached": list(_spk_feats.keys()),
         "hop": hop,
+        "active_req": active,
+        "idle_unload_sec": IDLE,
     }
 
 
@@ -302,6 +337,29 @@ def health():
 def unload():
     _unload()
     return {"ok": True, "model_loaded": False}
+
+
+@app.post("/v1/keepalive")
+def keepalive():
+    """通话中续命：推迟空闲卸载，不清模型。"""
+    _arm()
+    return {"ok": True, "model_loaded": _model is not None, "idle_unload_sec": IDLE}
+
+
+@app.post("/v1/cancel")
+def cancel(req_id: str = Form("")):
+    """打断合成。req_id 空则取消当前 active。"""
+    global _active_req
+    want = (req_id or "").strip()
+    with _cancel_lock:
+        target = want or (_active_req or "")
+        if not target:
+            return {"ok": True, "cancelled": False, "reason": "idle"}
+        _cancelled.add(target)
+        if _active_req == target:
+            _active_req = None
+    print(f"[cosyvoice] cancel req={target}", flush=True)
+    return {"ok": True, "cancelled": True, "req_id": target}
 
 
 @app.post("/v1/warm")
@@ -314,11 +372,14 @@ def warm(prompt_wav: str = Form("")):
     with _lock:
         model = _get_model()
         _ensure_spk_feats(model, ref)
-        # 一次极短推理把 CUDA kernel 热开（可选）
         try:
             instruct = _to_instruct("自然短促地应答一声。")
-            for _ in _iter_instruct2_stream(model, "嗯。", instruct, ref, speed=1.0):
+            rid = _new_req_id("warm")
+            for _ in _iter_instruct2_stream(
+                model, "嗯。", instruct, ref, speed=1.0, req_id=rid
+            ):
                 break
+            _clear_active(rid)
         except Exception as e:
             print(f"[cosyvoice] warm probe warn: {e}", flush=True)
         hop = _hop_state(model)
@@ -329,11 +390,12 @@ def warm(prompt_wav: str = Form("")):
         "prompt_wav": os.path.realpath(ref),
         "hop": hop,
         "spk_cached": True,
+        "model_loaded": True,
     }
 
 
 @app.post("/v1/audio/speech")
-async def speech(
+def speech(
     text: str = Form(...),
     instruction: str = Form(""),
     emotion: str = Form("中性"),
@@ -341,7 +403,9 @@ async def speech(
     speed: str = Form("正常"),
     extra: str = Form(""),
     prompt_wav: str = Form(""),
+    req_id: str = Form(""),
 ):
+    """同步 def：避免 async 路由里 with _lock 阻塞事件循环。"""
     text = (text or "").strip()
     if not text:
         raise HTTPException(400, "text required")
@@ -351,12 +415,21 @@ async def speech(
     ref = (prompt_wav or "").strip() or PROMPT_WAV
     if not os.path.isfile(ref):
         raise HTTPException(500, f"prompt wav missing: {ref}")
+    rid = _new_req_id(req_id)
     try:
         with _lock:
+            if _is_cancelled(rid):
+                raise HTTPException(409, "cancelled")
             model = _get_model()
             chunks = []
-            for j in _iter_instruct2_stream(model, text[:500], instruct, ref, speed=sp):
+            for j in _iter_instruct2_stream(
+                model, text[:500], instruct, ref, speed=sp, req_id=rid
+            ):
+                if _is_cancelled(rid):
+                    break
                 chunks.append(j["tts_speech"])
+            if _is_cancelled(rid):
+                raise HTTPException(409, "cancelled")
             if not chunks:
                 raise RuntimeError("no audio")
             wav = torch.cat(chunks, dim=1)
@@ -364,13 +437,21 @@ async def speech(
             torchaudio.save(buf, wav.cpu(), model.sample_rate, format="wav")
             data = buf.getvalue()
             _arm()
-        return Response(content=data, media_type="audio/wav")
+        return Response(
+            content=data,
+            media_type="audio/wav",
+            headers={"X-Req-Id": rid},
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"cosyvoice failed: {e}") from e
+    finally:
+        _clear_active(rid)
 
 
 @app.post("/v1/audio/speech/stream")
-async def speech_stream(
+def speech_stream(
     text: str = Form(...),
     instruction: str = Form(""),
     emotion: str = Form("中性"),
@@ -379,8 +460,12 @@ async def speech_stream(
     extra: str = Form(""),
     prompt_wav: str = Form(""),
     first_hop: str = Form(""),
+    req_id: str = Form(""),
 ):
-    """真流式：每块 PCM s16le 立刻下发。帧=4字节大端长度+PCM。"""
+    """真流式：每块 PCM s16le 立刻下发。帧=4字节大端长度+PCM。
+
+    同步 def + 线程内持锁，不堵 FastAPI 事件循环；新请求会 supersede 旧 req。
+    """
     text = (text or "").strip()
     if not text:
         raise HTTPException(400, "text required")
@@ -395,12 +480,12 @@ async def speech_stream(
     except Exception:
         hop_override = 0
 
+    rid = _new_req_id(req_id)
     sr_hdr = "24000"
     try:
-        with _lock:
-            model = _get_model()
-            sr_hdr = str(int(model.sample_rate))
-            _ensure_spk_feats(model, ref)
+        # 只做轻量准备；真正合成在 gen 里持锁，避免 async 阻塞
+        if _model is not None:
+            sr_hdr = str(int(_model.sample_rate))
     except Exception:
         pass
 
@@ -408,40 +493,68 @@ async def speech_stream(
         t0 = time.perf_counter()
         first = None
         n = 0
-        with _lock:
-            model = _get_model()
-            sr = int(model.sample_rate)
-            hop0 = _hop_state(model)
-            print(f"[cosyvoice-stream] start hop={hop0} text={text[:40]!r}", flush=True)
-            for j in _iter_instruct2_stream(
-                model, text[:500], instruct, ref, speed=sp, first_hop=hop_override
-            ):
-                wav = j["tts_speech"]
-                pcm = (wav.clamp(-1, 1).squeeze(0).cpu() * 32767.0).short().numpy().tobytes()
-                if not pcm:
-                    continue
-                n += 1
-                audio_s = len(pcm) / 2 / sr
-                now = time.perf_counter()
-                if first is None:
-                    first = now
-                    print(
-                        f"[cosyvoice-stream] first_pcm_ms={round((first-t0)*1000)} "
-                        f"first_audio_s={round(audio_s,3)} sr={sr}",
-                        flush=True,
-                    )
+        try:
+            with _lock:
+                if _is_cancelled(rid):
+                    print(f"[cosyvoice-stream] skip cancelled req={rid}", flush=True)
+                    return
+                model = _get_model()
+                sr = int(model.sample_rate)
+                _ensure_spk_feats(model, ref)
+                hop0 = _hop_state(model)
                 print(
-                    f"[cosyvoice-stream] chunk={n} ms={round((now-t0)*1000)} "
-                    f"audio_s={round(audio_s,3)} bytes={len(pcm)}",
+                    f"[cosyvoice-stream] start hop={hop0} text={text[:40]!r} req={rid}",
                     flush=True,
                 )
-                yield struct.pack(">I", len(pcm)) + pcm
-            print(
-                f"[cosyvoice-stream] last_ms={round((time.perf_counter()-t0)*1000)} "
-                f"chunks={n} hop_end={_hop_state(model)}",
-                flush=True,
-            )
-            _arm()
+                for j in _iter_instruct2_stream(
+                    model,
+                    text[:500],
+                    instruct,
+                    ref,
+                    speed=sp,
+                    first_hop=hop_override,
+                    req_id=rid,
+                ):
+                    if _is_cancelled(rid):
+                        print(
+                            f"[cosyvoice-stream] cancelled req={rid} after chunks={n}",
+                            flush=True,
+                        )
+                        break
+                    wav = j["tts_speech"]
+                    pcm = (
+                        (wav.clamp(-1, 1).squeeze(0).cpu() * 32767.0)
+                        .short()
+                        .numpy()
+                        .tobytes()
+                    )
+                    if not pcm:
+                        continue
+                    n += 1
+                    audio_s = len(pcm) / 2 / sr
+                    now = time.perf_counter()
+                    if first is None:
+                        first = now
+                        print(
+                            f"[cosyvoice-stream] first_pcm_ms={round((first-t0)*1000)} "
+                            f"first_audio_s={round(audio_s,3)} sr={sr}",
+                            flush=True,
+                        )
+                    print(
+                        f"[cosyvoice-stream] chunk={n} ms={round((now-t0)*1000)} "
+                        f"audio_s={round(audio_s,3)} bytes={len(pcm)}",
+                        flush=True,
+                    )
+                    yield struct.pack(">I", len(pcm)) + pcm
+                print(
+                    f"[cosyvoice-stream] last_ms={round((time.perf_counter()-t0)*1000)} "
+                    f"chunks={n} hop_end={_hop_state(model)} req={rid}",
+                    flush=True,
+                )
+                if not _is_cancelled(rid):
+                    _arm()
+        finally:
+            _clear_active(rid)
 
     return StreamingResponse(
         gen(),
@@ -450,6 +563,7 @@ async def speech_stream(
             "X-Sample-Rate": sr_hdr,
             "X-Audio-Format": "s16le",
             "X-Frame": "lenprefixed",
+            "X-Req-Id": rid,
         },
     )
 

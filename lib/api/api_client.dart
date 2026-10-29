@@ -1,14 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:http/http.dart' show MultipartFile, MultipartRequest;
+import 'package:http/io_client.dart';
 import 'package:http_parser/http_parser.dart';
 
 /// 把 FastAPI 的 detail（字符串或校验错误列表）收成用户能看懂的中文。
 String _friendlyDetail(Object? detail, int statusCode) {
   if (detail is String && detail.trim().isNotEmpty) return detail.trim();
+  if (detail is Map) {
+    final err = detail['error'] ?? detail['message'] ?? detail['msg'];
+    if (err != null && '$err'.trim().isNotEmpty) return '$err'.trim();
+  }
   if (detail is List && detail.isNotEmpty) {
     final parts = <String>[];
     for (final item in detail) {
@@ -450,12 +456,16 @@ class ApiClient {
   }
 
   /// 聊天媒体上传，返回 file_id / auth_url。
+  ///
+  /// 走公网反向隧道时偶发卡顿：独立 HttpClient、更长 idle、超时强制掐线，
+  /// 401 先续签再重试，避免「看起来一直转圈最后超时」。
   Future<Map<String, dynamic>> uploadChatMedia({
     required Uint8List bytes,
     required String filename,
     String kind = 'image',
     String contentType = 'application/octet-stream',
     bool allowAuthRetry = true,
+    Duration timeout = const Duration(seconds: 120),
   }) async {
     if (accessToken == null || accessToken!.isEmpty) {
       throw ApiException('未登录', statusCode: 401, authNoise: true);
@@ -472,9 +482,19 @@ class ApiClient {
       mt = null;
     }
     req.files.add(MultipartFile.fromBytes('file', bytes, filename: filename, contentType: mt));
+
+    final io = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 30)
+      // 隧道卡顿时不能 30s 就当空闲掐线
+      ..idleTimeout = const Duration(minutes: 3)
+      // 与 main.dart HttpOverrides 一致，独立 client 也放行跳板自签
+      ..badCertificateCallback = (cert, host, port) => host == '119.45.30.73';
+    final client = IOClient(io);
     try {
-      final streamed = await req.send().timeout(const Duration(seconds: 120));
-      final res = await http.Response.fromStream(streamed);
+      final streamed = await client.send(req).timeout(timeout);
+      final res = await http.Response.fromStream(streamed).timeout(
+        const Duration(seconds: 30),
+      );
       Map<String, dynamic>? data;
       if (res.body.isNotEmpty) {
         try {
@@ -490,12 +510,21 @@ class ApiClient {
             kind: kind,
             contentType: contentType,
             allowAuthRetry: false,
+            timeout: timeout,
           );
         }
+        throw ApiException('登录已失效，请重新登录', statusCode: 401, authNoise: true);
       }
       if (res.statusCode >= 400) {
         final detail = data?['detail'];
-        final msg = detail is String ? detail : '上传失败（${res.statusCode}）';
+        String msg;
+        if (detail is String && detail.trim().isNotEmpty) {
+          msg = detail.trim();
+        } else if (detail is Map && detail['error'] != null) {
+          msg = '${detail['error']}';
+        } else {
+          msg = '上传失败（${res.statusCode}）';
+        }
         throw ApiException(
           msg,
           statusCode: res.statusCode,
@@ -505,8 +534,17 @@ class ApiClient {
       return data ?? {};
     } on ApiException {
       rethrow;
+    } on TimeoutException {
+      try {
+        io.close(force: true);
+      } catch (_) {}
+      throw ApiException('上传超时（公网链路拥堵），请再试一次', statusCode: 408);
     } catch (e) {
       throw ApiException(_netFailMessage(e, action: '上传'));
+    } finally {
+      try {
+        client.close();
+      } catch (_) {}
     }
   }
 
@@ -1193,6 +1231,7 @@ class ApiClient {
   Future<Map<String, dynamic>> voiceRealtimeHangup({
     required String convId,
     int? durationSec,
+    String callId = '',
   }) {
     return _json(
       'POST',
@@ -1201,6 +1240,7 @@ class ApiClient {
       body: {
         'conv_id': convId,
         if (durationSec != null) 'duration_sec': durationSec,
+        if (callId.isNotEmpty) 'call_id': callId,
       },
     );
   }

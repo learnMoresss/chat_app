@@ -17,6 +17,7 @@ router = APIRouter(prefix="/api/v1/voice/realtime", tags=["voice-realtime"])
 class _HangupBody(BaseModel):
     conv_id: str = Field(..., min_length=1)
     duration_sec: Optional[int] = Field(None, ge=0, le=86400)
+    call_id: str = Field("", description="本路 call_id；与当前不符则跳过，防旧页误杀新通话")
 
 
 class _CancelBody(BaseModel):
@@ -133,6 +134,7 @@ async def voice_hangup(
         user_id=user["id"],
         conv_id=body.conv_id.strip(),
         duration_sec=body.duration_sec,
+        call_id=(body.call_id or "").strip() or None,
     )
 
 

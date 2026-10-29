@@ -233,23 +233,29 @@ def delete_channel(channel_id: str, user: Dict[str, Any] = Depends(current_user)
 def resolve_channel_for_persona(user_id: str, channel_id: str):
     """返回渠道行；无 Key 时返回 None。
 
-    未指定人设渠道时：优先日卡（8888ok / 名称含日卡），避免误落到官方订阅。
+    未指定人设渠道时：优先官方 DeepSeek；日卡已过期，直接跳过。
     """
     if channel_id:
         row = db.fetchone(
             "SELECT * FROM channels WHERE id = ? AND (user_id IS NULL OR user_id = ?)",
             (channel_id, user_id),
         )
+        # 日卡渠道当作无效，走下面官方回退
         if row and row["key_enc"]:
-            return row
-    # 回退：用户私有已填 Key → 公共已填 Key（日卡优先）
+            base = (row["base_url"] or "").lower()
+            name = row["name"] or ""
+            if "8888ok" not in base and "日卡" not in name:
+                return row
+    # 回退：用户私有 → 公共；官方优先，排除日卡
     row = db.fetchone(
         """
         SELECT * FROM channels
         WHERE user_id = ? AND key_enc != ''
+          AND lower(COALESCE(base_url,'')) NOT LIKE '%8888ok%'
+          AND COALESCE(name,'') NOT LIKE '%日卡%'
         ORDER BY
           CASE
-            WHEN lower(base_url) LIKE '%8888ok%' OR name LIKE '%日卡%' THEN 0
+            WHEN lower(base_url) LIKE '%api.deepseek.com%' OR name LIKE '%官方%' THEN 0
             ELSE 1
           END,
           created_at
@@ -263,9 +269,11 @@ def resolve_channel_for_persona(user_id: str, channel_id: str):
         """
         SELECT * FROM channels
         WHERE user_id IS NULL AND key_enc != ''
+          AND lower(COALESCE(base_url,'')) NOT LIKE '%8888ok%'
+          AND COALESCE(name,'') NOT LIKE '%日卡%'
         ORDER BY
           CASE
-            WHEN lower(base_url) LIKE '%8888ok%' OR name LIKE '%日卡%' THEN 0
+            WHEN lower(base_url) LIKE '%api.deepseek.com%' OR name LIKE '%官方%' THEN 0
             ELSE 1
           END,
           created_at

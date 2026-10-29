@@ -1,6 +1,7 @@
 """入站语音转写：优先 OpenAI 兼容 /v1/audio/transcriptions，其次本机 whisper 子进程。"""
 from __future__ import annotations
 
+import logging
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Optional
 import httpx
 
 from .config import get_settings
+
+log = logging.getLogger("asr_gen")
 
 
 def transcribe_audio_path(
@@ -28,6 +31,7 @@ def transcribe_audio_path(
     if text:
         return text
     if not allow_fallback:
+        log.warning("asr http empty/fail path=%s (whisper fallback disabled)", p.name)
         return None
     return _via_local_whisper(p, language=language)
 
@@ -57,13 +61,15 @@ def _via_http(path: Path, *, language: str) -> Optional[str]:
             with httpx.Client(timeout=to) as client:
                 r = client.post(url, headers=headers, files=files, data=data)
             if r.status_code >= 400:
+                log.warning("asr http %s: %s", r.status_code, (r.text or "")[:180])
                 return None
             j = r.json()
             text = (j.get("text") or "").strip()
             if text.startswith("[asr-stub]"):
                 return None
             return text or None
-    except Exception:
+    except Exception as e:
+        log.warning("asr http exception: %s", e)
         return None
 
 
