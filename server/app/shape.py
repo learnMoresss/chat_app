@@ -341,9 +341,18 @@ def inbound_from_message(
         return "[对方发来一段视频]" if mine else "[你发了一段视频]"
 
     if kind == "voice":
-        # ASR 未接：JSON 媒体壳或空 → 占位；有纯文本转写再用
+        # JSON 壳里可能带 asr；连发合并必须带上，否则模型只看到「一段语音」
         t = raw.strip()
+        asr = ""
         if t.startswith("{"):
+            try:
+                meta = json.loads(t)
+                if isinstance(meta, dict):
+                    asr = (meta.get("asr") or "").strip()
+            except (json.JSONDecodeError, TypeError):
+                asr = ""
+            if asr:
+                return f"[对方语音] {asr}" if mine else f"[你的语音] {asr}"
             return "[对方发来一段语音]" if mine else "[你发了一段语音]"
         if t:
             return t

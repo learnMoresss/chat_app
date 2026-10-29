@@ -1151,10 +1151,14 @@ class _ChatPageState extends State<ChatPage> {
           );
         }),
       if (m.kind == MsgKind.voice)
-        _WxMenuItem(Icons.text_fields, '转文字', () {
-          store.sendText(conv, '[语音转文字]（演示）${m.seconds}"');
-          _stickOrBadge();
-        }),
+        _WxMenuItem(
+          Icons.text_fields,
+          (m.meta?['asr_visible'] == true) ? '隐藏文字' : '转文字',
+          () {
+            store.toggleVoiceAsrVisible(m);
+            setState(() {});
+          },
+        ),
       _WxMenuItem(Icons.format_quote, '引用', () => setState(() => quoteId = m.id)),
       _WxMenuItem(Icons.checklist, '多选', () {
         setState(() {
@@ -2530,7 +2534,7 @@ class _VoiceBubbleBody extends StatelessWidget {
   }
 }
 
-/// 微信：语音条下方直接跟一块转写文字（独立气泡）。
+/// 微信：长按「转文字」后才在语音条下方显示转写；默认隐藏，不另发一条消息。
 class _VoiceAsrBelow extends StatelessWidget {
   const _VoiceAsrBelow({required this.msg, required this.mine});
   final Msg msg;
@@ -2538,8 +2542,10 @@ class _VoiceAsrBelow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final visible = msg.meta?['asr_visible'] == true;
+    if (!visible) return const SizedBox.shrink();
     final asr = (msg.meta?['asr'] as String?)?.trim() ?? '';
-    if (asr.isEmpty) return const SizedBox.shrink();
+    final body = asr.isEmpty ? '暂无识别文字' : asr;
     return Padding(
       padding: const EdgeInsets.only(top: 6),
       child: ConstrainedBox(
@@ -2551,8 +2557,12 @@ class _VoiceAsrBelow extends StatelessWidget {
             borderRadius: BorderRadius.circular(6),
           ),
           child: Text(
-            asr,
-            style: const TextStyle(fontSize: 16, height: 1.35, color: Color(0xFF111111)),
+            body,
+            style: TextStyle(
+              fontSize: 16,
+              height: 1.35,
+              color: asr.isEmpty ? const Color(0xFF888888) : const Color(0xFF111111),
+            ),
           ),
         ),
       ),

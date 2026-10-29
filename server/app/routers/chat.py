@@ -541,7 +541,11 @@ async def _generate_reply(
         if merged:
             # 调用方已带 OCR/整形（[对方发来…]），合并结果若仍是 JSON 壳或更短，保留调用方
             merged_s = merged.strip()
-            caller_rich = caller_text.startswith("[对方发来") or "图中文字" in caller_text
+            caller_rich = (
+                caller_text.startswith("[对方发来")
+                or caller_text.startswith("[对方语音]")
+                or "图中文字" in caller_text
+            )
             merged_raw_shell = merged_s.startswith("{") and '"files"' in merged_s
             if caller_rich and (merged_raw_shell or len(merged_s) < len(caller_text)):
                 user_text = caller_text

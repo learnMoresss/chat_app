@@ -1139,6 +1139,16 @@ class AppStore extends ChangeNotifier {
     // 同 id 一律覆盖（一起听卡 ended、设备申请状态等依赖更新）
     final i = list.indexWhere((e) => e.id == m.id || (clientId != null && e.id == clientId));
     if (i >= 0) {
+      // 保留本地「转文字」显隐，避免 sync/WS 覆盖后气泡文字又消失
+      final prevVisible = list[i].meta?['asr_visible'] == true;
+      final prevBytes = list[i].meta?['local_bytes'];
+      if (prevVisible || prevBytes != null) {
+        m.meta = {
+          ...?m.meta,
+          if (prevVisible) 'asr_visible': true,
+          if (prevBytes != null) 'local_bytes': prevBytes,
+        };
+      }
       list[i] = m;
     } else {
       list.add(m);
@@ -2036,6 +2046,17 @@ class AppStore extends ChangeNotifier {
 
   void retry(Msg m) {
     m.state = SendState.sent;
+    ping();
+  }
+
+  /// 微信式：长按「转文字 / 隐藏文字」只切换气泡下方转写显隐，不发新消息。
+  void toggleVoiceAsrVisible(Msg m) {
+    if (m.kind != MsgKind.voice) return;
+    final cur = m.meta?['asr_visible'] == true;
+    m.meta = {
+      ...?m.meta,
+      'asr_visible': !cur,
+    };
     ping();
   }
 
