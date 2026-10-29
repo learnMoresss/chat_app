@@ -68,18 +68,29 @@ DSH 只出暗号文本；chat_app 抠暗号后本地/SSH 执行。见 `CHAT_LOGI
 
 ## 实时语音对话（半双工）
 
-路径：**麦 → ASR → DSH 流式出字 → 按句 Breeze TTS → App 播放队列**。
+路径：**麦 → SenseVoice ASR → DSH 流式出字 → CosyVoice 流式 PCM → App 边收边播**。
+
+公网：`https://119.45.30.73:8443/chat-api`（WSS 同前缀）；本机网关 `8886` ASR / `8885` CosyVoice 仅 AI 主机 loopback。
 
 | 项 | 约定 |
 |----|------|
-| 预热 | chat-api 启动 / `POST /api/v1/voice/realtime/warm`；App 进页只显示「连接中…」 |
-| 逐句 | DSH delta 凑齐句号即合成；`keep_loaded` 避免每句 unload |
-| 事件 | WS：`voice_asr` / `voice_sentence` / `voice_done` / `voice_error` |
-| 声线 | 人设固定 `persona_assets` prompt + `speak_instructions` 情绪 |
-| AEC | 外放走 playAndRecord；真 Voice Processing 仍可加强 |
+| 预热 | chat-api 启动 / `POST /api/v1/voice/realtime/warm?conv_id=`（按人设参考 wav）；App 进页「连接中…」 |
+| 逐句 | DSH delta 凑句；首句可逗号早切；句间 `VOICE_SENTENCE_GAP_MS` 静音 |
+| 事件 | WS：`voice_asr` / `voice_status` / `voice_sentence` / **`voice_audio`（PCM base64）** / `voice_audio_end` / `voice_done` / `voice_error` |
+| 声线 | 人设固定 `persona_assets`（参考 wav + 短风格 instruct）；情绪标签 `[轻快]` 等会剥离后映射 instruct |
+| 压测 | `.env` 设 `VOICE_REALTIME_MOCK_REPLY=…` 可跳过 DSH；**生产必须留空** |
+| AEC | 外放走 playAndRecord；真全双工 AEC 另做 |
 | 不做 | 全双工叠话、换云端 Realtime 主脑 |
 
-入口：聊天「语音通话」→ `RealtimeVoicePage`。
+入口：聊天「更多 → 语音通话」→ `RealtimeVoicePage`（需已固定音色）。  
+就绪：`GET /api/v1/voice/realtime/ready?conv_id=` → `ready/engine/mock_llm/need_fixed_voice`。
+
+通话体验（微信式）：
+1. `POST /start` 插入 `kind=link` / `card=voice_call` 气泡（AI 默认已接）
+2. warm + loading → `POST /greeting` 固定音色短问候
+3. 自动开麦；说完静音后 `POST /turn`
+4. 插话：`POST /cancel` + 本地停播，再听
+5. `POST /hangup` 把气泡更新为「语音通话 mm:ss」
 
 ## 另期
 

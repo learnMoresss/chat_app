@@ -241,13 +241,16 @@ class AppStore extends ChangeNotifier {
       if (g.remark.trim().isNotEmpty) return g.remark.trim();
       return g.name;
     }
-    final p = persona(c.personaId!);
-    return p?.display ?? '会话';
+    final pid = c.personaId;
+    if (pid == null || pid.isEmpty) return '会话';
+    return persona(pid)?.display ?? '会话';
   }
 
   Color colorOf(Conv c) {
     if (c.groupId != null) return const Color(0xFF07C160);
-    return persona(c.personaId!)?.color ?? Colors.grey;
+    final pid = c.personaId;
+    if (pid == null || pid.isEmpty) return Colors.grey;
+    return persona(pid)?.color ?? Colors.grey;
   }
 
   String nameOfSender(String id, {String? groupId}) {
@@ -1145,7 +1148,7 @@ class AppStore extends ChangeNotifier {
       // 列表预览：一起听卡用 body
       final previewText = () {
         final card = m.meta?['card']?.toString();
-        if (card == 'listen_invite') {
+        if (card == 'listen_invite' || card == 'voice_call') {
           return m.meta?['body']?.toString() ?? m.text;
         }
         return m.text;
@@ -1442,6 +1445,17 @@ class AppStore extends ChangeNotifier {
               'status': m['status']?.toString() ?? '',
             };
             text = (m['body'] ?? '一起听').toString();
+          } else if (m['card'] == 'voice_call') {
+            final dur = m['duration_sec'];
+            meta = {
+              'card': 'voice_call',
+              'media': m['media']?.toString() ?? 'audio',
+              'status': m['status']?.toString() ?? '',
+              'duration_sec': dur is num ? dur.toInt() : int.tryParse('$dur') ?? 0,
+              'call_id': m['call_id']?.toString() ?? '',
+              'body': m['body']?.toString() ?? '',
+            };
+            text = (m['body'] ?? '语音通话').toString();
           } else if (m['card'] == 'sticker_pack_added') {
             final covers = m['cover_file_ids'];
             meta = {

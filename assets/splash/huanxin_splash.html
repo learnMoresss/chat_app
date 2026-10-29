@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<meta name="theme-color" content="#ffffff" />
+<meta name="color-scheme" content="light" />
+<title>幻信</title>
+<style>
+:root {
+  --ink:#25323b; --sub:#76858e; --pale:#c3cdd1; --line:#e6ecee;
+  --blue:#597b9a; --cyan:#5d9d99; --rose:#b98e92; --silver:#82939b;
+  color-scheme:light;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:"SF Pro Display","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;background:#fff;color:var(--ink);overflow:hidden;-webkit-tap-highlight-color:transparent}
+button,input{font:inherit}
+.screen {position:relative; margin:0 auto; width:min(100%,520px); height:100vh; height:100dvh; overflow:hidden; isolation:isolate; background:#fff;}
+.screen:before{content:"";position:absolute;inset:0;pointer-events:none;z-index:0;background:radial-gradient(ellipse 42% 31% at 49% 44%,rgba(232,239,243,.46),transparent 95%),radial-gradient(ellipse 45% 32% at 64% 65%,rgba(244,246,247,.46),transparent 90%);}
+.screen:after{content:"";position:absolute;inset:0;pointer-events:none;z-index:4;background:linear-gradient(#fff 0%,transparent 10%,transparent 77%,rgba(255,255,255,.65) 86%,#fff 100%);opacity:.22}
+canvas{position:absolute;inset:0;width:100%;height:100%;z-index:1;display:block}
+.header {position:absolute; z-index:5; top:max(32px,env(safe-area-inset-top)); left:27px;right:27px;display:flex;justify-content:space-between;align-items:flex-start;gap:18px}
+.micro {font-size:11px;line-height:1.35;letter-spacing:3px;font-weight:600;color:#6f8088}
+.brand-mini{display:flex;align-items:center;gap:9px;}
+.brand-symbol{width:18px;height:18px;position:relative;border:1px solid #81949c;border-radius:50%;transform:rotate(-25deg)}
+.brand-symbol:before{content:"";position:absolute;inset:4px;border:1px solid #a4b3b6;border-radius:50%}
+.brand-symbol:after{content:"";position:absolute;left:7px;top:-4px;width:4px;height:4px;background:#879fa8;border-radius:50%}
+.header-right{display:flex;align-items:center;gap:7px;font-size:11px;letter-spacing:1px;color:#91a0a4;font-weight:500;white-space:nowrap}
+.live-dot{width:5px;height:5px;background:#7eaca8;border-radius:50%;box-shadow:0 0 0 4px rgba(122,180,176,.10);animation:live 3s ease-in-out infinite}
+@keyframes live {50%{opacity:.35;transform:scale(.7)}}
+.top-rule{position:absolute;z-index:3;top:calc(max(32px,env(safe-area-inset-top)) + 53px);left:27px;right:27px;height:1px;background:linear-gradient(90deg,#e4e8ea 0%,#f4f6f7 70%,transparent)}
+.module{z-index:5;position:absolute;display:flex;flex-direction:column;gap:4px;pointer-events:none;min-width:84px;transform:translateY(-50%);transition:opacity 350ms ease}
+.module .index {font:600 10px/1.1 "SF Mono",ui-monospace,Consolas,monospace;letter-spacing:1px;color:#a9b4b9}
+.module .name {font-size:13px;line-height:1.5;letter-spacing:.6px;font-weight:600;color:#53616b}
+.module .detail {font-size:10px;line-height:1.45;letter-spacing:.2px;color:#9da9ad;white-space:nowrap;max-width:124px;text-overflow:ellipsis;overflow:hidden;transition:color 350ms ease}
+.module.active .name {color:#253740}
+.module.active .detail {color:#5d7f80}
+.mod-input{left:6.5%;top:26%;text-align:left}
+.mod-memory{right:4.4%;top:25%;text-align:right}
+.mod-emotion{right:3.7%;top:49.8%;text-align:right}
+.mod-archive{left:6.5%;top:65.8%;text-align:left}
+.mod-world{right:5.5%;top:67.7%;text-align:right}
+.mod-input .name{color:#455d6b}
+.mod-memory .name{color:#526d83}
+.mod-emotion .name{color:#b08087}
+.mod-world .name{color:#548d87}
+.mod-archive .name{color:#788b94}
+.packet{position:absolute;z-index:7;max-width:210px;pointer-events:none;white-space:nowrap;padding:9px 12px;border:1px solid #e4e9ed;border-radius:12px;color:#506673;background:rgba(255,255,255,.93);box-shadow:0 9px 32px rgba(45,72,86,.08);font-size:11px;line-height:1.3;opacity:0;transform:translate(-50%,-50%) scale(.95);filter:blur(1px);will-change:left,top,opacity,transform}
+.packet:before{content:"";position:absolute;top:50%;left:-4px;width:6px;height:6px;border-radius:50%;background:#8da9b1;transform:translateY(-50%)}
+.scan-label {position:absolute;z-index:4;left:50%;top:60.3%;transform:translateX(-50%);color:#9ba8ae;font-size:10px;white-space:nowrap;letter-spacing:2px;opacity:.8}
+.scan-label:before,.scan-label:after{content:"";display:inline-block;height:1px;width:16px;background:#d4dde0;vertical-align:middle;margin:0 11px 3px}
+.footer{position:absolute;z-index:6;bottom:max(43px,calc(env(safe-area-inset-bottom) + 28px));left:27px;right:27px;text-align:center}
+.eyebrow {font-size:11px;color:#9dabb0;letter-spacing:4px;font-weight:500;margin-bottom:11px}
+h1{font-size:clamp(34px,8.5vw,46px);font-weight:560;letter-spacing:10px;line-height:1.32;margin:0 0 9px;color:#273841;padding-left:10px}
+.tagline{font-size:12px;color:#8b999e;letter-spacing:2.4px;margin:0}
+.line{height:1px;background:linear-gradient(90deg,transparent,#dfe6e8 18%,#bccdcf 50%,#dfe6e8 82%,transparent);width:70%;margin:25px auto 17px;position:relative}
+.line .trace {position:absolute;width:36px;height:2px;top:-.5px;left:0;background:linear-gradient(90deg,transparent,#84a7a7,transparent);border-radius:1px;box-shadow:0 0 9px #a7c2c0a8;animation:slide 4.2s linear infinite}
+@keyframes slide {from{left:0}to{left:calc(100% - 36px)}}
+.statusline{height:22px;display:flex;align-items:center;justify-content:center;gap:10px;color:#9ba6aa;font-size:11px;letter-spacing:1px}
+.statusdot{width:4px;height:4px;background:#95b9b6;border-radius:50%;animation:live 2.2s infinite}
+@media (max-height:720px){.mod-input{top:23%}.mod-memory{top:22%}.mod-emotion{top:47%}.mod-archive{top:64%}.mod-world{top:67%}.scan-label{top:61%}.footer{bottom:14px}.eyebrow{margin-bottom:5px}.line{margin:16px auto 10px}}
+@media (max-width:355px){.header{left:20px;right:20px}.mod-input,.mod-archive{left:4%}.mod-memory,.mod-world,.mod-emotion{right:2.5%}.module .name{font-size:12px}.module .detail{font-size:9px}.footer{left:15px;right:15px}h1{font-size:32px}}
+@media (prefers-reduced-motion: reduce){.line .trace,.live-dot,.statusdot{animation:none}}
+</style>
+</head>
+<body>
+<div class="screen" id="screen">
+  <canvas id="universe" aria-label="幻信开屏动画"></canvas>
+  <div class="header"><div class="brand-mini"><div class="brand-symbol" aria-hidden="true"></div><span class="micro">幻信</span></div><div class="header-right"><span class="live-dot"></span><span id="topStatus">启动中</span></div></div>
+  <div class="top-rule"></div>
+  <div class="module mod-input" id="m-input"><span class="index">01</span><span class="name">对话</span><span class="detail" id="d-input">等待新的消息</span></div>
+  <div class="module mod-memory" id="m-memory"><span class="index">02</span><span class="name">记忆</span><span class="detail" id="d-memory">按相关性沉淀</span></div>
+  <div class="module mod-emotion" id="m-emotion"><span class="index">03</span><span class="name">情绪</span><span class="detail" id="d-emotion">保持自然波动</span></div>
+  <div class="module mod-archive" id="m-archive"><span class="index">04</span><span class="name">人设</span><span class="detail" id="d-archive">角色设定就绪</span></div>
+  <div class="module mod-world" id="m-world"><span class="index">05</span><span class="name">世界线</span><span class="detail" id="d-world">经历持续演进</span></div>
+  <div class="packet" id="packet">今天下雨了，散步要改计划</div>
+  <div class="scan-label" id="scanLabel">陪伴核心</div>
+  <div class="footer">
+    <div class="eyebrow">私人陪伴</div>
+    <h1>幻信</h1>
+    <p class="tagline">对话 · 人设 · 记忆</p>
+    <div class="line"><div class="trace"></div></div>
+    <div class="statusline"><span class="statusdot"></span><span id="statusText">正在准备</span></div>
+  </div>
+</div>
+<script>
+(()=>{'use strict';
+const screen=document.getElementById('screen'),canvas=document.getElementById('universe'),ctx=canvas.getContext('2d',{alpha:true});
+const packet=document.getElementById('packet'),statusText=document.getElementById('statusText'),scanLabel=document.getElementById('scanLabel');
+const topStatus=document.getElementById('topStatus');
+const modules=['input','memory','emotion','archive','world'];
+const moduleEls=Object.fromEntries(modules.map(k=>[k,document.getElementById('m-'+k)]));
+const detailEls=Object.fromEntries(modules.map(k=>[k,document.getElementById('d-'+k)]));
+const defaults={input:'等待新的消息',memory:'按相关性沉淀',emotion:'保持自然波动',archive:'角色设定就绪',world:'经历持续演进'};
+const samples=[
+  {text:'傍晚下雨了，散步计划要调整',input:'识别新的环境变化',memory:'天气变化已关联',emotion:'略有遗憾 · 平稳',archive:'人设语境已对齐',world:'散步 → 室内活动'},
+  {text:'明天下午要面试，有点紧张',input:'识别重要生活事件',memory:'记录面试安排',emotion:'关切正在形成',archive:'陪伴语气已校准',world:'生成后续关心意图'},
+  {text:'家里的狗改名叫来福了',input:'识别明确事实修订',memory:'名称已更新',emotion:'好奇 · 平稳',archive:'保留修订来源',world:'加入新的共同经历'}
+];
+let W=0,H=0,dpr=1,core=[],dust=[],clouds={},routes={},time0=performance.now(),pauseAt=null;
+let loop=0,activeSample=samples[0],manual=false,manualStart=0,progress=null,progressLabel='',done=false;
+let color={input:[79,113,135],memory:[81,119,152],emotion:[185,124,137],archive:[138,157,166],world:[83,156,145]};
+const rand=(a,b)=>a+Math.random()*(b-a),clamp=(v,min,max)=>Math.min(max,Math.max(min,v)),ease=(x)=>x*x*(3-2*x);
+const b=(a,c,t)=>{const u=1-t;return{x:u*u*u*c[0].x+3*u*u*t*c[1].x+3*u*t*t*c[2].x+t*t*t*c[3].x,y:u*u*u*c[0].y+3*u*u*t*c[1].y+3*u*t*t*c[2].y+t*t*t*c[3].y}};
+const rgb=(k,alpha)=>`rgba(${color[k].join(',')},${alpha})`;
+function initCloud(){
+ core=[];let count=W<380?1850:2400;
+ for(let i=0;i<count;i++){
+  const u=rand(-1,1),a=Math.random()*Math.PI*2,r=Math.pow(Math.random(),.92),lat=Math.acos(u);
+  let x=Math.cos(a)*Math.sin(lat)*r,y=Math.sin(a)*Math.sin(lat)*r,z=u*r;
+  x=x*(1+.10*Math.sin(2*y+2*z));y=y*(1+.07*Math.cos(4*x));
+  const c=Math.random();
+  core.push({x,y,z,s:rand(.5,1.6),phase:rand(0,Math.PI*2),lum:rand(.4,1),kind:c<.70?0:c<.88?1:2});
+ }
+ dust=[];for(let i=0;i<180;i++)dust.push({x:Math.random()*W,y:rand(H*.14,H*.82),s:rand(.25,1),a:rand(.04,.22),p:rand(0,10)});
+ clouds={};for(const key of modules){clouds[key]=Array.from({length:95},()=>({a:rand(0,Math.PI*2),r:Math.sqrt(Math.random()),z:rand(-1,1),s:rand(.4,1.4),phase:rand(0,7)}));}
+}
+function geometry(){
+ const cx=W*.5,cy=H*.444,rad=Math.min(W*.292,H*.183,145);
+ let p={input:{x:W*.18,y:H*.312},memory:{x:W*.82,y:H*.317},emotion:{x:W*.84,y:H*.545},archive:{x:W*.17,y:H*.605},world:{x:W*.785,y:H*.635}};
+ const edge={input:{x:cx-rad*.63,y:cy-rad*.35},memory:{x:cx+rad*.66,y:cy-rad*.38},emotion:{x:cx+rad*.89,y:cy+.09*rad},archive:{x:cx-rad*.53,y:cy+rad*.68},world:{x:cx+rad*.55,y:cy+rad*.69}};
+ const createPath=(k)=>{let a=edge[k],c=p[k],dx=c.x-a.x,dy=c.y-a.y;return [{x:a.x,y:a.y},{x:a.x+dx*.35,y:a.y+dy*.08},{x:c.x-dx*.24,y:c.y-dy*.07},{x:c.x,y:c.y}];};
+ return {cx,cy,rad,p,edge,paths:Object.fromEntries(modules.map(k=>[k,createPath(k)]))};
+}
+function size(){const r=screen.getBoundingClientRect();W=r.width;H=r.height;dpr=Math.min(window.devicePixelRatio||1,2);canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);routes=geometry();initCloud()}
+const ro=new ResizeObserver(size);ro.observe(screen);size();
+function drawBackground(t){
+  for(const p of dust){const y=p.y+Math.sin(t*.4+p.p)*2;ctx.fillStyle=`rgba(93,119,129,${p.a*(.65+.35*Math.sin(t*.5+p.p))})`;ctx.beginPath();ctx.arc(p.x,y,p.s,0,Math.PI*2);ctx.fill()}
+  const {cx,cy,rad}=routes;
+  let g=ctx.createRadialGradient(cx,cy,rad*.22,cx,cy,rad*1.9);g.addColorStop(0,'rgba(214,226,231,.21)');g.addColorStop(.6,'rgba(235,241,242,.12)');g.addColorStop(1,'rgba(255,255,255,0)');ctx.fillStyle=g;ctx.fillRect(cx-rad*2,cy-rad*2,rad*4,rad*4);
+  ctx.save();ctx.translate(cx,cy);ctx.rotate(-.32);for(let i=0;i<3;i++){
+    ctx.beginPath();ctx.ellipse(0,0,rad*(1.21+i*.095),rad*(.45+i*.038),0,0,Math.PI*2);
+    ctx.setLineDash(i===2?[2,8]:[]);ctx.lineWidth=.65;ctx.strokeStyle=`rgba(138,164,172,${.11-i*.022})`;ctx.stroke();
+  }ctx.restore();ctx.setLineDash([]);
+}
+function drawLinks(t,excite){
+ const {paths}=routes;
+ for(const key of modules){
+   const path=paths[key],act=excite[key]||0;
+   ctx.beginPath();ctx.moveTo(path[0].x,path[0].y);ctx.bezierCurveTo(path[1].x,path[1].y,path[2].x,path[2].y,path[3].x,path[3].y);
+   ctx.strokeStyle=`rgba(150,174,181,${.17+act*.19})`;ctx.lineWidth=.68+act*.4;ctx.stroke();
+   for(let j=0;j<5;j++){
+     let q=(j*.21+(t*.065)*(key==='input'?-1:1))%1;if(q<0)q+=1;
+     let xy=b(null,path,q),alpha=(.16+act*.55)*Math.sin(Math.PI*q);
+     ctx.fillStyle=rgb(key,alpha);ctx.beginPath();ctx.arc(xy.x,xy.y,act>.1?1.1:.68,0,Math.PI*2);ctx.fill();
+   }
+ }
+}
+function drawCore(t,activation){
+ const {cx,cy,rad}=routes;const rot=t*.105;
+ for(let k=0;k<12;k++){
+  let begin=0;ctx.beginPath();for(let j=0;j<=52;j++){
+   const v=j/52,th=v*Math.PI*3.2+k*.53+rot*.6, rr=rad*(.21+.65*Math.sin(Math.PI*v));
+   const x=cx+Math.cos(th)*rr,y=cy+Math.sin(th)*rr*.63+rad*(v-.5)*.5;
+   if(!begin++){ctx.moveTo(x,y)}else ctx.lineTo(x,y)
+  }
+  ctx.strokeStyle=`rgba(112,151,166,${.038+.030*activation})`;ctx.lineWidth=.75;ctx.stroke();
+ }
+ const pts=[];
+ for(const p of core){
+  let ax=p.x*Math.cos(rot)-p.z*Math.sin(rot), az=p.x*Math.sin(rot)+p.z*Math.cos(rot);
+  let ay=p.y+Math.sin(p.x*5+t*.56+p.phase)*.012;
+  const twist=.13*Math.sin((ay+1)*3.2+t*.2);
+  let x=ax*Math.cos(twist)-az*Math.sin(twist);
+  let z=ax*Math.sin(twist)+az*Math.cos(twist);
+  let depth=2.7/(2.7-z*.52);
+  let px=cx+x*rad*1.03*depth,py=cy+ay*rad*.90*depth;
+  let alpha=clamp(.21 + (.50*(z+1)/2)+p.lum*.19+activation*.13,.12,.91);
+  pts.push({px,py,z,alpha,s:p.s*depth,kind:p.kind})
+ }
+ pts.sort((a,b)=>a.z-b.z);
+ for(const p of pts){
+  const rgbc=p.kind===0?'43,67,79':p.kind===1?'88,139,156':'116,167,165';
+  ctx.fillStyle=`rgba(${rgbc},${p.alpha})`;ctx.beginPath();ctx.arc(p.px,p.py,p.s*(.82+activation*.12),0,Math.PI*2);ctx.fill();
+ }
+ for(let i=0;i<24;i++){
+  const a=i*2.39996+t*.12,r=rad*(.08+.84*Math.sqrt((i+.5)/24));
+  const x=cx+Math.cos(a)*r,y=cy+Math.sin(a)*r*.89;
+  ctx.fillStyle=`rgba(111,164,173,${.10+.08*activation})`;ctx.beginPath();ctx.arc(x,y,2.0,0,Math.PI*2);ctx.fill()
+ }
+}
+function drawModules(t,excite){
+ for(const key of modules){
+  const {x,y}=routes.p[key],sp=excite[key]||0;
+  let halo=ctx.createRadialGradient(x,y,0,x,y,24);halo.addColorStop(0,rgb(key,sp*.10+.025));halo.addColorStop(1,rgb(key,0));ctx.fillStyle=halo;ctx.fillRect(x-25,y-25,50,50);
+  for(const p of clouds[key]){
+   const r=p.r*(14+sp*2.5),a=p.a+t*.08*(p.z>0?1:-1),x1=x+Math.cos(a)*r,y1=y+Math.sin(a)*r*.67+p.z*3;
+   ctx.fillStyle=rgb(key,(.15+.20*(p.z+1)/2)*(1+sp*.65));ctx.beginPath();ctx.arc(x1,y1,p.s*(1+sp*.1),0,Math.PI*2);ctx.fill()
+  }
+  ctx.fillStyle=rgb(key,.46+sp*.44);ctx.beginPath();ctx.arc(x,y,1.9+sp*1.1,0,Math.PI*2);ctx.fill();
+ }
+}
+function drawPulse(key,progress,scale=1){const path=routes.paths[key],c=color[key];
+ for(let i=5;i>=0;i--){let tq=progress-i*.035;if(tq<0)continue;let a=b(null,path,tq);let s=(1.6-i*.19)*scale;
+  ctx.fillStyle=`rgba(${c.join(',')},${(.55-i*.075)*Math.sin(Math.PI*tq)})`;ctx.beginPath();ctx.arc(a.x,a.y,Math.max(.35,s),0,Math.PI*2);ctx.fill()
+ }
+}
+function setDetails(k,active){for(const m of modules){moduleEls[m].classList.toggle('active',m===k&&active)}}
+function setSample(sample){activeSample=sample;packet.textContent=sample.text;for(const k of modules){detailEls[k].textContent=defaults[k]}}
+function render(now){if(pauseAt)return;const elapsed=(now-time0)/1000;const duration=11.2;let cur=manual? (now-manualStart)/1000 :elapsed;let phase=((cur%duration)+duration)%duration;
+ if(!manual){let n=Math.floor(cur/duration);if(n!==loop){loop=n;setSample(samples[((n%samples.length)+samples.length)%samples.length])}}
+ let t=elapsed;const excite={input:0,memory:0,emotion:0,archive:0,world:0};
+ const inputP=clamp((phase-.45)/2.35,0,1);
+ let activation=(Math.sin(Math.PI*clamp((phase-1.6)/4.1,0,1))**2);
+ if(phase<3.2){excite.input=ease(inputP)}
+ const sequence={archive:3.00,memory:3.50,emotion:4.12,world:4.65};
+ for(const key of ['archive','memory','emotion','world']){let start=sequence[key];let q=clamp((phase-start)/1.7,0,1);excite[key]=Math.sin(Math.PI*q)**2*.92;if(phase>=start&&phase<=start+2.05){excite[key]=Math.max(.45,excite[key])}}
+ ctx.clearRect(0,0,W,H);drawBackground(t);drawLinks(t,excite);drawCore(t,activation);drawModules(t,excite);
+ if(phase>.45&&phase<3.1){const inpath=routes.paths.input;let pos=b(null,inpath,1-ease(inputP));
+   packet.style.left=pos.x+'px';packet.style.top=(pos.y+15-16*Math.sin(Math.PI*inputP))+'px';
+   packet.style.opacity=String(Math.min(clamp((phase-.45)/.50,0,1),clamp((3.12-phase)/.50,0,1))*.95);
+   packet.style.filter=`blur(${(1-inputP)*.6}px)`;packet.style.transform=`translate(-50%,-50%) scale(${.88+.12*Math.sin(Math.PI*(.1+inputP*.8))})`;
+   drawPulse('input',1-ease(inputP),1.1);
+ }else packet.style.opacity='0';
+ for(const key of ['archive','memory','emotion','world']){
+  const start=sequence[key];if(phase>start&&phase<start+2.2){let q=clamp((phase-start)/1.9,0,1);drawPulse(key,ease(q),1.25);}
+ }
+ const selected=phase<.45?'idle':phase<3.05?'input':phase<3.50?'archive':phase<4.15?'memory':phase<4.72?'emotion':phase<6.6?'world':'idle';
+ setDetails(selected,selected!=='idle');
+ if(phase>3.2)detailEls.archive.textContent=activeSample.archive;
+ if(phase>3.7)detailEls.memory.textContent=activeSample.memory;
+ if(phase>4.32)detailEls.emotion.textContent=activeSample.emotion;
+ if(phase>4.90)detailEls.world.textContent=activeSample.world;
+ if(phase>.8&&phase<3.1)detailEls.input.textContent=activeSample.input;
+ const label=phase<.55?'等待下一次对话':phase<2.8?'接收 · 理解':phase<3.8?'对齐人设语境':phase<4.7?'提炼有效信息':phase<6.5?'同步情绪与世界线':'持续演进';
+ scanLabel.textContent=label;
+ if(progress!==null){statusText.textContent=progressLabel||'正在准备';}else{statusText.textContent=phase<.55?'正在准备幻信':phase<3.0?'正在感知新的对话片段':phase<6.4?'记忆、情绪与世界线协同更新':'陪伴状态持续运行中'}
+ if(done){packet.style.opacity='0';statusText.textContent='准备就绪';topStatus.textContent='已就绪'}
+ requestAnimationFrame(render)
+}
+requestAnimationFrame(render);
+window.CompanionSplash={
+ ingest(text,values={}){text=(text||'').trim();if(!text)return;manual=true;manualStart=performance.now();loop=0;time0=manualStart;done=false;progress=null;setSample({text:text.slice(0,46),input:'正在理解新的信息',memory:values.memory||'正在提炼相关事实',emotion:values.emotion||'感知表达中的情绪',archive:values.archive||'人设已对齐',world:values.world||'世界线已关联此次对话'})},
+ setProgress(p,label=''){progress=clamp(Number(p)||0,0,100);progressLabel=label;statusText.textContent=label||'正在初始化';},
+ finish(){done=true;statusText.textContent='准备就绪';topStatus.textContent='已就绪';},
+ restart(){manual=false;done=false;progress=null;time0=performance.now();loop=0;setSample(samples[0]);topStatus.textContent='启动中'},
+ pause(){if(!pauseAt)pauseAt=performance.now()},
+ resume(){if(pauseAt){const delta=performance.now()-pauseAt;time0+=delta;if(manual)manualStart+=delta;pauseAt=null;requestAnimationFrame(render)}},
+ setAutoDemo(enabled){manual=!enabled;if(enabled){time0=performance.now();loop=0;setSample(samples[0])}},
+ getSnapshot(){return{phase:manual?'manual':'auto',text:activeSample.text,done,progress}}
+};
+if(window.matchMedia('(prefers-reduced-motion: reduce)').matches){window.CompanionSplash.pause();ctx.clearRect(0,0,W,H);drawBackground(0);drawLinks(0,{});drawCore(0,.2);drawModules(0,{});scanLabel.textContent='私人陪伴';statusText.textContent='对话、人设与记忆已就绪'}
+})();
+</script>
+</body>
+</html>

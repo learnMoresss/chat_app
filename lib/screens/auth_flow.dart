@@ -8,6 +8,7 @@ import '../api/api_client.dart';
 import '../api/session.dart';
 import '../store.dart';
 import '../theme.dart';
+import '../widgets/launch_splash.dart';
 import 'shell.dart';
 
 /// 启动流程共用的浅底与主按钮样式。
@@ -565,11 +566,20 @@ class BootstrapPage extends StatefulWidget {
 
 class _BootstrapPageState extends State<BootstrapPage> {
   bool _checking = true;
+  /// 开屏只做叠加播放：会话恢复并行进行，就绪即淡出，不等完整动画。
+  bool _splashDismiss = false;
+  bool _splashGone = false;
 
   @override
   void initState() {
     super.initState();
-    _restore();
+    // 会话恢复立刻开始，不 await 开屏 WebView
+    unawaited(_restore());
+  }
+
+  void _requestSplashDismiss() {
+    if (_splashDismiss || !mounted) return;
+    setState(() => _splashDismiss = true);
   }
 
   Future<void> _restore() async {
@@ -577,6 +587,7 @@ class _BootstrapPageState extends State<BootstrapPage> {
     if (!mounted) return;
     if (saved == null) {
       setState(() => _checking = false);
+      _requestSplashDismiss();
       return;
     }
 
@@ -616,6 +627,7 @@ class _BootstrapPageState extends State<BootstrapPage> {
         );
       }
       if (!mounted) return;
+      _requestSplashDismiss();
       await _enterRemote(
         context,
         serverUrl: saved.serverUrl,
@@ -626,10 +638,14 @@ class _BootstrapPageState extends State<BootstrapPage> {
       // 仅登录失效才清令牌；网络不通保留会话，用本地缓存进主界面
       if (e.statusCode == 401) {
         await SessionStore().clear();
-        if (mounted) setState(() => _checking = false);
+        if (mounted) {
+          setState(() => _checking = false);
+          _requestSplashDismiss();
+        }
         return;
       }
       if (!mounted) return;
+      _requestSplashDismiss();
       await _enterRemote(
         context,
         serverUrl: saved.serverUrl,
@@ -643,6 +659,7 @@ class _BootstrapPageState extends State<BootstrapPage> {
       );
     } catch (_) {
       if (!mounted) return;
+      _requestSplashDismiss();
       await _enterRemote(
         context,
         serverUrl: saved.serverUrl,
@@ -661,19 +678,28 @@ class _BootstrapPageState extends State<BootstrapPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_checking) return const WelcomePage();
-    return const AnnotatedRegion<SystemUiOverlayStyle>(
-      value: SystemUiOverlayStyle.dark,
-      child: Scaffold(
-        backgroundColor: Color(0xFFF7F7F5),
-        body: Center(
-          child: SizedBox(
-            width: 28,
-            height: 28,
-            child: CircularProgressIndicator(strokeWidth: 2.4, color: AppColors.green),
+    final under = !_checking
+        ? const WelcomePage()
+        : const AnnotatedRegion<SystemUiOverlayStyle>(
+            value: SystemUiOverlayStyle.dark,
+            child: Scaffold(
+              backgroundColor: Color(0xFFFFFFFF),
+              body: SizedBox.expand(),
+            ),
+          );
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        under,
+        if (!_splashGone)
+          LaunchSplashOverlay(
+            dismiss: _splashDismiss,
+            onDismissed: () {
+              if (mounted) setState(() => _splashGone = true);
+            },
           ),
-        ),
-      ),
+      ],
     );
   }
 }

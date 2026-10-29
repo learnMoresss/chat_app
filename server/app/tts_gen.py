@@ -81,22 +81,28 @@ def _voicedesign_wav(*, text: str, instructions: str, timeout: float) -> Optiona
         return None
 
 
-def _cosyvoice_wav(*, text: str, instructions: str, timeout: float) -> Optional[bytes]:
+def _cosyvoice_wav(
+    *,
+    text: str,
+    instructions: str,
+    timeout: float,
+    prompt_wav: str = "",
+) -> Optional[bytes]:
     """Fun-CosyVoice3 网关：固定参考声线 + instruction 控情绪。"""
     settings = get_settings()
     base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:8885").rstrip("/")
     if not base:
         return None
     url = f"{base}/v1/audio/speech"
+    data = {
+        "text": text[:500],
+        "instruction": (instructions or "")[:800],
+    }
+    if (prompt_wav or "").strip():
+        data["prompt_wav"] = prompt_wav.strip()
     try:
         with httpx.Client(timeout=timeout) as client:
-            r = client.post(
-                url,
-                data={
-                    "text": text[:500],
-                    "instruction": (instructions or "")[:800],
-                },
-            )
+            r = client.post(url, data=data)
             if r.status_code >= 400 or not r.content or len(r.content) < 200:
                 return None
             if r.content[:4] == b"RIFF":
@@ -104,6 +110,66 @@ def _cosyvoice_wav(*, text: str, instructions: str, timeout: float) -> Optional[
             return _pcm16_mono_to_wav(r.content, 24000)
     except Exception:
         return None
+
+
+def iter_cosyvoice_pcm(
+    *,
+    text: str,
+    instructions: str,
+    timeout: float = 0,
+    prompt_wav: str = "",
+):
+    """真流式：yield (pcm_s16le_bytes, sample_rate)。按网关长度帧解析，首块尽早返回。"""
+    settings = get_settings()
+    base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:8885").rstrip("/")
+    if not base:
+        return
+    url = f"{base}/v1/audio/speech/stream"
+    to = timeout or float(settings.tts_timeout_seconds or 300)
+    text = (text or "").strip()
+    if not text:
+        return
+    data = {
+        "text": text[:500],
+        "instruction": (instructions or "")[:800],
+    }
+    if (prompt_wav or "").strip():
+        data["prompt_wav"] = prompt_wav.strip()
+    hop = int(getattr(settings, "voice_cosy_first_hop", 12) or 0)
+    if hop > 0:
+        data["first_hop"] = str(hop)
+    try:
+        with httpx.Client(timeout=to) as client:
+            with client.stream("POST", url, data=data) as r:
+                if r.status_code >= 400:
+                    return
+                sr = int(r.headers.get("x-sample-rate") or "24000")
+                framed = (r.headers.get("x-frame") or "").lower() == "lenprefixed"
+                buf = bytearray()
+                for chunk in r.iter_bytes():
+                    if not chunk:
+                        continue
+                    if not framed:
+                        yield chunk, sr
+                        continue
+                    buf.extend(chunk)
+                    while len(buf) >= 4:
+                        n = int.from_bytes(buf[0:4], "big")
+                        if n <= 0 or n > 8_000_000:
+                            buf.clear()
+                            break
+                        if len(buf) < 4 + n:
+                            break
+                        pcm = bytes(buf[4 : 4 + n])
+                        del buf[: 4 + n]
+                        if pcm:
+                            yield pcm, sr
+    except Exception:
+        return
+
+
+def pcm16_mono_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
+    return _pcm16_mono_to_wav(pcm, sample_rate)
 
 
 def resolve_tts_engine(*, for_realtime: bool = False) -> str:
@@ -201,8 +267,12 @@ def synthesize_voice_wav(
     )
 
 
-def warm_tts_engine(*, for_realtime: bool = True) -> dict:
-    """启动预热：ensure 引擎 + 极短合成，压掉冷启动。"""
+def warm_tts_engine(*, for_realtime: bool = True, prompt_wav: str = "") -> dict:
+    """通话进页预热：ensure 引擎；CosyVoice 走 /v1/warm（模型+声线声学缓存）。
+
+    预热发生在用户点开通话时，不计入「说完→首声」等待。
+    prompt_wav：固定音色试听 wav，供 CosyVoice 克隆。
+    """
     from . import tts_ondemand
 
     engine = resolve_tts_engine(for_realtime=for_realtime)
@@ -210,6 +280,30 @@ def warm_tts_engine(*, for_realtime: bool = True) -> dict:
         tts_ondemand.ensure_engine(engine)
     except Exception as e:
         return {"ok": False, "engine": engine, "error": str(e)}
+
+    if engine == "cosyvoice":
+        settings = get_settings()
+        base = (getattr(settings, "tts_cosyvoice_url", None) or "http://127.0.0.1:8885").rstrip("/")
+        try:
+            data = {}
+            if (prompt_wav or "").strip():
+                data["prompt_wav"] = prompt_wav.strip()
+            with httpx.Client(timeout=180.0) as client:
+                r = client.post(f"{base}/v1/warm", data=data)
+            if r.status_code < 400:
+                body = r.json() if r.content else {}
+                return {
+                    "ok": True,
+                    "engine": engine,
+                    "warmed": True,
+                    "via": "cosyvoice_/v1/warm",
+                    "prompt_wav": (prompt_wav or "").strip() or None,
+                    "detail": body,
+                    "error": None,
+                }
+        except Exception as e:
+            return {"ok": False, "engine": engine, "error": f"warm failed: {e}"}
+
     wav = synthesize_voice_wav(
         text="嗯。",
         instructions="自然短促地应答一声，像微信语音。",

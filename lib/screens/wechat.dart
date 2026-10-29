@@ -45,27 +45,42 @@ class WechatPage extends StatelessWidget {
       ),
       body: Container(
         color: Colors.white,
-        child: rows.isEmpty && folded.isEmpty
-            ? const EmptyHint('还没有会话')
-            : ListView.builder(
-                itemCount: rows.length + (folded.isEmpty ? 0 : 1),
-                itemBuilder: (context, i) {
-                  if (i < rows.length) {
-                    final c = rows[i];
-                    return _ConvTile(store: store, conv: c, first: i == 0);
-                  }
-                  final unread = folded.fold<int>(0, (s, c) => s + c.unread);
-                  return ListTile(
-                    leading: Avatar('折', AppColors.muted, size: 50, group: true),
-                    title: Text('折叠的群聊(${folded.length})'),
-                    subtitle: Text(unread > 0 ? '$unread 条消息' : '暂无新消息', style: const TextStyle(color: AppColors.muted, fontSize: 14)),
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => _FoldedGroupsPage(store: store, convs: folded)),
-                    ),
-                  );
-                },
-              ),
+        child: RefreshIndicator(
+          color: AppColors.green,
+          onRefresh: () async {
+            try {
+              await store.pullSync();
+            } catch (_) {}
+          },
+          child: rows.isEmpty && folded.isEmpty
+              ? ListView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  children: const [
+                    SizedBox(height: 160),
+                    EmptyHint('还没有会话'),
+                  ],
+                )
+              : ListView.builder(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  itemCount: rows.length + (folded.isEmpty ? 0 : 1),
+                  itemBuilder: (context, i) {
+                    if (i < rows.length) {
+                      final c = rows[i];
+                      return _ConvTile(store: store, conv: c, first: i == 0);
+                    }
+                    final unread = folded.fold<int>(0, (s, c) => s + c.unread);
+                    return ListTile(
+                      leading: Avatar('折', AppColors.muted, size: 50, group: true),
+                      title: Text('折叠的群聊(${folded.length})'),
+                      subtitle: Text(unread > 0 ? '$unread 条消息' : '暂无新消息', style: const TextStyle(color: AppColors.muted, fontSize: 14)),
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => _FoldedGroupsPage(store: store, convs: folded)),
+                      ),
+                    );
+                  },
+                ),
+        ),
       ),
     );
   }
@@ -190,7 +205,9 @@ class _ConvTile extends StatelessWidget {
                 api: store.api,
                 avatarFileId: () {
                   if (conv.isGroup) return null;
-                  final id = store.persona(conv.personaId!)?.avatarFileId ?? '';
+                  final pid = conv.personaId;
+                  if (pid == null || pid.isEmpty) return null;
+                  final id = store.persona(pid)?.avatarFileId ?? '';
                   return id.isEmpty ? null : id;
                 }(),
               ),

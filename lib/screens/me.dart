@@ -231,13 +231,16 @@ class SettingsPage extends StatelessWidget {
           appBar: AppBar(title: const Text('设置')),
           body: ListView(
             children: [
-              Section(children: [
-                ArrowTile(
-                  title: '账号与服务器',
-                  subtitle: store.serverName,
-                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AccountServerPage(store: store))),
-                ),
-              ]),
+              Section(
+                margin: EdgeInsets.zero,
+                children: [
+                  ArrowTile(
+                    title: '账号与服务器',
+                    subtitle: store.serverName,
+                    onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AccountServerPage(store: store))),
+                  ),
+                ],
+              ),
               Section(children: [
                 // 一行入口，别把 7 个模型全摊开
                 ArrowTile(

@@ -1145,24 +1145,72 @@ class ApiClient {
     );
   }
 
-  Future<Map<String, dynamic>> voiceRealtimeWarm() {
-    return _json('POST', '/api/v1/voice/realtime/warm', auth: true);
+  Future<Map<String, dynamic>> voiceRealtimeWarm({String convId = ''}) {
+    return _json(
+      'POST',
+      '/api/v1/voice/realtime/warm',
+      auth: true,
+      query: {if (convId.isNotEmpty) 'conv_id': convId},
+    );
   }
 
-  Future<Map<String, dynamic>> voiceRealtimeHangup({required String convId}) {
+  /// 点击语音通话：服务端插入微信式通话气泡（AI 默认已接）。
+  Future<Map<String, dynamic>> voiceRealtimeStart({required String convId}) {
+    return _json(
+      'POST',
+      '/api/v1/voice/realtime/start',
+      auth: true,
+      body: {'conv_id': convId},
+    );
+  }
+
+  /// AI 接通短问候（固定音色），播完后再开麦。
+  Future<Map<String, dynamic>> voiceRealtimeGreeting({required String convId}) {
+    return _json(
+      'POST',
+      '/api/v1/voice/realtime/greeting',
+      auth: true,
+      body: {'conv_id': convId},
+    );
+  }
+
+  /// 插话打断：停服务端本轮 LLM/TTS。
+  Future<Map<String, dynamic>> voiceRealtimeCancel({
+    required String convId,
+    String turnId = '',
+  }) {
+    return _json(
+      'POST',
+      '/api/v1/voice/realtime/cancel',
+      auth: true,
+      body: {
+        'conv_id': convId,
+        if (turnId.isNotEmpty) 'turn_id': turnId,
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>> voiceRealtimeHangup({
+    required String convId,
+    int? durationSec,
+  }) {
     return _json(
       'POST',
       '/api/v1/voice/realtime/hangup',
       auth: true,
-      body: {'conv_id': convId},
+      body: {
+        'conv_id': convId,
+        if (durationSec != null) 'duration_sec': durationSec,
+      },
     );
   }
 
   Future<Map<String, dynamic>> voiceRealtimeTurn({
     required String convId,
     required Uint8List bytes,
-    String filename = 'voice.m4a',
-    String contentType = 'audio/mp4',
+    String filename = 'voice.wav',
+    String contentType = 'audio/wav',
+    String prefixText = '',
     bool allowAuthRetry = true,
   }) async {
     if (accessToken == null || accessToken!.isEmpty) {
@@ -1173,6 +1221,9 @@ class ApiClient {
     req.headers['Authorization'] = 'Bearer $accessToken';
     req.headers['Accept'] = 'application/json';
     req.fields['conv_id'] = convId;
+    if (prefixText.trim().isNotEmpty) {
+      req.fields['prefix_text'] = prefixText.trim();
+    }
     MediaType? mt;
     try {
       mt = MediaType.parse(contentType);
@@ -1197,6 +1248,7 @@ class ApiClient {
             bytes: bytes,
             filename: filename,
             contentType: contentType,
+            prefixText: prefixText,
             allowAuthRetry: false,
           );
         }

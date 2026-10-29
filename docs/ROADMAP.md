@@ -136,7 +136,7 @@
 - [x] 消息长按：微信式深色图标气泡（贴气泡定位），去掉底部白面板 / 模拟失败项
 - [x] 一起听：去重 + 曲库选歌弹层；链接入口已去掉（防崩溃）
 - [x] 实时语音对话页 UI（`realtime_voice.dart`）：球体动画、字幕开关、静音/外放/挂断
-- [x] 实时语音半双工接线：ASR→DSH 分句→逐句 Breeze→WS 播放队列；启动预热 +「连接中」门闩
+- [x] 实时语音半双工接线：SenseVoice ASR→DSH 分句→CosyVoice 流式 PCM（`voice_audio`）→App 播放；启动预热 +「连接中」门闩；公网 `/chat-api`
 - [ ] 实时语音：更强原生 Voice Processing AEC；流式 ASR
 - [ ] 语音/视频通话：WebRTC 媒体通道（信令骨架已有）
 

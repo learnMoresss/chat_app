@@ -31,6 +31,26 @@ class Settings(BaseSettings):
     tts_engine: str = "breeze"  # breeze | voicedesign | cosyvoice
     # 实时语音半双工：默认 CosyVoice 3（固定参考声线，RTF 更适合边听边播）
     tts_realtime_engine: str = "cosyvoice"  # cosyvoice | breeze | voicedesign
+    # 非空则跳过 DSH，用这段写死回复测「ASR→TTS 流式」（仅压测）。
+    # 生产公网通话请保持为空，走真实 DSH。
+    voice_realtime_mock_reply: str = ""
+    # 模拟 LLM 流式吐字间隔（毫秒）；0=整段一次给出
+    voice_realtime_mock_stream_ms: int = 18
+    # 语音通话强制走的 DSH provider（避开坏掉的 daycard）
+    voice_dsh_provider: str = "deepseek-official"
+    voice_dsh_model: str = "deepseek-chat"
+    # 句与句之间人工停顿（毫秒）：生成可立刻开始，播放时插入静音，避免下句抢话
+    voice_sentence_gap_ms: int = 380
+    # 首句提前切：按逗号切出的最短字数（仅第 1 句）
+    voice_first_phrase_min_chars: int = 6
+    # 是否启用逐句情绪标签解析（[轻快] 等）
+    voice_emotion_tags: bool = True
+    # CosyVoice 首块 hop（越小首声越快；音质接缝需 A/B）
+    voice_cosy_first_hop: int = 12
+    # 自动听静音判定（毫秒）
+    voice_auto_silence_ms: int = 550
+    # 通话句尾判断：未说完则 hold，等下一段合并（规则版，零额外延迟）
+    voice_turn_hold: bool = True
     # Qwen3-TTS VoiceDesign（旧后端，可作回退）
     tts_voicedesign_url: str = "http://127.0.0.1:8882"
     # 固定音色 CustomVoice（按需启动，默认 8881）

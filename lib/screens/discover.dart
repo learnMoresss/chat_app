@@ -21,7 +21,7 @@ class DiscoverPage extends StatelessWidget {
           body: ListView(
             children: [
               Section(
-                margin: const EdgeInsets.only(top: 8),
+                margin: EdgeInsets.zero,
                 children: [
                   _DiscoverTile(
                     icon: Icons.camera_alt,

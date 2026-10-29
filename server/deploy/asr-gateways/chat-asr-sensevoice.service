@@ -1,0 +1,19 @@
+# 可选单元：默认不 enable（不常驻）。
+# 通话走 asr_ondemand：点打电话 → warm 拉起 → 闲置 3 分钟停。
+# 本 unit 仅供手动 systemctl --user start/stop 调试。
+[Unit]
+Description=chat_app SenseVoice FunASR gateway (:8886) — on-demand only, do not enable
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/ai/services/asr-gateways
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=FUNASR_DEVICE=cuda:0
+Environment=FUNASR_MODEL=iic/SenseVoiceSmall
+Environment=MODELSCOPE_CACHE=/data/ai/models/audio/modelscope-cache
+ExecStartPre=/bin/mkdir -p /data/ai/logs/audio /data/ai/models/audio/modelscope-cache
+ExecStart=/data/ai/envs/funasr-voice/bin/python -m uvicorn funasr_gateway:app --host 127.0.0.1 --port 8886
+Restart=no
+StandardOutput=append:/data/ai/logs/audio/funasr-gateway.log
+StandardError=append:/data/ai/logs/audio/funasr-gateway.log

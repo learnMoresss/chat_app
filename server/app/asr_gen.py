@@ -11,14 +11,24 @@ import httpx
 from .config import get_settings
 
 
-def transcribe_audio_path(path: str | Path, *, language: str = "zh") -> Optional[str]:
-    """返回转写文本；失败返回 None（不抛，避免堵发送）。"""
+def transcribe_audio_path(
+    path: str | Path,
+    *,
+    language: str = "zh",
+    allow_fallback: bool = True,
+) -> Optional[str]:
+    """返回转写文本；失败返回 None（不抛，避免堵发送）。
+
+    allow_fallback=False：通话路径只用 HTTP SenseVoice，失败不回退 whisper（又慢又易串语言）。
+    """
     p = Path(path)
     if not p.is_file() or p.stat().st_size < 64:
         return None
     text = _via_http(p, language=language)
     if text:
         return text
+    if not allow_fallback:
+        return None
     return _via_local_whisper(p, language=language)
 
 

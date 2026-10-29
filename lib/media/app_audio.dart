@@ -4,17 +4,19 @@ import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:path_provider/path_provider.dart';
 
-/// App 全局音频：拉高音量、iOS 走 playback + 扬声器（模拟器才能从 Mac 喇叭出声）。
+/// App 全局音频：媒体播放 vs 通话模式（VOICE_COMMUNICATION + 外放，利于系统 AEC）。
 class AppAudio {
   AppAudio._();
 
   static bool _ready = false;
+  static bool _inCallMode = false;
   static Directory? _tmp;
   static Directory? _cacheDir;
 
   static Future<void> ensureConfigured() async {
-    if (_ready) return;
-    // defaultToSpeaker 只能配 playAndRecord；模拟器才能从 Mac 喇叭出来
+    if (_ready && !_inCallMode) return;
+    if (_inCallMode) return;
+    // 普通媒体：外放；通话请用 [enterCallAudioMode]
     await AudioPlayer.global.setAudioContext(
       AudioContext(
         iOS: AudioContextIOS(
@@ -35,6 +37,39 @@ class AppAudio {
       ),
     );
     _ready = true;
+  }
+
+  /// 进入语音通话：播放走 voiceCommunication，配合录音 VOICE_COMMUNICATION 源，
+  /// 系统才会认真做回声消除（比 media 通路靠谱得多）。
+  static Future<void> enterCallAudioMode({bool speakerOn = true}) async {
+    _inCallMode = true;
+    await AudioPlayer.global.setAudioContext(
+      AudioContext(
+        iOS: AudioContextIOS(
+          category: AVAudioSessionCategory.playAndRecord,
+          options: {
+            if (speakerOn) AVAudioSessionOptions.defaultToSpeaker,
+            AVAudioSessionOptions.allowBluetooth,
+            AVAudioSessionOptions.allowBluetoothA2DP,
+          },
+        ),
+        android: AudioContextAndroid(
+          isSpeakerphoneOn: speakerOn,
+          stayAwake: true,
+          contentType: AndroidContentType.speech,
+          usageType: AndroidUsageType.voiceCommunication,
+          audioFocus: AndroidAudioFocus.gain,
+        ),
+      ),
+    );
+  }
+
+  /// 挂断后回到普通媒体通路。
+  static Future<void> leaveCallAudioMode() async {
+    if (!_inCallMode) return;
+    _inCallMode = false;
+    _ready = false;
+    await ensureConfigured();
   }
 
   static Future<Directory> _ensureCacheDir() async {

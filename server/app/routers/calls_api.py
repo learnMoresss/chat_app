@@ -45,6 +45,20 @@ async def create_call(body: CallCreate, user: Dict[str, Any] = Depends(current_u
     )
     if conv is None:
         raise HTTPException(404, "会话不存在")
+    # 与实时语音通话互斥：账号同时只能一路
+    from .. import voice_realtime as vr
+
+    busy = vr.find_active_call_for_user(user["id"])
+    if busy:
+        kind = "视频通话" if (busy.get("media") or "") == "video" else "语音通话"
+        raise HTTPException(
+            409,
+            detail={
+                "error": f"当前已有{kind}进行中，请先挂断",
+                "error_code": "call_busy",
+                "busy": busy,
+            },
+        )
     now = iso()
     cid = new_id("call_")
     db.execute(

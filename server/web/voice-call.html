@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>幻信 · 语音通话测试</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a222c;
+      --line: #2a3542;
+      --text: #e8eef5;
+      --muted: #8b9aab;
+      --accent: #5b9fd4;
+      --ok: #3dba7a;
+      --warn: #d4a017;
+      --bad: #e05a5a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh;
+      font-family: "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #1c2a3a 0%, var(--bg) 55%);
+      color: var(--text);
+    }
+    .wrap { max-width: 520px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 6px; }
+    .sub { color: var(--muted); font-size: .9rem; margin-bottom: 20px; line-height: 1.5; }
+    .card {
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 16px; padding: 16px; margin-bottom: 14px;
+    }
+    label { display: block; font-size: .8rem; color: var(--muted); margin: 10px 0 4px; }
+    input, select, button {
+      width: 100%; border-radius: 10px; border: 1px solid var(--line);
+      background: #121820; color: var(--text); padding: 11px 12px; font-size: 1rem;
+    }
+    button {
+      cursor: pointer; background: var(--accent); border: none; color: #081018;
+      font-weight: 600; margin-top: 12px;
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+    button.danger { background: var(--bad); color: #fff; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    .status {
+      font-size: .85rem; color: var(--muted); min-height: 1.4em;
+      margin-top: 8px; word-break: break-word;
+    }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.bad { color: var(--bad); }
+    .orb {
+      width: 148px; height: 148px; margin: 18px auto;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 30%, #7ec2f0, #2a6ea3 55%, #152433 100%);
+      box-shadow: 0 0 0 0 rgba(91,159,212,.45);
+      transition: transform .2s ease, box-shadow .2s ease;
+    }
+    .orb.listen { animation: pulse 1.6s ease-in-out infinite; }
+    .orb.speak { animation: pulse 1.1s ease-in-out infinite; filter: hue-rotate(40deg); }
+    .orb.think { opacity: .75; }
+    @keyframes pulse {
+      0%,100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(91,159,212,.4); }
+      50% { transform: scale(1.04); box-shadow: 0 0 0 18px rgba(91,159,212,0); }
+    }
+    .caps {
+      max-height: 220px; overflow: auto; font-size: .9rem; line-height: 1.45;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .cap { padding: 8px 10px; border-radius: 10px; background: #121820; border: 1px solid var(--line); }
+    .cap.mine { align-self: flex-end; background: #1e3244; }
+    .cap.peer { align-self: flex-start; }
+    .hidden { display: none !important; }
+    .hint { font-size: .78rem; color: var(--muted); margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>语音通话测试</h1>
+    <p class="sub">流程：进页预热声线 → 麦克风 → 说完自动发送 → <b>mock 流式出句</b>（本轮不调 LLM）→ TTS <b>流式</b>出块 → 首块即播。测延迟与情感起伏。</p>
+
+    <section class="card" id="loginCard">
+      <label>后端地址（留空＝当前站点）</label>
+      <input id="baseUrl" placeholder="https://你的官网域名" />
+      <label>用户名</label>
+      <input id="username" autocomplete="username" value="syl" />
+      <label>密码</label>
+      <input id="password" type="password" autocomplete="current-password" />
+      <button id="loginBtn" type="button">登录并预热</button>
+      <p class="status" id="loginStatus"></p>
+    </section>
+
+    <section class="card hidden" id="callCard">
+      <label>会话（需已固定音色）</label>
+      <select id="convSelect"></select>
+      <p class="hint">先点「开始通话」允许麦克风；通过后「按住说话 / 自动听」才会亮起。</p>
+      <div class="row">
+        <button id="startBtn" type="button">① 开始通话</button>
+        <button id="hangupBtn" class="ghost" type="button" disabled>挂断</button>
+      </div>
+      <div class="orb" id="orb"></div>
+      <p class="status" id="callStatus">未开始</p>
+      <p class="hint" id="timingLine" style="font-family:ui-monospace,monospace;font-size:12px;color:#8ab4f8"></p>
+      <div class="row">
+        <button id="pttBtn" type="button" disabled>② 按住说话</button>
+        <button id="autoBtn" class="ghost" type="button" disabled>自动听</button>
+      </div>
+      <div class="caps" id="caps"></div>
+    </section>
+  </div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const state = {
+    base: '',
+    token: localStorage.getItem('voice_demo_token') || '',
+    userId: '',
+    convId: '',
+    ws: null,
+    turnId: null,
+    inCall: false,
+    busy: false,
+    autoListen: false,
+    media: null,
+    recorder: null,
+    chunks: [],
+    audioCtx: null,
+    playTime: 0,
+    prebufferSec: 0.28,
+    sentenceGapSec: 0.38,
+    lastAudioIndex: 0,
+    startedPlay: false,
+    pcmQueue: [],
+    sampleRate: 24000,
+    autoSilenceMs: 550,
+  };
+
+  function setStatus(el, text, kind='') {
+    el.textContent = text;
+    el.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function detectDefaultBase() {
+    // 公网入口是 https://host:8443/chat-api/... ，origin 不含前缀；
+    // 若不带 /chat-api 会打到 nginx 根路径的 Basic Auth，表现为 401 HTML。
+    const path = location.pathname || '';
+    const m = path.match(/^(.*?\/chat-api)(?=\/|$)/);
+    if (m) return location.origin + m[1];
+    return location.origin;
+  }
+
+  function apiBase() {
+    const v = ($('baseUrl').value || '').trim().replace(/\/$/, '');
+    return v || detectDefaultBase();
+  }
+
+  async function api(path, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {});
+    if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+    if (opts.json) {
+      headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(opts.json);
+      delete opts.json;
+    }
+    const res = await fetch(apiBase() + path, { ...opts, headers });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!res.ok) {
+      const detail = data && (data.detail || data.error) || text || res.status;
+      throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    }
+    return data;
+  }
+
+  function pushCap(mine, text) {
+    if (!text) return;
+    // 同轮重复整句不重复刷泡（模型偶发复读）
+    const last = $('caps').lastElementChild;
+    if (last && last.classList.contains(mine ? 'mine' : 'peer') && last.textContent === text) return;
+    const div = document.createElement('div');
+    div.className = 'cap ' + (mine ? 'mine' : 'peer');
+    div.textContent = text;
+    $('caps').appendChild(div);
+    $('caps').scrollTop = $('caps').scrollHeight;
+  }
+
+  function setOrb(mode) {
+    const orb = $('orb');
+    orb.className = 'orb' + (mode ? ' ' + mode : '');
+  }
+
+  async function ensureAudioCtx() {
+    if (!state.audioCtx) {
+      state.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    }
+    if (state.audioCtx.state === 'suspended') await state.audioCtx.resume();
+    return state.audioCtx;
+  }
+
+  function resetPlayback() {
+    state.playTime = 0;
+    state.startedPlay = false;
+    state.lastAudioIndex = 0;
+    state.pcmQueue = [];
+  }
+
+  function schedulePcm(pcmBytes, sampleRate) {
+    const ctx = state.audioCtx;
+    if (!ctx || !pcmBytes || !pcmBytes.length) return;
+    const samples = pcmBytes.length / 2;
+    const f32 = new Float32Array(samples);
+    const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+    for (let i = 0; i < samples; i++) f32[i] = view.getInt16(i * 2, true) / 32768;
+    const buf = ctx.createBuffer(1, samples, sampleRate || state.sampleRate);
+    buf.copyToChannel(f32, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    const now = ctx.currentTime;
+    if (!state.startedPlay) {
+      state.playTime = now + state.prebufferSec;
+      state.startedPlay = true;
+    }
+    if (state.playTime < now) state.playTime = now;
+    src.start(state.playTime);
+    state.playTime += buf.duration;
+  }
+
+  function feedPcmB64(b64, sampleRate) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    if (sampleRate) state.sampleRate = sampleRate;
+    schedulePcm(bytes, state.sampleRate);
+  }
+
+  function connectWs() {
+    return new Promise((resolve, reject) => {
+      if (state.ws && state.ws.readyState === 1) { resolve(); return; }
+      // 保留 /chat-api 前缀：不可把 pathname 直接设成 /api/v1/ws
+      const base = apiBase().replace(/\/$/, '');
+      const wsUrl = base.replace(/^http/, 'ws') + '/api/v1/ws?token=' + encodeURIComponent(state.token);
+      const ws = new WebSocket(wsUrl);
+      state.ws = ws;
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { ws.close(); } catch (_) {}
+        reject(new Error('WebSocket 连接超时：' + wsUrl.replace(/token=[^&]+/, 'token=***')));
+      }, 8000);
+      ws.onopen = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      ws.onerror = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error('WebSocket 连接失败（检查是否走 /chat-api 前缀）'));
+      };
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        const event = msg.event || '';
+        const payload = msg.payload || {};
+        if (event === 'ready') state.userId = payload.user_id || state.userId;
+        if (event === 'auth_error') {
+          setStatus($('loginStatus'), 'WS 鉴权失败：' + (payload.detail || ''), 'bad');
+        }
+        if (!event.startsWith('voice_')) return;
+        onVoiceEvent(event, payload);
+      };
+    });
+  }
+
+  function onVoiceEvent(event, payload) {
+    const tid = payload.turn_id;
+    if (state.turnId && tid && tid !== state.turnId) return;
+
+    if (event === 'voice_asr') {
+      pushCap(true, payload.text || '');
+      setStatus($('callStatus'), '思考中（mock 流式）…', 'warn');
+      setOrb('think');
+    }
+    if (event === 'voice_sentence') {
+      const emo = payload.emo ? ('[' + payload.emo + '] ') : '';
+      pushCap(false, emo + (payload.text || ''));
+      // streaming=true：不下载整文件，等 voice_audio 块
+    }
+    if (event === 'voice_timing') {
+      const t = payload || {};
+      const parts = [];
+      if (t.mock) parts.push('mockLLM');
+      if (t.asr_ms != null) parts.push('ASR ' + t.asr_ms + 'ms');
+      if (t.mem_ms != null) parts.push('mem ' + t.mem_ms + 'ms' + (t.mem_cache ? '(cache)' : ''));
+      if (t.llm_first_tok_ms != null) parts.push('首token ' + t.llm_first_tok_ms + 'ms');
+      if (t.first_phrase_ms != null) parts.push('首句 ' + t.first_phrase_ms + 'ms');
+      if (t.first_pcm_ms != null) parts.push('首声 ' + t.first_pcm_ms + 'ms');
+      if (t.total_ms != null) parts.push('合计 ' + t.total_ms + 'ms');
+      if (t.sentences != null) parts.push(t.sentences + '句');
+      $('timingLine').textContent = parts.join(' · ');
+    }
+    if (event === 'voice_status') {
+      const phase = payload.phase || '';
+      if (phase === 'speaking') {
+        setStatus($('callStatus'), '对方说话中（音频流）…', 'ok');
+        setOrb('speak');
+      }
+    }
+    if (event === 'voice_audio') {
+      setOrb('speak');
+      setStatus($('callStatus'), '播放中（流式块）…', 'ok');
+      const idx = Number(payload.index) || 0;
+      ensureAudioCtx().then(() => {
+        // 服务端已插静音；若缺 gap 块，换句时再补气口，避免抢话
+        if (idx > 1 && state.lastAudioIndex && idx !== state.lastAudioIndex && !(payload.gap_ms > 0)) {
+          state.playTime += state.sentenceGapSec;
+        }
+        state.lastAudioIndex = idx || state.lastAudioIndex;
+        feedPcmB64(payload.pcm_b64 || '', Number(payload.sample_rate) || 24000);
+      });
+    }
+    if (event === 'voice_done') {
+      state.busy = false;
+      state.turnId = null;
+      const waitMs = Math.max(0, (state.playTime - (state.audioCtx ? state.audioCtx.currentTime : 0)) * 1000) + 200;
+      setTimeout(() => {
+        if (!state.inCall) return;
+        setStatus($('callStatus'), '轮次结束，可继续说', 'ok');
+        setOrb(state.autoListen ? 'listen' : '');
+        if (state.autoListen) startAutoListen();
+      }, waitMs);
+    }
+    if (event === 'voice_error') {
+      state.busy = false;
+      state.turnId = null;
+      setStatus($('callStatus'), '错误：' + (payload.error || '未知'), 'bad');
+      setOrb('');
+      if (state.autoListen && state.inCall) setTimeout(startAutoListen, 800);
+    }
+  }
+
+  async function warmAll() {
+    setStatus($('loginStatus'), '预热 TTS / 声线中（不计入通话响应）…', 'warn');
+    const warmQs = state.convId ? ('?conv_id=' + encodeURIComponent(state.convId)) : '';
+    await api('/api/v1/voice/realtime/warm' + warmQs, { method: 'POST' });
+    // 多轮询 ready，等 CosyVoice warm
+    for (let i = 0; i < 40; i++) {
+      const r = await api('/api/v1/voice/realtime/ready?conv_id=' + encodeURIComponent(state.convId || ''));
+      if (r.auto_silence_ms) state.autoSilenceMs = Number(r.auto_silence_ms) || 550;
+      if (r.ready) return r;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    throw new Error('预热超时');
+  }
+
+  async function loadConvs() {
+    const sync = await api('/api/v1/sync');
+    const personas = {};
+    (sync.personas || []).forEach(p => { personas[p.id] = p.name || p.id; });
+    // 优先有人设的会话；没有则列出全部并提示
+    let convs = (sync.conversations || []).filter(c => c.persona_id);
+    if (!convs.length) {
+      convs = (sync.conversations || []).slice();
+    }
+    // 硬兜底：绘梨衣会话（若 sync 因 hidden 漏掉，仍可选手动 ID）
+    const preferId = 'c_c1860d7d86c353b82483a58e';
+    if (!convs.some(c => c.id === preferId)) {
+      convs.unshift({
+        id: preferId,
+        persona_id: 'p_4dc5c2ee71e552d37c4557b8',
+        preview: '绘梨衣（语音测试）',
+      });
+    }
+    const sel = $('convSelect');
+    sel.innerHTML = '';
+    convs.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.id;
+      const name = personas[c.persona_id] || c.persona_id || '会话';
+      const prev = (c.preview || '').slice(0, 18);
+      opt.textContent = name + (prev ? ' · ' + prev : '');
+      if (c.id === preferId) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    if (!sel.value && convs[0]) sel.value = convs[0].id;
+    state.convId = sel.value;
+    if (!state.convId) {
+      throw new Error('没有可用会话。请先在 App 里给人设开聊并固定音色。');
+    }
+  }
+
+  async function login() {
+    try {
+      setStatus($('loginStatus'), '登录中…');
+      state.base = apiBase();
+      const body = {
+        username: $('username').value.trim(),
+        password: $('password').value,
+        device_name: 'voice-web',
+      };
+      const tok = await api('/api/v1/auth/login', { method: 'POST', json: body });
+      state.token = tok.access_token;
+      localStorage.setItem('voice_demo_token', state.token);
+      await connectWs();
+      await loadConvs();
+      state.convId = $('convSelect').value;
+      await warmAll();
+      $('loginCard').classList.add('hidden');
+      $('callCard').classList.remove('hidden');
+      setStatus($('callStatus'), '已预热，可开始通话', 'ok');
+      setStatus($('loginStatus'), 'OK', 'ok');
+    } catch (e) {
+      setStatus($('loginStatus'), String(e.message || e), 'bad');
+    }
+  }
+
+  async function startCall() {
+    state.convId = $('convSelect').value;
+    if (!state.convId) {
+      setStatus($('callStatus'), '请先选择会话', 'bad');
+      return;
+    }
+    try {
+      setStatus($('callStatus'), '请求麦克风权限…', 'warn');
+      await ensureAudioCtx();
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('当前浏览器不支持麦克风，请用 Chrome/Safari');
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+        video: false,
+      });
+      state.media = stream;
+      state.inCall = true;
+      resetPlayback();
+      $('startBtn').disabled = true;
+      $('hangupBtn').disabled = false;
+      $('pttBtn').disabled = false;
+      $('autoBtn').disabled = false;
+      await api('/api/v1/voice/realtime/warm?conv_id=' + encodeURIComponent(state.convId), { method: 'POST' });
+      const ready = await api('/api/v1/voice/realtime/ready?conv_id=' + encodeURIComponent(state.convId));
+      if (ready.need_fixed_voice) throw new Error('请先给人设固定音色');
+      setStatus($('callStatus'), '通话中 · 请按住「② 按住说话」', 'ok');
+      setOrb('listen');
+    } catch (e) {
+      state.inCall = false;
+      if (state.media) {
+        state.media.getTracks().forEach(t => t.stop());
+        state.media = null;
+      }
+      $('startBtn').disabled = false;
+      $('hangupBtn').disabled = true;
+      $('pttBtn').disabled = true;
+      $('autoBtn').disabled = true;
+      const msg = String(e.message || e);
+      const tip = /NotAllowed|Permission|权限/i.test(msg)
+        ? '浏览器拒绝了麦克风，请在地址栏允许麦克风后重试'
+        : msg;
+      setStatus($('callStatus'), '无法开始：' + tip, 'bad');
+      setOrb('');
+    }
+  }
+
+  async function hangup() {
+    state.inCall = false;
+    state.autoListen = false;
+    state.busy = false;
+    stopRecorder(true);
+    if (state.media) state.media.getTracks().forEach(t => t.stop());
+    state.media = null;
+    resetPlayback();
+    try {
+      await api('/api/v1/voice/realtime/hangup', { method: 'POST', json: { conv_id: state.convId } });
+    } catch (_) {}
+    $('startBtn').disabled = false;
+    $('hangupBtn').disabled = true;
+    $('pttBtn').disabled = true;
+    $('autoBtn').disabled = true;
+    setOrb('');
+    setStatus($('callStatus'), '已挂断', '');
+  }
+
+  function stopRecorder(cancel) {
+    const rec = state.recorder;
+    state.recorder = null;
+    if (!rec) return;
+    try {
+      if (rec.state !== 'inactive') rec.stop();
+    } catch (_) {}
+    if (cancel) state.chunks = [];
+  }
+
+  function startRecorder() {
+    return new Promise((resolve, reject) => {
+      if (!state.media) { reject(new Error('无麦克风')); return; }
+      state.chunks = [];
+      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      const rec = new MediaRecorder(state.media, { mimeType: mime });
+      state.recorder = rec;
+      rec.ondataavailable = (e) => { if (e.data && e.data.size) state.chunks.push(e.data); };
+      rec.onerror = (e) => reject(e.error || new Error('录音失败'));
+      rec.onstop = () => resolve();
+      rec.start(100);
+    });
+  }
+
+  async function sendUtterance() {
+    if (state.busy || !state.inCall) return;
+    stopRecorder(false);
+    await new Promise(r => setTimeout(r, 30));
+    const blob = new Blob(state.chunks, { type: state.chunks[0]?.type || 'audio/webm' });
+    state.chunks = [];
+    if (blob.size < 800) {
+      setStatus($('callStatus'), '声音太短，再说一次', 'warn');
+      if (state.autoListen) startAutoListen();
+      return;
+    }
+    state.busy = true;
+    resetPlayback();
+    await ensureAudioCtx();
+    setStatus($('callStatus'), '上传并识别…', 'warn');
+    setOrb('think');
+    const fd = new FormData();
+    fd.append('conv_id', state.convId);
+    fd.append('file', blob, 'voice.webm');
+    const res = await fetch(apiBase() + '/api/v1/voice/realtime/turn', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + state.token },
+      body: fd,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      state.busy = false;
+      setStatus($('callStatus'), '发送失败：' + (data.detail || res.status), 'bad');
+      setOrb('');
+      return;
+    }
+    state.turnId = data.turn_id;
+    setStatus($('callStatus'), '等待流式回复…', 'warn');
+  }
+
+  // —— 按住说话 ——
+  const ptt = $('pttBtn');
+  let pttDown = false;
+  async function pttStart(e) {
+    e.preventDefault();
+    if (!state.inCall || state.busy || pttDown) return;
+    pttDown = true;
+    state.autoListen = false;
+    setOrb('listen');
+    setStatus($('callStatus'), '正在听你说…', 'ok');
+    try { await startRecorder(); } catch (err) {
+      pttDown = false;
+      setStatus($('callStatus'), String(err.message || err), 'bad');
+    }
+  }
+  async function pttEnd(e) {
+    e.preventDefault();
+    if (!pttDown) return;
+    pttDown = false;
+    await sendUtterance();
+  }
+  ptt.addEventListener('mousedown', pttStart);
+  ptt.addEventListener('mouseup', pttEnd);
+  ptt.addEventListener('mouseleave', (e) => { if (pttDown) pttEnd(e); });
+  ptt.addEventListener('touchstart', pttStart, { passive: false });
+  ptt.addEventListener('touchend', pttEnd);
+
+  // —— 简易自动 VAD ——
+  let vadTimer = null;
+  let speechStarted = false;
+  let silenceMs = 0;
+  let analyser = null;
+  let vadRAF = 0;
+
+  async function startAutoListen() {
+    if (!state.inCall || state.busy) return;
+    state.autoListen = true;
+    speechStarted = false;
+    silenceMs = 0;
+    setOrb('listen');
+    setStatus($('callStatus'), '自动听 · 请说话', 'ok');
+    await startRecorder();
+    const ctx = await ensureAudioCtx();
+    const src = ctx.createMediaStreamSource(state.media);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+    const loop = (t) => {
+      if (!state.autoListen || state.busy || !state.recorder) return;
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      if (rms > 0.04) {
+        speechStarted = true;
+        silenceMs = 0;
+      } else if (speechStarted) {
+        silenceMs += 50;
+        if (silenceMs >= (state.autoSilenceMs || 550)) {
+          state.autoListen = false;
+          cancelAnimationFrame(vadRAF);
+          sendUtterance();
+          return;
+        }
+      }
+      vadRAF = requestAnimationFrame(() => setTimeout(() => loop(), 50));
+    };
+    loop();
+  }
+
+  $('autoBtn').onclick = () => {
+    if (!state.inCall || state.busy) return;
+    startAutoListen();
+  };
+
+  $('loginBtn').onclick = login;
+  $('startBtn').onclick = startCall;
+  $('hangupBtn').onclick = hangup;
+  $('convSelect').onchange = () => { state.convId = $('convSelect').value; };
+
+  // 预填后端地址（含 /chat-api 前缀）
+  $('baseUrl').value = detectDefaultBase();
+  $('baseUrl').placeholder = detectDefaultBase();
+
+  // 已有 token 时尝试恢复
+  if (state.token) {
+    $('loginStatus').textContent = '检测到已保存登录，可直接点登录并预热';
+  }
+})();
+</script>
+</body>
+</html>

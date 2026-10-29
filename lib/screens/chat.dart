@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../api/api_client.dart';
 import '../format.dart';
@@ -32,6 +33,30 @@ void _toastIfNeeded(BuildContext context, Object e, {String prefix = ''}) {
   if (!shouldToastApiError(e)) return;
   final msg = prefix.isEmpty ? '$e' : '$prefix$e';
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+}
+
+/// 通话前麦克风权限门闩：拒绝则弹窗引导设置，不进入通话页。
+Future<bool> _ensureMicForCall(BuildContext context) async {
+  var st = await Permission.microphone.status;
+  if (st.isGranted) return true;
+  st = await Permission.microphone.request();
+  if (st.isGranted) return true;
+  if (!context.mounted) return false;
+  final go = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('需要麦克风权限'),
+      content: const Text('语音/视频通话需要使用麦克风。请在系统设置中开启权限后再试。'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+        TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('去设置')),
+      ],
+    ),
+  );
+  if (go == true) {
+    await openAppSettings();
+  }
+  return false;
 }
 
 class ChatPage extends StatefulWidget {
@@ -408,6 +433,9 @@ class _ChatPageState extends State<ChatPage> {
             }
             return;
           }
+          // 先检查麦克风权限，没权限直接阻断
+          final micOk = await _ensureMicForCall(context);
+          if (!micOk || !mounted) return;
           var hasFixed = false;
           try {
             final ready = await api.voiceRealtimeReady(convId: conv.id);
@@ -474,6 +502,8 @@ class _ChatPageState extends State<ChatPage> {
           setState(() => moreOpen = false);
           final api = store.api;
           if (api == null) return;
+          final micOk = await _ensureMicForCall(context);
+          if (!micOk || !mounted) return;
           try {
             final r = await api.createCall(convId: conv.id, media: 'video');
             if (!mounted) return;
@@ -2077,9 +2107,10 @@ class _Bubble extends StatelessWidget {
     );
 
     // 图/视频/链接（含听歌）是独立卡片，不要套绿/白聊天气泡
-    final standaloneCard = msg.kind == MsgKind.image ||
-        msg.kind == MsgKind.video ||
-        msg.kind == MsgKind.link;
+    // 语音通话气泡走微信绿/白条，不当独立卡片
+    final isVoiceCallMsg = msg.kind == MsgKind.link && msg.meta?['card']?.toString() == 'voice_call';
+    final standaloneCard = !isVoiceCallMsg &&
+        (msg.kind == MsgKind.image || msg.kind == MsgKind.video || msg.kind == MsgKind.link);
 
     Widget body;
     EdgeInsets pad = const EdgeInsets.symmetric(horizontal: 12, vertical: 9);
@@ -2101,7 +2132,9 @@ class _Bubble extends StatelessWidget {
         );
       case MsgKind.link:
         body = _LinkCardBody(msg: msg, store: store, conv: conv);
-        pad = EdgeInsets.zero;
+        pad = isVoiceCallMsg
+            ? const EdgeInsets.symmetric(horizontal: 12, vertical: 10)
+            : EdgeInsets.zero;
       case MsgKind.video:
         final meta = msg.meta ?? const <String, dynamic>{};
         final dur = msg.seconds > 0 ? msg.seconds : (meta['duration'] is num ? (meta['duration'] as num).round() : 0);
@@ -2530,11 +2563,42 @@ class _LinkCardBody extends StatelessWidget {
     final pct = meta['progress'];
     final status = meta['status']?.toString() ?? '';
     final isListen = meta['card']?.toString() == 'listen_invite';
+    final isVoiceCall = meta['card']?.toString() == 'voice_call';
     final isPack = meta['card']?.toString() == 'sticker_pack_added';
     final isDeviceReq = meta['card']?.toString() == 'device_create_request';
     final isLoc = meta['card']?.toString() == 'location';
     final isFwd = meta['card']?.toString() == 'forward';
     final isOg = meta['card']?.toString() == 'og' || (meta['url'] != null && meta['job_id'] == null && status.isEmpty);
+
+    if (isVoiceCall) {
+      // 微信样式：气泡内电话图标 + 文案（通话时长 / 语音通话 / 已取消）
+      final st = meta['status']?.toString() ?? '';
+      final dur = meta['duration_sec'];
+      final durSec = dur is num ? dur.toInt() : int.tryParse('$dur') ?? msg.seconds;
+      String label;
+      if (st == 'canceled') {
+        label = '已取消';
+      } else if (st == 'ended' && durSec > 0) {
+        final m = durSec ~/ 60;
+        final s = durSec % 60;
+        label = '通话时长 ${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+      } else if ((meta['body']?.toString() ?? '').trim().isNotEmpty) {
+        label = meta['body'].toString().trim();
+      } else if (msg.text.trim().isNotEmpty) {
+        label = msg.text.trim();
+      } else {
+        label = '语音通话';
+      }
+      final fg = msg.mine ? const Color(0xFF111111) : const Color(0xFF111111);
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.phone, size: 20, color: fg),
+          const SizedBox(width: 6),
+          Text(label, style: TextStyle(color: fg, fontSize: 16, height: 1.2)),
+        ],
+      );
+    }
     final title = meta['title']?.toString() ?? msg.text;
     final url = meta['url']?.toString() ?? '';
     final desc = meta['description']?.toString() ?? '';

@@ -200,6 +200,17 @@ def create_app() -> FastAPI:
 
         app.mount("/web", StaticFiles(directory=str(WEB_LEGACY), html=True), name="web")
 
+    # 语音通话网页测试（半双工：LLM 流式分句 → TTS 流式出块 → 浏览器播）
+    voice_call_page = WEB_LEGACY / "voice-call.html"
+    if voice_call_page.is_file():
+        @app.get("/voice-call")
+        def voice_call() -> FileResponse:
+            return FileResponse(voice_call_page)
+
+    # dist 模式下也挂 /web，方便 /web/voice-call.html（legacy 分支已挂过则跳过）
+    if dist_index.is_file() and WEB_LEGACY.is_dir():
+        app.mount("/web", StaticFiles(directory=str(WEB_LEGACY), html=True), name="web")
+
     return app
 
 

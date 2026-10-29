@@ -30,7 +30,16 @@ def conversation_preview(*, kind: str, text: str, seconds: int = 0) -> str:
                     return f"[唱歌] {sec}\"" if sec > 0 else "[唱歌]"
                 return f"[语音] {sec}\"" if sec > 0 else "[语音]"
             if kind == "link":
-                title = (data.get("title") or cap or "").strip()
+                if str(data.get("card") or "") == "voice_call":
+                    body = (data.get("body") or "").strip()
+                    if body:
+                        return body[:200]
+                    dur = int(data.get("duration_sec") or seconds or 0)
+                    if dur > 0:
+                        m, s = divmod(dur, 60)
+                        return f"通话时长 {m:02d}:{s:02d}"
+                    return "语音通话"
+                title = (data.get("title") or cap or data.get("body") or "").strip()
                 return (title or "[链接]")[:200]
     if kind == "voice":
         return f"[语音] {seconds}\"" if seconds > 0 else "[语音]"

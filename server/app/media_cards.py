@@ -289,6 +289,74 @@ def fixed_voice_prompt(*, user_id: str, persona_id: str) -> Optional[str]:
     return p or None
 
 
+def fixed_voice_wav_path(*, user_id: str, persona_id: str) -> Optional[str]:
+    """固定音色的试听 wav 路径（供 CosyVoice prompt_wav 克隆声线）。"""
+    from pathlib import Path
+
+    row = db.fetchone(
+        """
+        SELECT path FROM voice_profiles
+        WHERE user_id = ? AND persona_id = ?
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (user_id, persona_id),
+    )
+    if row and (row["path"] or "").strip():
+        p = Path(str(row["path"]))
+        if p.is_file():
+            return str(p.resolve())
+    row2 = db.fetchone(
+        """
+        SELECT path, file_id, meta_json FROM persona_assets
+        WHERE user_id = ? AND persona_id = ? AND kind = 'voice' AND fixed = 1
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (user_id, persona_id),
+    )
+    if row2 is None:
+        return None
+    path = (row2["path"] or "").strip()
+    if path and Path(path).is_file():
+        return str(Path(path).resolve())
+    fid = (row2["file_id"] or "").strip()
+    if not fid:
+        return None
+    mf = db.fetchone(
+        "SELECT path FROM media_files WHERE id = ? AND user_id = ?",
+        (fid, user_id),
+    )
+    if mf and (mf["path"] or "").strip() and Path(mf["path"]).is_file():
+        return str(Path(mf["path"]).resolve())
+    return None
+
+
+def fixed_voice_style_hint(*, user_id: str, persona_id: str) -> str:
+    """CosyVoice 短风格：抽卡变体描述（不塞长提示词，避免被念出来）。"""
+    import json
+
+    row = db.fetchone(
+        """
+        SELECT meta_json FROM persona_assets
+        WHERE user_id = ? AND persona_id = ? AND kind = 'voice' AND fixed = 1
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (user_id, persona_id),
+    )
+    if not row:
+        return ""
+    try:
+        meta = json.loads(row["meta_json"] or "{}")
+    except Exception:
+        meta = {}
+    extra = (meta.get("variant_extra") or meta.get("variant_desc") or "").strip()
+    label = (meta.get("variant") or "").strip()
+    if extra:
+        return extra.rstrip("。") + "。"
+    if label:
+        return f"{label}风格。"
+    return ""
+
+
 _AFFECT_TONE = {
     "joy": "愉悦偏高：语气轻快、略带笑意，句尾可微微上扬",
     "sadness": "低落偏高：语速稍慢、声音偏软沉，别过分卖惨",
@@ -297,6 +365,91 @@ _AFFECT_TONE = {
     "annoyance": "不悦偏高：略硬、短促，傲娇或嫌弃感，别吼",
     "curiosity": "好奇偏高：上扬问询感、带一点探究，别播音",
 }
+
+# 逐句情绪标签 → CosyVoice 短 instruct（字幕/TTS 正文会剥掉标签）
+_EMO_TAG_INSTRUCT = {
+    "轻快": "语气轻快、略带笑意，句尾微微上扬。",
+    "愉悦": "语气轻快、略带笑意，句尾微微上扬。",
+    "低落": "语速稍慢、声音偏软沉，别过分卖惨。",
+    "难过": "语速稍慢、声音偏软沉，别过分卖惨。",
+    "兴奋": "节奏更活一点、气息更利落，别喊。",
+    "好奇": "上扬问询感、带一点探究，别播音。",
+    "害羞": "句尾变软、气声稍多，像靠近耳边。",
+    "无奈": "略硬、短促，傲娇或嫌弃感，别吼。",
+    "不悦": "略硬、短促，傲娇或嫌弃感，别吼。",
+    "担忧": "语气小心、放轻，带一点迟疑但不结巴。",
+    "平静": "平稳自然，像微信语音，不要播音腔。",
+}
+
+# CosyVoice3 允许透传的细粒度标记（其余方括号一律剥掉，防被念出）
+_COS_Y_MARK_ALLOW = ("breath", "laughter", "cough", "clucking", "accent", "quick_breath")
+
+_EMO_TAG_RE = re.compile(r"^\[([^\]]{1,12})\]\s*")
+_BRACKET_RE = re.compile(r"\[([^\]]{1,24})\]")
+
+
+def parse_emotion_tag(sentence: str) -> tuple[str, str]:
+    """剥离句首情绪标签。返回 (tag_or_empty, clean_text)。"""
+    raw = (sentence or "").strip()
+    if not raw:
+        return "", ""
+    m = _EMO_TAG_RE.match(raw)
+    if not m:
+        return "", raw
+    tag = (m.group(1) or "").strip()
+    rest = raw[m.end() :].strip()
+    return tag, rest or raw
+
+
+def filter_cosy_marks(text: str) -> str:
+    """只保留白名单标记，其它 [xxx] 全部去掉，避免念出系统词。"""
+    raw = text or ""
+
+    def _keep(m: re.Match) -> str:
+        inner = (m.group(1) or "").strip().lower().replace(" ", "_")
+        if inner in _COS_Y_MARK_ALLOW or inner in {x.replace("_", "") for x in _COS_Y_MARK_ALLOW}:
+            return m.group(0)
+        # 中文情绪标签已在句首剥过；正文里残留的也删
+        return ""
+
+    return _BRACKET_RE.sub(_keep, raw).strip()
+
+
+def emotion_tag_to_instruct(tag: str, affect: Optional[dict] = None) -> str:
+    """标签优先；affect 作基线/幅度微调。"""
+    t = (tag or "").strip()
+    base = _EMO_TAG_INSTRUCT.get(t, "")
+    if not base:
+        return speak_emotion_line(affect)
+    # affect 偏低落时，「轻快/兴奋」收一点
+    if isinstance(affect, dict) and t in ("轻快", "愉悦", "兴奋"):
+        try:
+            sad = float(affect.get("sadness", 35) or 35)
+        except Exception:
+            sad = 35.0
+        if sad >= 55:
+            return "语气偏克制的轻快，笑意淡一点，别太蹦。"
+    return base
+
+
+def build_sentence_instruct(
+    *,
+    engine: str,
+    style_hint: str = "",
+    emo_tag: str = "",
+    affect: Optional[dict] = None,
+) -> str:
+    """逐句 instruct：固定风格短句 + 本句情绪。"""
+    eng = (engine or "").strip().lower()
+    emo = emotion_tag_to_instruct(emo_tag, affect) if emo_tag else speak_emotion_line(affect)
+    hint = (style_hint or "").strip()
+    if eng == "cosyvoice":
+        if hint and emo:
+            return f"{hint}{emo}"
+        return hint or emo
+    if hint and emo:
+        return f"{hint}{emo}"
+    return emo or hint
 
 
 def speak_emotion_line(affect: Optional[dict] = None) -> str:
@@ -323,12 +476,35 @@ def speak_emotion_line(affect: Optional[dict] = None) -> str:
 
 
 def speak_instructions(base_prompt: str, affect: Optional[dict] = None) -> str:
-    """固定音色文案 + 情绪语气 → Breeze instruction（说话确定路线）。提示词优先。"""
+    """固定音色文案 + 情绪语气 → Breeze / VoiceDesign instruction（说话确定路线）。提示词优先。"""
     base = (base_prompt or "").strip()
     emo = speak_emotion_line(affect)
     if not base:
         return emo
     return f"【必须严格遵从的音色提示词】{base}。{emo} 读完整句，不要吞字、不要只念半句。"
+
+
+def speak_instructions_for_engine(
+    base_prompt: str,
+    affect: Optional[dict] = None,
+    *,
+    engine: str = "",
+    style_hint: str = "",
+) -> str:
+    """按 TTS 引擎选择 instruction。
+
+    CosyVoice instruct2：音色来自 prompt wav，instruction 只能是短风格句；
+    若塞入「必须严格遵从的音色提示词」长文案，会被模型朗读出来（循环念提示词）。
+    Breeze / VoiceDesign 仍用完整抽卡文案。
+    """
+    eng = (engine or "").strip().lower()
+    if eng == "cosyvoice":
+        hint = (style_hint or "").strip()
+        emo = speak_emotion_line(affect)
+        if hint:
+            return f"{hint}{emo}"
+        return emo
+    return speak_instructions(base_prompt, affect)
 
 
 def recent_persona_voice_secs(
