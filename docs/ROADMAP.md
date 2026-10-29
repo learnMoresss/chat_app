@@ -1,11 +1,12 @@
 # ROADMAP（以代码为准）
 
-更新：2026-10-27。只保留 **已实现 / 待做 / 边界**。  
+更新：2026-10-28。只保留 **已实现 / 待做 / 边界**。  
 聊天怎么跑（人设、情绪、记忆、媒体暗号）→ [`CHAT_LOGIC.md`](./CHAT_LOGIC.md)  
+陪伴世界线改造（事件/记忆底座/意图/上下文；含与现状偏差纠正）→ [`COMPANION_WORLDLINE.md`](./COMPANION_WORLDLINE.md)  
 运维（公网、备份切流）→ [`OPS.md`](./OPS.md)  
 用量看板 → [`USAGE_METRICS.md`](./USAGE_METRICS.md)
 
-做完一件：在「待做」勾掉，必要时挪进「已实现」一行；**不要再开平行规划文档**。
+做完一件：在「待做」勾掉，必要时挪进「已实现」一行；**详细方案只维护 COMPANION_WORLDLINE，不在此复制长文**。
 
 ---
 
@@ -29,7 +30,7 @@
 - [x] 思考环走 `dsh_gateway`（闲聊 / 记忆抽取 / 调度文案）
 - [x] 表情包表 + API；角色 `⟦表情⟧` + 情绪启发式；用户图不进人民设库；约 90s 冷却
 - [x] schema **v30**：`sticker_packs`（global/account）+ `pack_id`；多图 collect；`suggest`；加入气泡
-- [x] 入站识图：本机 OCR（Paddle/RapidOCR + 坐标），停用 llama-swap VL
+- [x] 入站识图：百度 Unlimited-OCR 优先（本机 Paddle/Rapid 回落）；文档先抽正文再 OCR
 - [x] `⟦图⟧` → Z-Image / Qwen，失败氛围卡
 - [x] 入站语音 ASR（`asr_gen`：transcriptions URL 或本机 whisper）进模型上下文
 - [x] 出站混合语音：固定音色时 `⟦语音⟧` → **Breeze**（+情绪语气）；冷却 / 字数闸（路线见 `VOICE_SING.md`）
@@ -92,13 +93,26 @@
 - [x] 唱歌：命中曲库源曲时默认 `with_backing`
 - [x] 一起听：曲目可带 `lyrics` 字段（schema v25）
 
-### P2 记忆与运维
+### P2 记忆 / 世界线 / 运维
 
 - [x] 记忆分类型 / 来源纠正删除 / FTS 检索 / 纠错抑制屏障（schema v20）
+- [x] 检索默认 `rrf_gated`（空召回热记忆门控）；抽取 v2+启发式（机制压测后）
 - [x] sqlite-vec 可选（`scripts/memory_nightly.py --vec`；未装库则跳过）
 - [x] 暂停记忆读写（`companion_policy`）+ 看板操作
 - [x] 课程记忆体检 / 夜间流水线（`scripts/memory_nightly.py`）
 - [x] 备份回滚演练脚本（`scripts/backup_drill.sh [--restore-dry]`）
+- [x] 管理台「世界线」Tab：Neural Field 白主题**前端模拟**（未接后端状态）
+- [x] 世界线阶段 0 基线：见 [`reports/worldline-phase0-baseline.md`](./reports/worldline-phase0-baseline.md)（单进程；插件双重注入关；忙只改措辞）
+- [x] 世界线阶段 1：raw_records、显式记忆前置、抽取 background_jobs、FTS bigram、去 500 扫、ContextCompiler
+- [x] 世界线阶段 2：companion_events、action_intents、worldline_enabled、Runtime/DshAdapter
+- [x] 世界线阶段 3：WorldlineService（日计划/模拟天气/扰动）+ 忙时措辞注入（不拖延）
+- [x] 世界线阶段 4：ActionDispatcher；退役 moment_daily；发帖不升格记忆
+- [x] 世界线阶段 5：语义通道开关位、可选真实天气、看板 worldline/intents、成长证据修订、默认关 memories 双写
+- [x] 世界线 Tab 监控看板：接 board/worldline/turn-trace，只读展示主路径过程（不从此页发消息）
+- [ ] 陪伴世界线长跑与生产 DSH 记忆评测（运维侧）
+  - 世界线按人设可开关（默认开）；关闭 = 仅对话驱动
+  - 观察模式：`WORLDLINE_ACTIONS=0`；打开行动默认 `1`
+  - 真实天气：`WORLD_WEATHER_REAL=1`；语义：`MEMORY_SEMANTIC=1`（需 sqlite-vec）
 - [ ] FastAPI→TS 产品包迁移（按模块搬；**写入归属仍在产品库**；**不恢复双主脑**）— 仍属长期项
 
 ### P3 设备与观测（仍缺）
@@ -121,8 +135,9 @@
 - [x] 位置按需「⟦附近⟧」；额度满时聊天侧可走 DSH 联网总结（不刷地图配额）
 - [x] 消息长按：微信式深色图标气泡（贴气泡定位），去掉底部白面板 / 模拟失败项
 - [x] 一起听：去重 + 曲库选歌弹层；链接入口已去掉（防崩溃）
-- [x] 实时语音对话页 UI（`realtime_voice.dart`）：球体动画、假字幕开关、静音/外放(AEC 态)/挂断；**未接麦 / ASR / TTS / WebRTC**
-- [ ] 实时语音：原生 Voice Processing AEC + 本地实时 ASR/TTS 接线
+- [x] 实时语音对话页 UI（`realtime_voice.dart`）：球体动画、字幕开关、静音/外放/挂断
+- [x] 实时语音半双工接线：ASR→DSH 分句→逐句 Breeze→WS 播放队列；启动预热 +「连接中」门闩
+- [ ] 实时语音：更强原生 Voice Processing AEC；流式 ASR
 - [ ] 语音/视频通话：WebRTC 媒体通道（信令骨架已有）
 
 ### 后续可做（见 `CHAT_FUTURE.md`）

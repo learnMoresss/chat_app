@@ -1,4 +1,4 @@
-"""入站图片/视频描述：优先本机 PaddleOCR（文字+坐标），无字再启发式。不用 VL。"""
+"""入站图片/视频描述：优先本机 Unlimited-OCR，回落 Paddle/Rapid；无字再启发式。"""
 from __future__ import annotations
 
 import base64
@@ -25,11 +25,13 @@ def describe_image_path(path: str | Path, *, hint: str = "") -> Optional[str]:
 
 
 def ocr_image_path(path: str | Path, *, hint: str = "") -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """OCR：返回 (摘要文本, lines[{text, box, score}])。"""
+    """OCR：返回 (摘要文本, lines[{text, box, score}])。优先 Unlimited。"""
     p = Path(path)
     if not p.is_file() or p.stat().st_size < 32:
         return None, []
-    lines = _ocr_via_paddle(p)
+    lines = _ocr_via_unlimited(p)
+    if not lines:
+        lines = _ocr_via_paddle(p)
     if lines:
         texts = [str(x.get("text") or "").strip() for x in lines if (x.get("text") or "").strip()]
         joined = "；".join(texts[:24])
@@ -46,6 +48,18 @@ def ocr_image_path(path: str | Path, *, hint: str = "") -> Tuple[Optional[str], 
         return f"图中无明显文字，对方说：{hint[:100]}", []
     h = _heuristic(p, hint=hint)
     return (h or "图中无明显文字"), []
+
+
+def _ocr_via_unlimited(path: Path) -> List[Dict[str, Any]]:
+    try:
+        from . import unlimited_ocr
+
+        if not unlimited_ocr.configured():
+            return []
+        return unlimited_ocr.ocr_image_lines(path)
+    except Exception as exc:
+        log.warning("unlimited image ocr failed: %s", exc)
+        return []
 
 
 def describe_video_path(path: str | Path, *, hint: str = "") -> Optional[str]:

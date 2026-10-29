@@ -1,6 +1,6 @@
 import { App, Button, Card, Col, Form, Input, Modal, Popconfirm, Row, Select, Space, Spin, Switch, Table, Tabs, Typography, Upload } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import AuthMediaThumb from '../components/AuthMediaThumb'
@@ -9,6 +9,7 @@ import MemoriesPage from './MemoriesPage'
 import CompanionBoardPage from './CompanionBoardPage'
 import SchedulesPage from './SchedulesPage'
 import ExtractPage from './ExtractPage'
+import WorldlineMockPage from './WorldlineMockPage'
 
 type Eraser = {
   id: string
@@ -22,7 +23,7 @@ const COLORS = [
   0xff2f6bff, 0xffe6a23c, 0xff9b59b6, 0xff16a085, 0xffe67e22, 0xffe74c3c, 0xff34495e, 0xff07c160,
 ]
 
-const TAB_KEYS = ['profile', 'memory', 'companion', 'schedules', 'extract'] as const
+const TAB_KEYS = ['profile', 'memory', 'companion', 'schedules', 'extract', 'worldline'] as const
 type TabKey = (typeof TAB_KEYS)[number]
 
 function colorHex(n: number) {
@@ -41,9 +42,15 @@ export default function PersonasPage() {
   const [erasers, setErasers] = useState<Eraser[]>([])
   const [eraserForm] = Form.useForm()
   const [avatarId, setAvatarId] = useState('')
+  const detailRef = useRef<HTMLDivElement>(null)
 
   const tabParam = (params.get('tab') || 'profile') as TabKey
   const tab: TabKey = TAB_KEYS.includes(tabParam) ? tabParam : 'profile'
+
+  const scrollDetailToTop = useCallback(() => {
+    const root = detailRef.current
+    if (root) root.scrollTop = 0
+  }, [])
 
   const current = useMemo(
     () => personas.find((p) => p.id === pid) || personas[0],
@@ -78,18 +85,27 @@ export default function PersonasPage() {
       channel_id: current.channel_id || undefined,
       greet: !!current.greet,
       moments_on: !!current.moments_on,
+      worldline_enabled: current.worldline_enabled !== false,
       color: current.color || COLORS[0],
     })
     setAvatarId(current.avatar_file_id || '')
     void loadErasers(current.id)
   }, [current, form, loadErasers])
 
-  const selectPersona = (id: string) => {
+  const selectPersona = (id: string, opts?: { scrollTop?: boolean }) => {
     setPid(id)
     const next = new URLSearchParams(params)
     next.set('persona', id)
     setParams(next, { replace: true })
+    if (opts?.scrollTop !== false) {
+      // 等右侧表单切完再滚，避免仍停在橡皮擦底部
+      requestAnimationFrame(() => scrollDetailToTop())
+    }
   }
+
+  useEffect(() => {
+    scrollDetailToTop()
+  }, [pid, scrollDetailToTop])
 
   const setTab = (key: string) => {
     const next = new URLSearchParams(params)
@@ -103,7 +119,7 @@ export default function PersonasPage() {
   const profilePane = !current ? (
     <Card>还没有角色，请先新建。</Card>
   ) : (
-    <Card title={`资料 · ${current.name}`} styles={{ body: { maxWidth: 720 } }}>
+    <Card title={`资料 · ${current.name}`} styles={{ body: { width: '100%' } }}>
       <Form
         form={form}
         layout="vertical"
@@ -118,6 +134,7 @@ export default function PersonasPage() {
                 channel_id: v.channel_id || '',
                 greet: !!v.greet,
                 moments_on: !!v.moments_on,
+                worldline_enabled: v.worldline_enabled !== false,
                 color: v.color,
                 avatar_file_id: avatarId,
               }),
@@ -220,18 +237,62 @@ export default function PersonasPage() {
             }))}
           />
         </Form.Item>
-        <Space size={24} style={{ marginBottom: 16 }}>
+        <Space size={24} style={{ marginBottom: 16 }} wrap>
           <Form.Item name="greet" label="自己问候" valuePropName="checked" style={{ marginBottom: 0 }}>
             <Switch />
           </Form.Item>
           <Form.Item name="moments_on" label="朋友圈" valuePropName="checked" style={{ marginBottom: 0 }}>
             <Switch />
           </Form.Item>
+          <Form.Item
+            name="worldline_enabled"
+            label="世界线"
+            valuePropName="checked"
+            style={{ marginBottom: 0 }}
+            tooltip="关闭后仅对话驱动，无天气/日程/扰动"
+          >
+            <Switch />
+          </Form.Item>
         </Space>
         <Form.Item>
-          <Button type="primary" htmlType="submit">
-            保存资料
-          </Button>
+          <Space wrap>
+            <Button type="primary" htmlType="submit">
+              保存资料
+            </Button>
+            <Popconfirm
+              title={`删除角色「${current.name}」？`}
+              description="将删除人设、聊天记录与记忆，不可恢复。"
+              okText="删除"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+              onConfirm={async () => {
+                const deleted = current
+                const snapshot = personas
+                const rest = snapshot.filter((p) => p.id !== deleted.id)
+                // 乐观更新：先从列表拿掉，不整页 loading
+                setPersonas(rest)
+                const nextId = rest[0]?.id
+                if (nextId) {
+                  selectPersona(nextId)
+                } else {
+                  setPid(undefined)
+                  const next = new URLSearchParams(params)
+                  next.delete('persona')
+                  setParams(next, { replace: true })
+                }
+                try {
+                  await api(`/api/v1/personas/${deleted.id}`, { method: 'DELETE' })
+                  message.success('已删除')
+                } catch (e) {
+                  setPersonas(snapshot)
+                  selectPersona(deleted.id)
+                  message.error(e instanceof Error ? e.message : String(e))
+                }
+              }}
+            >
+              <Button danger>删除此角色</Button>
+            </Popconfirm>
+          </Space>
         </Form.Item>
       </Form>
 
@@ -348,8 +409,29 @@ export default function PersonasPage() {
   )
 
   return (
-    <Row gutter={[16, 16]} style={{ alignItems: 'stretch' }}>
-      <Col xs={24} md={7} xl={6}>
+    <div
+      className="personas-split"
+      style={{
+        flex: 1,
+        minHeight: 0,
+        height: '100%',
+        display: 'flex',
+        gap: 16,
+        overflow: 'hidden',
+        alignItems: 'stretch',
+      }}
+    >
+      <div
+        style={{
+          width: 'min(300px, 28%)',
+          flex: '0 0 auto',
+          minWidth: 220,
+          maxWidth: 320,
+          minHeight: 0,
+          overflow: 'auto',
+          alignSelf: 'stretch',
+        }}
+      >
         <Card
           title="角色"
           extra={
@@ -365,6 +447,7 @@ export default function PersonasPage() {
                   color: COLORS[0],
                   greet: false,
                   moments_on: false,
+                  worldline_enabled: true,
                 })
                 setCreating(true)
               }}
@@ -418,55 +501,91 @@ export default function PersonasPage() {
             设置默认聊天对象 →
           </Button>
         </Card>
-      </Col>
+      </div>
 
-      <Col xs={24} md={17} xl={18}>
-        <Card styles={{ body: { paddingTop: 8 } }}>
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          minHeight: 0,
+          overflow: 'hidden',
+          alignSelf: 'stretch',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        <Card
+          className="personas-detail-card"
+          style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+          styles={{
+            body: {
+              flex: 1,
+              minHeight: 0,
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
+              paddingTop: 8,
+              width: '100%',
+            },
+          }}
+        >
           <Tabs
+            className="personas-detail-tabs"
             activeKey={tab}
             onChange={setTab}
             items={[
-              { key: 'profile', label: '资料', children: profilePane },
-              {
-                key: 'memory',
-                label: '记忆',
-                children: current ? (
-                  <MemoriesPage embeddedPersonaId={current.id} hideGlobalSwitches />
-                ) : (
-                  <Typography.Text type="secondary">先选角色</Typography.Text>
-                ),
-              },
-              {
-                key: 'companion',
-                label: '陪伴',
-                children: current ? (
-                  <CompanionBoardPage embeddedPersonaId={current.id} />
-                ) : (
-                  <Typography.Text type="secondary">先选角色</Typography.Text>
-                ),
-              },
-              {
-                key: 'schedules',
-                label: '定时',
-                children: current ? (
-                  <SchedulesPage embeddedPersonaId={current.id} />
-                ) : (
-                  <Typography.Text type="secondary">先选角色</Typography.Text>
-                ),
-              },
-              {
-                key: 'extract',
-                label: '提取',
-                children: current ? (
-                  <ExtractPage embeddedPersonaId={current.id} />
-                ) : (
-                  <Typography.Text type="secondary">先选角色</Typography.Text>
-                ),
-              },
+              { key: 'profile', label: '资料' },
+              { key: 'memory', label: '记忆' },
+              { key: 'companion', label: '陪伴' },
+              { key: 'schedules', label: '主动' },
+              { key: 'extract', label: '提取' },
+              { key: 'worldline', label: '世界线' },
             ]}
           />
+          <div ref={detailRef} className="personas-detail-scroll">
+            {tab === 'profile' ? profilePane : null}
+            {tab === 'memory' ? (
+              current ? (
+                <MemoriesPage embeddedPersonaId={current.id} hideGlobalSwitches />
+              ) : (
+                <Typography.Text type="secondary">先选角色</Typography.Text>
+              )
+            ) : null}
+            {tab === 'companion' ? (
+              current ? (
+                <CompanionBoardPage embeddedPersonaId={current.id} />
+              ) : (
+                <Typography.Text type="secondary">先选角色</Typography.Text>
+              )
+            ) : null}
+            {tab === 'schedules' ? (
+              current ? (
+                <SchedulesPage embeddedPersonaId={current.id} />
+              ) : (
+                <Typography.Text type="secondary">先选角色</Typography.Text>
+              )
+            ) : null}
+            {tab === 'extract' ? (
+              current ? (
+                <ExtractPage embeddedPersonaId={current.id} />
+              ) : (
+                <Typography.Text type="secondary">先选角色</Typography.Text>
+              )
+            ) : null}
+            {tab === 'worldline' ? (
+              current ? (
+                <WorldlineMockPage
+                  personaId={current.id}
+                  personaName={personaLabel(current)}
+                  worldlineEnabled={current.worldline_enabled !== false}
+                />
+              ) : (
+                <Typography.Text type="secondary">先选角色</Typography.Text>
+              )
+            ) : null}
+          </div>
         </Card>
-      </Col>
+      </div>
 
       <Modal
         title="新建角色"
@@ -491,6 +610,7 @@ export default function PersonasPage() {
                   is_bot: true,
                   greet: !!v.greet,
                   moments_on: !!v.moments_on,
+                  worldline_enabled: v.worldline_enabled !== false,
                 }),
               })
               message.success(`已创建「${created.name}」`)
@@ -530,16 +650,19 @@ export default function PersonasPage() {
               }))}
             />
           </Form.Item>
-          <Space size={24}>
+          <Space size={24} wrap>
             <Form.Item name="greet" label="自己问候" valuePropName="checked" style={{ marginBottom: 0 }}>
               <Switch />
             </Form.Item>
             <Form.Item name="moments_on" label="朋友圈" valuePropName="checked" style={{ marginBottom: 0 }}>
               <Switch />
             </Form.Item>
+            <Form.Item name="worldline_enabled" label="世界线" valuePropName="checked" style={{ marginBottom: 0 }}>
+              <Switch />
+            </Form.Item>
           </Space>
         </Form>
       </Modal>
-    </Row>
+    </div>
   )
 }

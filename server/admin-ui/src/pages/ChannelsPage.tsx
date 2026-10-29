@@ -8,6 +8,7 @@ export default function ChannelsPage() {
   const { loading, channels, setChannels, reload } = useCore()
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState<Channel | null>(null)
+  const [probingId, setProbingId] = useState<string | null>(null)
   const [form] = Form.useForm()
 
   useEffect(() => {
@@ -24,7 +25,13 @@ export default function ChannelsPage() {
 
   return (
     <>
-      <Card title="渠道列表" extra={<Button onClick={() => reload()}>刷新</Button>}>
+      <Card
+        title="渠道列表"
+        extra={<Button onClick={() => reload()}>刷新</Button>}
+      >
+        <div style={{ marginBottom: 12, color: '#64748b', fontSize: 13, lineHeight: 1.55 }}>
+          同一家厂商可配置多条渠道（官方 / 日卡等）。自检会按该条接口探测，按钮会转圈直到返回。
+        </div>
         <Table
           rowKey="id"
           dataSource={channels}
@@ -34,10 +41,12 @@ export default function ChannelsPage() {
               title: '名称',
               dataIndex: 'name',
               render: (name: string, row: Channel) => (
-                <Space>
+                <Space wrap>
                   {name}
                   {row.shared ? <Tag color="green">公共</Tag> : <Tag>我的</Tag>}
                   {row.key_filled ? <Tag color="blue">Key 已填</Tag> : <Tag color="orange">未配置</Tag>}
+                  {/日卡|8888ok/i.test(`${name} ${row.base_url}`) ? <Tag color="purple">日卡</Tag> : null}
+                  {/api\.deepseek\.com/i.test(row.base_url) ? <Tag color="geekblue">官方</Tag> : null}
                 </Space>
               ),
             },
@@ -50,8 +59,10 @@ export default function ChannelsPage() {
                 <Space>
                   <Button
                     type="link"
-                    disabled={!row.key_filled}
+                    disabled={!row.key_filled || (probingId !== null && probingId !== row.id)}
+                    loading={probingId === row.id}
                     onClick={async () => {
+                      setProbingId(row.id)
                       try {
                         const r = await api<{ ok: boolean; ms?: number; error?: string }>(
                           `/api/v1/channels/${row.id}/probe`,
@@ -61,6 +72,8 @@ export default function ChannelsPage() {
                         else message.error(`失败 · ${r.ms ?? 0}ms：${r.error || '未知错误'}`)
                       } catch (e) {
                         message.error(e instanceof Error ? e.message : String(e))
+                      } finally {
+                        setProbingId(null)
                       }
                     }}
                   >

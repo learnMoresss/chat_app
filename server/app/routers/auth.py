@@ -141,66 +141,8 @@ def _issue_tokens(user_row, device_name: str) -> TokenResponse:
 
 
 def _seed_user(user_id: str, display_name: str) -> None:
-    """给新用户塞一个人设「深深」和空会话，方便立刻能聊。"""
-    now = iso()
-    persona_id = new_id("p_")
-    db.execute(
-        """
-        INSERT INTO personas(id, user_id, name, color, bio, channel_id, state, is_bot, verify, remark, greet, moments_on, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'friend', 1, '', '', 1, 1, ?)
-        """,
-        (
-            persona_id,
-            user_id,
-            "深深",
-            0xFF2F6BFF,
-            "称呼主人。短句、柔和、会接话：可以关心、反问、提起前文；"
-            "对方话少时主动往下聊一句，不要干等。不使用 Markdown，不用 emoji。",
-            "",
-            now,
-        ),
-    )
-    mem_id = new_id("m_")
-    db.execute(
-        "INSERT INTO memories(id, user_id, persona_id, text, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (mem_id, user_id, persona_id, "主人刚注册，还没有更多记忆。", now),
-    )
-    conv_id = new_id("c_")
-    db.execute(
-        """
-        INSERT INTO conversations(id, user_id, persona_id, preview, last_time, unread, pinned, muted, draft, last_seq)
-        VALUES (?, ?, ?, ?, ?, 0, 0, 0, '', 0)
-        """,
-        (conv_id, user_id, persona_id, "和深深打个招呼吧", now),
-    )
-    try:
-        from ..schedules import sync_persona_proactive
-
-        sync_persona_proactive(user_id, persona_id, greet=True, moments_on=True)
-    except Exception:
-        pass
-    try:
-        from .. import stickers as stk
-
-        stk.ensure_persona_stickers(
-            user_id=user_id, persona_id=persona_id, persona_name="深深"
-        )
-    except Exception:
-        pass
-    # 系统欢迎语
-    msg_id = new_id("msg_")
-    client_id = new_id("cli_")
-    db.execute(
-        """
-        INSERT INTO messages(id, client_id, seq, user_id, conv_id, sender_id, mine, kind, text, state, created_at)
-        VALUES (?, ?, 1, ?, ?, ?, 0, 'system', ?, 'sent', ?)
-        """,
-        (msg_id, client_id, user_id, conv_id, "system", f"欢迎，{display_name}。深深在等你。", now),
-    )
-    db.execute(
-        "UPDATE conversations SET last_seq = 1, preview = ?, last_time = ? WHERE id = ?",
-        (f"欢迎，{display_name}。深深在等你。", now, conv_id),
-    )
+    """注册后不再预置默认人设；会话列表空着，由用户自己创建人设。"""
+    _ = (user_id, display_name)
 
 
 @router.post("/register", response_model=TokenResponse)

@@ -4,7 +4,9 @@ import {
   CloudServerOutlined,
   DashboardOutlined,
   KeyOutlined,
+  LeftOutlined,
   LogoutOutlined,
+  RightOutlined,
   RobotOutlined,
   SettingOutlined,
   TeamOutlined,
@@ -81,6 +83,7 @@ export default function AdminLayout() {
         collapsible
         collapsed={collapsed}
         onCollapse={setCollapsed}
+        trigger={null}
         breakpoint="lg"
         collapsedWidth={64}
         width={208}
@@ -98,7 +101,7 @@ export default function AdminLayout() {
             align="center"
             gap={10}
             style={{
-              padding: collapsed ? '16px 12px' : '18px 16px 12px',
+              padding: collapsed ? '16px 0' : '18px 16px 12px',
               flexShrink: 0,
               justifyContent: collapsed ? 'center' : 'flex-start',
             }}
@@ -129,27 +132,58 @@ export default function AdminLayout() {
           </div>
           <div
             style={{
-              padding: collapsed ? 8 : 12,
+              padding: collapsed ? '8px 0 12px' : '10px 12px 12px',
               borderTop: `1px solid ${token.colorBorderSecondary}`,
               flexShrink: 0,
               background: '#fff',
             }}
           >
-            <Flex vertical gap={8}>
-              {!collapsed ? (
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {name}
-                  {user.is_admin ? ' · 管理员' : ''}
-                </Typography.Text>
-              ) : null}
+            {!collapsed ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+                {name}
+                {user.is_admin ? ' · 管理员' : ''}
+              </Typography.Text>
+            ) : null}
+            {/* 展开：退出+折叠同一行；收起：图标居中对齐菜单 */}
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: collapsed ? 'column' : 'row',
+                alignItems: 'center',
+                justifyContent: collapsed ? 'center' : 'stretch',
+                gap: collapsed ? 8 : 8,
+                width: '100%',
+              }}
+            >
               <Button
                 icon={<LogoutOutlined />}
                 block={!collapsed}
                 onClick={() => logout().then(() => nav('/login'))}
+                style={
+                  collapsed
+                    ? { width: 40, height: 40, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+                    : { flex: 1, minWidth: 0 }
+                }
               >
                 {collapsed ? null : '退出登录'}
               </Button>
-            </Flex>
+              <Button
+                type="text"
+                aria-label={collapsed ? '展开侧栏' : '收起侧栏'}
+                icon={collapsed ? <RightOutlined /> : <LeftOutlined />}
+                onClick={() => setCollapsed((v) => !v)}
+                style={{
+                  width: collapsed ? 40 : 36,
+                  height: collapsed ? 40 : 32,
+                  padding: 0,
+                  flexShrink: 0,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: token.colorTextSecondary,
+                }}
+              />
+            </div>
           </div>
         </div>
       </Sider>
@@ -188,8 +222,32 @@ export default function AdminLayout() {
             ) : null}
           </div>
         </Header>
-        <Content style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 24 }}>
-          <Outlet />
+        <Content
+          style={{
+            flex: 1,
+            minWidth: 0,
+            minHeight: 0,
+            overflow: 'hidden',
+            padding: 24,
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          {/* 角色页左右分栏各自滚动；其它页只竖向滚，禁止整页横滚 */}
+          <div
+            className={selected === '/personas' ? 'admin-outlet admin-outlet--personas' : 'admin-outlet'}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              minHeight: 0,
+              overflowX: 'hidden',
+              overflowY: selected === '/personas' ? 'hidden' : 'auto',
+              display: selected === '/personas' ? 'flex' : undefined,
+              flexDirection: selected === '/personas' ? 'column' : undefined,
+            }}
+          >
+            <Outlet />
+          </div>
         </Content>
       </Layout>
     </Layout>

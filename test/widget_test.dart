@@ -5,7 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   testWidgets('欢迎页拆开，随便填也能进主界面', (tester) async {
     await tester.pumpWidget(const ChatApp());
-    expect(find.text('未读'), findsOneWidget);
+    expect(find.text('幻信'), findsOneWidget);
     expect(find.text('连接服务器'), findsOneWidget);
     expect(find.text('本机演示'), findsOneWidget);
 

@@ -46,20 +46,7 @@ RECIPES: Dict[str, Dict[str, Any]] = {
             "想配图可写 ⟦图：晨光里的杯子⟧，或表情 ⟦表情：元气⟧。"
         ),
     },
-    "moment_daily": {
-        "title": "发朋友圈",
-        "kind": "moment_daily",
-        "hour": 12,
-        "minute": 30,
-        "jitter_minutes": 90,
-        "daily_limit": 1,
-        "require_chatted_today": 0,
-        "prompt": (
-            "用你平常的语气写一条很短的朋友圈动态，像随手发的，一两句话，带一点情绪，"
-            "不要标签，不要 Markdown，不要说自己是 AI。"
-            "想配图时单独写一行：⟦图：画面一句话⟧。"
-        ),
-    },
+    # moment_daily 已退役：朋友圈由世界线意图驱动（见 companion/action_dispatcher.py）
 }
 
 
@@ -268,23 +255,16 @@ def sync_persona_proactive(
     greet: bool,
     moments_on: bool,
 ) -> None:
-    """人设开关打开时自动装配方；关掉则暂停对应任务。"""
-    if greet:
-        for key in ("greet_sleep", "greet_morning"):
-            try:
-                install_recipe(user_id, persona_id, key)
-            except Exception:
-                pass
-    else:
-        _pause_kinds(user_id, persona_id, "greet_")
+    """人设开关语义：greet=允许主动私聊，moments_on=允许发朋友圈。
 
-    if moments_on:
-        try:
-            install_recipe(user_id, persona_id, "moment_daily")
-        except Exception:
-            pass
-    else:
-        _pause_kinds(user_id, persona_id, "moment_")
+    固定钟点 greet_morning/greet_sleep 已退役，改由 ProactivePlanner 机会驱动；
+    此处一律暂停旧配方，避免定点轰炸。
+    """
+    _ = greet
+    _pause_kinds(user_id, persona_id, "greet_")
+    # 朋友圈改由世界线/规划器意图驱动，不再安装 moment_daily
+    _pause_kinds(user_id, persona_id, "moment_")
+    _ = moments_on  # 开关仍由 ActionDispatcher / ProactiveGates 检查
 
 
 def patch_schedule(user_id: str, schedule_id: str, **fields) -> Optional[Dict[str, Any]]:
@@ -521,7 +501,15 @@ def reschedule_on_user_message(user_id: str, persona_id: str) -> None:
 
 
 def upcoming_for_persona(user_id: str, persona_id: str, limit: int = 5) -> List[str]:
-    """注入提示词用的只读日程摘要。"""
+    """注入提示词用的只读摘要：优先读待发意图，其次旧 schedules。"""
+    try:
+        from .companion.proactive import upcoming_intents_for_persona
+
+        intents = upcoming_intents_for_persona(user_id, persona_id, limit=limit)
+        if intents:
+            return intents
+    except Exception:
+        pass
     rows = db.fetchall(
         """
         SELECT title, next_run_at, hour, minute FROM schedules
@@ -532,7 +520,7 @@ def upcoming_for_persona(user_id: str, persona_id: str, limit: int = 5) -> List[
     )
     out: List[str] = []
     for r in rows:
-        title = r["title"] or "定时问候"
+        title = r["title"] or "待办"
         nxt = _parse_iso(r["next_run_at"])
         if nxt:
             local = nxt.astimezone()
@@ -611,32 +599,18 @@ async def fire_schedule(row) -> str:
         return "skipped"
 
     if kind.startswith("moment"):
-        # 朋友圈：不依赖会话；检查人设 moments_on
-        persona = db.fetchone(
-            "SELECT moments_on FROM personas WHERE id = ? AND user_id = ?",
-            (persona_id, user_id),
-        )
-        if persona is None or not persona["moments_on"]:
-            _record_run(row["id"], user_id, "skipped", "人设未开启朋友圈")
-            _advance_next(row)
-            return "skipped"
-        if _in_quiet(user_id) or _runs_today(row["id"]) >= int(row["daily_limit"] or 1):
-            _record_run(row["id"], user_id, "skipped", "免打扰或已达上限")
-            _advance_next(row)
-            return "skipped"
-        prompt = (row["prompt"] or "").strip()
+        # 阶段4：旧 moment_* 配方停用，改走世界线意图；直接跳过并推进以免重试风暴
+        _record_run(row["id"], user_id, "skipped", "moment_daily_retired_use_worldline_intents")
+        _advance_next(row)
+        # 顺带暂停，避免反复到期
         try:
-            text = await _complete_once(user_id, persona_id, prompt)
-            from .routers.moments import post_persona_moment
-
-            mid = post_persona_moment(user_id=user_id, persona_id=persona_id, text=text)
-            _record_run(row["id"], user_id, "ok" if mid else "error", mid or "空动态")
-            _advance_next(row)
-            return "ok" if mid else "error"
-        except Exception as exc:  # noqa: BLE001
-            _record_run(row["id"], user_id, "error", str(exc))
-            _advance_next(row)
-            return "error"
+            db.execute(
+                "UPDATE schedules SET paused=1, updated_at=? WHERE id=?",
+                (iso(), row["id"]),
+            )
+        except Exception:
+            pass
+        return "skipped"
 
     if not conv_id:
         _record_run(row["id"], user_id, "skipped", "无人设会话")
@@ -693,7 +667,7 @@ async def fire_schedule(row) -> str:
 async def _complete_once(user_id: str, persona_id: str, prompt: str) -> str:
     """非流式短补全，用于朋友圈文案。只走 DSH，无渠道回退。"""
     from .dsh_gateway import dsh_complete, require_dsh
-    from .llm import build_messages
+    from .security import new_id
 
     require_dsh()
     persona = db.fetchone(
@@ -702,21 +676,17 @@ async def _complete_once(user_id: str, persona_id: str, prompt: str) -> str:
     )
     if persona is None:
         return ""
-    moment_user = (
-        f"{prompt.strip()}\n\n"
-        "（写一条朋友圈正文，一两句口语即可；不要标题，不要 emoji/颜文字，不要标签。）"
+    bio = (persona["bio"] or "").strip()
+    name = persona["name"] or "角色"
+    system = (
+        f"你是{name}。{bio}\n"
+        "现在只写一条朋友圈正文。只输出正文，不要解释、不要提问、不要给备选。"
     )
-    messages = build_messages(
-        persona_bio=persona["bio"] or "",
-        persona_name=persona["name"],
-        history=[{"role": "user", "content": moment_user}],
-    )
-    system = ""
-    if messages and messages[0].get("role") == "system":
-        system = messages[0].get("content") or ""
+    moment_user = (prompt or "").strip()
+    # 每次新会话，避免粘住上一次「帮我改文案」语境
     return await dsh_complete(
         user_id=user_id,
-        conversation_id=f"sys-moment-{persona_id}",
+        conversation_id=f"sys-moment-{persona_id}-{new_id('m')[:10]}",
         text=moment_user,
         system=system,
     )

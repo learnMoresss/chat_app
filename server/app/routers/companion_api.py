@@ -13,6 +13,7 @@ from .. import db
 from ..companion.affect import AffectService, DIMS
 from ..companion.followup import FollowupService
 from ..companion.growth import GrowthService, MODES, TRAITS
+from ..companion.retrieve_schemes import SchemeRetriever, default_scheme
 from ..companion.retriever import MemoryRetriever
 from ..companion.snapshot import build_companion_snapshot
 from ..companion.store import ConflictError, MemoryStore
@@ -121,6 +122,49 @@ def board(
     pol = _policy(uid, persona_id)
     state_version = int(affect.get("state_version") or 1) * 1000 + int(growth.get("growth_epoch") or 1)
     seq = state_version
+    world = {}
+    intents: list = []
+    try:
+        from ..companion.worldline import get_world_state, worldline_enabled
+        from ..companion.intent_service import IntentService
+
+        wl_on = worldline_enabled(uid, persona_id)
+        st = get_world_state(uid, persona_id) if wl_on else None
+        world = {
+            "enabled": wl_on,
+            "state": {
+                "weather": (st or {}).get("weather"),
+                "weather_source": (st or {}).get("weather_source"),
+                "current_activity": (st or {}).get("current_activity"),
+                "location": (st or {}).get("location"),
+                "interrupt_policy": (st or {}).get("interrupt_policy"),
+            }
+            if st
+            else None,
+            "note": None
+            if wl_on
+            else "世界线已关闭，仅对话驱动",
+        }
+        intents = IntentService().list_open(uid, persona_id, limit=30)
+    except Exception:
+        world = {"enabled": False, "state": None, "note": "世界线状态不可用"}
+        intents = []
+    proactive: Dict[str, Any] = {}
+    try:
+        from ..companion.proactive import ProactiveGates, latest_plan_summary
+
+        proactive = {
+            "budget": ProactiveGates().budget_status(uid, persona_id),
+            "last_plan": latest_plan_summary(uid, persona_id),
+        }
+    except Exception:
+        proactive = {}
+    # 心情变化来源标注（chat / world）
+    affect_events_out = []
+    for e in events:
+        reason = e.get("reason") or ""
+        src = "world" if str(reason).startswith("world:") else "chat"
+        affect_events_out.append({**e, "source": src})
     return {
         "persona_id": persona_id,
         "seq": seq,
@@ -128,14 +172,18 @@ def board(
         "has_more": False,
         "state_version": state_version,
         "affect": affect,
-        "affect_events": events,
+        "affect_events": affect_events_out,
         "growth": growth,
+        "worldline": world,
+        "proactive": proactive,
+        "intents": intents,
         "memories": [
             {
                 "id": m["id"],
                 "text": m.get("text"),
                 "status": m.get("status"),
                 "mem_type": m.get("mem_type"),
+                "source_kind": m.get("source_kind"),
                 "source_message_id": m.get("source_message_id"),
                 "heat": store.effective_heat(m),
                 "updated_at": m.get("updated_at"),
@@ -148,6 +196,109 @@ def board(
             "pause_memory_write": bool(pol.get("pause_memory_write")),
             "pause_memory_read": bool(pol.get("pause_memory_read")),
         },
+    }
+
+
+@router.get("/personas/{persona_id}/worldline")
+def worldline_detail(
+    persona_id: str,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """世界线监控详情：状态 / 计划 / 活动 / 最近事件（只读）。"""
+    uid = user["id"]
+    _persona_owned(uid, persona_id)
+    from ..companion.worldline import get_world_state, worldline_enabled
+
+    enabled = worldline_enabled(uid, persona_id)
+    st = get_world_state(uid, persona_id) if enabled else None
+    plans = []
+    activities = []
+    events = []
+    if enabled:
+        try:
+            plans = [
+                dict(r)
+                for r in db.fetchall(
+                    """
+                    SELECT id, plan_date, blocks_json, status, created_at, updated_at
+                    FROM world_plans
+                    WHERE user_id=? AND persona_id=?
+                    ORDER BY plan_date DESC LIMIT 3
+                    """,
+                    (uid, persona_id),
+                )
+            ]
+            for p in plans:
+                try:
+                    p["blocks"] = json.loads(p.pop("blocks_json") or "[]")
+                except Exception:
+                    p["blocks"] = []
+        except Exception:
+            plans = []
+        try:
+            activities = [
+                dict(r)
+                for r in db.fetchall(
+                    """
+                    SELECT id, plan_id, title, status, interrupt_policy, starts_at, ends_at, updated_at
+                    FROM world_activities
+                    WHERE user_id=? AND persona_id=?
+                    ORDER BY starts_at DESC LIMIT 20
+                    """,
+                    (uid, persona_id),
+                )
+            ]
+        except Exception:
+            activities = []
+        try:
+            events = [
+                {
+                    "id": r["id"],
+                    "kind": r["kind"],
+                    "source": r["source"],
+                    "payload": json.loads(r["payload_json"] or "{}"),
+                    "seq": r["seq"],
+                    "created_at": r["created_at"],
+                }
+                for r in db.fetchall(
+                    """
+                    SELECT id, kind, source, payload_json, seq, created_at
+                    FROM companion_events
+                    WHERE user_id=? AND persona_id=? AND source IN ('world', 'system')
+                    ORDER BY seq DESC LIMIT 30
+                    """,
+                    (uid, persona_id),
+                )
+            ]
+        except Exception:
+            events = []
+    return {
+        "persona_id": persona_id,
+        "enabled": enabled,
+        "state": dict(st) if st else None,
+        "plans": plans,
+        "activities": activities,
+        "events": events,
+        "note": None if enabled else "世界线已关闭，仅对话驱动",
+    }
+
+
+@router.get("/personas/{persona_id}/turn-trace")
+def turn_trace_list(
+    persona_id: str,
+    limit: int = Query(10, ge=1, le=50),
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """最近回合过程快照（监控回放用，只读）。"""
+    uid = user["id"]
+    _persona_owned(uid, persona_id)
+    from ..companion.turn_trace import list_turn_traces
+
+    traces = list_turn_traces(uid, persona_id, limit=limit)
+    return {
+        "persona_id": persona_id,
+        "traces": traces,
+        "latest_id": traces[0]["id"] if traces else "",
     }
 
 
@@ -324,7 +475,7 @@ def search_memories(
 ) -> Dict[str, Any]:
     uid = user["id"]
     _persona_owned(uid, persona_id)
-    packed, report = MemoryRetriever().retrieve_for_turn(uid, persona_id, q)
+    packed, report = SchemeRetriever(scheme=default_scheme()).retrieve_for_turn(uid, persona_id, q)
     return {
         "items": [{"id": m["id"], "text": m.get("text")} for m in packed],
         "budget": {"tokens": report.total, "limit": report.limit, "trimmed": report.trimmed},

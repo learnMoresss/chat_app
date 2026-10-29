@@ -24,6 +24,10 @@ def _persona_out(row, memories: Optional[List] = None) -> PersonaOut:
         pref = "sometimes"
     if pref not in ("never", "sometimes", "always"):
         pref = "sometimes"
+    try:
+        wl = bool(int(row["worldline_enabled"]))
+    except Exception:
+        wl = True
     return PersonaOut(
         id=row["id"],
         name=row["name"],
@@ -36,6 +40,7 @@ def _persona_out(row, memories: Optional[List] = None) -> PersonaOut:
         remark=row["remark"] or "",
         greet=bool(row["greet"]),
         moments_on=bool(row["moments_on"]),
+        worldline_enabled=wl,
         avatar_file_id=avatar,
         voice_reply_pref=pref,
         memories=memories or [],
@@ -58,8 +63,8 @@ def create_persona(body: PersonaCreate, user: Dict[str, Any] = Depends(current_u
     now = iso()
     db.execute(
         """
-        INSERT INTO personas(id, user_id, name, color, bio, channel_id, state, is_bot, verify, remark, greet, moments_on, created_at, avatar_file_id)
-        VALUES (?, ?, ?, ?, ?, ?, 'friend', ?, '', '', ?, ?, ?, ?)
+        INSERT INTO personas(id, user_id, name, color, bio, channel_id, state, is_bot, verify, remark, greet, moments_on, created_at, avatar_file_id, worldline_enabled)
+        VALUES (?, ?, ?, ?, ?, ?, 'friend', ?, '', '', ?, ?, ?, ?, ?)
         """,
         (
             pid,
@@ -73,6 +78,7 @@ def create_persona(body: PersonaCreate, user: Dict[str, Any] = Depends(current_u
             1 if body.moments_on else 0,
             now,
             body.avatar_file_id or "",
+            1 if body.worldline_enabled else 0,
         ),
     )
     conv_id = new_id("c_")
@@ -141,6 +147,11 @@ def patch_persona(
     remark = body.remark if body.remark is not None else row["remark"]
     greet = int(body.greet) if body.greet is not None else row["greet"]
     moments_on = int(body.moments_on) if body.moments_on is not None else row["moments_on"]
+    try:
+        cur_wl = int(row["worldline_enabled"])
+    except Exception:
+        cur_wl = 1
+    worldline_enabled = int(body.worldline_enabled) if body.worldline_enabled is not None else cur_wl
     color = int(body.color) if body.color is not None else int(row["color"])
     try:
         avatar = (
@@ -165,6 +176,16 @@ def patch_persona(
         )
         if not owned:
             raise HTTPException(status_code=400, detail="头像文件不存在")
+    if body.worldline_enabled is not None:
+        try:
+            from ..companion.worldline import set_worldline_enabled
+
+            set_worldline_enabled(user["id"], persona_id, bool(worldline_enabled))
+        except Exception:
+            db.execute(
+                "UPDATE personas SET worldline_enabled=? WHERE id=? AND user_id=?",
+                (worldline_enabled, persona_id, user["id"]),
+            )
     db.execute(
         """
         UPDATE personas
@@ -499,28 +520,46 @@ def delete_persona(
     persona_id: str,
     user: Dict[str, Any] = Depends(current_user),
 ) -> dict:
-    """删除人设：通讯录消失，并清掉对应会话与消息。"""
-    _owned(user["id"], persona_id)
+    """删除人设：通讯录消失，并清掉对应会话、消息与陪伴记忆。"""
+    uid = user["id"]
+    _owned(uid, persona_id)
     convs = db.fetchall(
         "SELECT id FROM conversations WHERE user_id = ? AND persona_id = ?",
-        (user["id"], persona_id),
+        (uid, persona_id),
     )
     for c in convs:
         db.execute(
             "DELETE FROM messages WHERE user_id = ? AND conv_id = ?",
-            (user["id"], c["id"]),
+            (uid, c["id"]),
         )
     db.execute(
         "DELETE FROM conversations WHERE user_id = ? AND persona_id = ?",
-        (user["id"], persona_id),
+        (uid, persona_id),
     )
-    db.execute("DELETE FROM memories WHERE user_id = ? AND persona_id = ?", (user["id"], persona_id))
-    try:
-        db.execute(
-            "DELETE FROM persona_assets WHERE user_id = ? AND persona_id = ?",
-            (user["id"], persona_id),
-        )
-    except Exception:
-        pass
-    db.execute("DELETE FROM personas WHERE id = ? AND user_id = ?", (persona_id, user["id"]))
+    db.execute("DELETE FROM memories WHERE user_id = ? AND persona_id = ?", (uid, persona_id))
+    # companion / 旁路表：缺表则跳过
+    for sql in (
+        "DELETE FROM memory_facts_fts WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM memory_facts WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM memory_heat_events WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM memory_source_suppress WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM persona_affect WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM persona_affect_events WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM companion_followups WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM companion_policy WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM persona_growth_revisions WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM persona_growth WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM person_notes WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM memory_injections WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM memory_runs WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM eraser_rules WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM schedules WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM persona_assets WHERE user_id = ? AND persona_id = ?",
+        "DELETE FROM voice_profiles WHERE user_id = ? AND persona_id = ?",
+    ):
+        try:
+            db.execute(sql, (uid, persona_id))
+        except Exception:
+            pass
+    db.execute("DELETE FROM personas WHERE id = ? AND user_id = ?", (persona_id, uid))
     return {"ok": True}

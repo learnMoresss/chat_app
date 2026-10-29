@@ -66,6 +66,21 @@ DSH 只出暗号文本；chat_app 抠暗号后本地/SSH 执行。见 `CHAT_LOGI
 - 流：`GET /api/v1/music/tracks/{id}/audio`（本地 / NAS 经 cache）
 - 后续：网络歌单进池或外链播放；所有人设仍共用同一曲库
 
+## 实时语音对话（半双工）
+
+路径：**麦 → ASR → DSH 流式出字 → 按句 Breeze TTS → App 播放队列**。
+
+| 项 | 约定 |
+|----|------|
+| 预热 | chat-api 启动 / `POST /api/v1/voice/realtime/warm`；App 进页只显示「连接中…」 |
+| 逐句 | DSH delta 凑齐句号即合成；`keep_loaded` 避免每句 unload |
+| 事件 | WS：`voice_asr` / `voice_sentence` / `voice_done` / `voice_error` |
+| 声线 | 人设固定 `persona_assets` prompt + `speak_instructions` 情绪 |
+| AEC | 外放走 playAndRecord；真 Voice Processing 仍可加强 |
+| 不做 | 全双工叠话、换云端 Realtime 主脑 |
+
+入口：聊天「语音通话」→ `RealtimeVoicePage`。
+
 ## 另期
 
-通话、`⟦视频⟧`、图配额、图片入站描述。
+通话 WebRTC 媒体、`⟦视频⟧` 增强、流式 ASR。

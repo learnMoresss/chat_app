@@ -1,11 +1,74 @@
 # Product overlay for companion (sdk-based) profile.
-# 插件路径相对 PRODUCT_ROOT（Docker 默认 /app；本机可 export PRODUCT_ROOT=本仓库 dsh-product）。
-# P0 模型：deepseek-official + 产品渠道 DEEPSEEK_API_KEY（挂进 $DSH_HOME/.credentials.yaml）。
+# 默认：日卡中转 daycard-deepseek / deepseek-v4.1-flash。
+# 同时挂官方订阅 deepseek-official，人设渠道可切换；另挂 local-qwen。
 
 - id: agent-default-model
   config:
-    provider: deepseek-official
-    model: deepseek-flash
+    provider: daycard-deepseek
+    model: deepseek-v4.1-flash
+
+- id: llm-pi-ai
+  config:
+    providers:
+      daycard-deepseek:
+        displayName: DeepSeek 日卡
+        apiKeyEnv: DAYCARD_DEEPSEEK_API_KEY
+        api: openai-completions
+        baseURL: https://8888ok.cc/v1
+        defaultContextWindow: 128000
+        defaultMaxTokens: 4096
+        models:
+          - id: deepseek-v4.1-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 128000
+            maxTokens: 4096
+          - id: deepseek-v4-flash
+            name: DeepSeek V4 Flash
+            contextWindow: 128000
+            maxTokens: 4096
+          - id: deepseek-v4-pro
+            name: DeepSeek V4 Pro
+            contextWindow: 128000
+            maxTokens: 8192
+      deepseek-official:
+        displayName: DeepSeek 官方订阅
+        apiKeyEnv: DEEPSEEK_API_KEY_OFFICIAL
+        api: openai-completions
+        baseURL: https://api.deepseek.com
+        defaultContextWindow: 128000
+        defaultMaxTokens: 4096
+        models:
+          - id: deepseek-flash
+            name: DeepSeek Flash
+            contextWindow: 128000
+            maxTokens: 4096
+          - id: deepseek-chat
+            name: DeepSeek Chat
+            contextWindow: 128000
+            maxTokens: 8192
+          - id: deepseek-reasoner
+            name: DeepSeek Reasoner
+            contextWindow: 128000
+            maxTokens: 8192
+      local-qwen:
+        displayName: 本地 Qwen
+        apiKeyEnv: LOCAL_QWEN_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:9292/v1
+        defaultContextWindow: 131072
+        defaultMaxTokens: 2048
+        compat:
+          chatTemplateKwargs:
+            enable_thinking: false
+        models:
+          - id: qwen3.8-flash-next-iq3_xxs
+            name: Qwen3.8 Flash Next
+            contextWindow: 262144
+            maxTokens: 2048
+          - id: qwen3.8-27b
+            name: Qwen3.8-27B
+            contextWindow: 131072
+            maxTokens: 2048
 
 # 闲聊人设：产品提示会再覆盖；此处避免 coding-agent 默认腔
 - id: system-prompt

@@ -11,6 +11,7 @@ export type Persona = {
   channel_id?: string
   greet?: boolean
   moments_on?: boolean
+  worldline_enabled?: boolean
   is_bot?: boolean
   avatar_file_id?: string
 }
@@ -45,8 +46,9 @@ export function useCore() {
   const [prefs, setPrefs] = useState<Prefs>({})
   const [error, setError] = useState('')
 
-  const reload = useCallback(async () => {
-    setLoading(true)
+  const reload = useCallback(async (opts?: { silent?: boolean }) => {
+    const silent = !!opts?.silent
+    if (!silent) setLoading(true)
     setError('')
     try {
       const [info, p, c, pr] = await Promise.all([
@@ -61,8 +63,9 @@ export function useCore() {
       setServerLabel(`${info.name} · v${info.version}`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+      if (!silent) throw e
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }, [setServerLabel])
 

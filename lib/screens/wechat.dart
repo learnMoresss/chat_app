@@ -27,7 +27,7 @@ class WechatPage extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('未读'),
+        title: const Text('幻信'),
         actions: [
           IconButton(
             onPressed: () => _showPlusMenu(context),

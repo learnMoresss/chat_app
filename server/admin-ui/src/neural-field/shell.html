@@ -1,0 +1,117 @@
+<div id="neural-field-demo" lang="zh-CN">
+  <header class="nf-nav">
+    <div class="nf-brand"><span class="nf-mark" aria-hidden="true"></span><span class="nf-brand-name">灵</span><span class="nf-brand-tag nf-mono">NEURAL FIELD</span></div>
+    <div class="nf-nav-right"><span class="nf-live"><span class="nf-live-dot"></span>交互模拟</span><span class="nf-mono">v0.3</span></div>
+  </header>
+  <div class="nf-body">
+    <div class="nf-heading">
+      <div><div class="nf-eyebrow nf-mono">INPUT → UNDERSTAND → CONNECT</div><h2>让文字流进<span>「脑海」</span></h2><p>对话唤起记忆，持续的处境推动心情与行动。</p></div>
+      <button id="nf-play" class="nf-main-control" type="button" aria-pressed="true"><span class="nf-control-glyph" id="nf-play-glyph">Ⅱ</span><span id="nf-play-label">暂停演示</span></button>
+    </div>
+    <div class="nf-workbench">
+      <section class="nf-stage" aria-label="输入信息经过点云脑图进行拆解与分流">
+        <div class="nf-stage-top"><span class="nf-mono">COGNITIVE SPACE</span><span id="nf-context-live">17:10 · 当前处境</span><span id="nf-stage-tag" class="nf-tag">等待输入</span></div>
+        <div class="nf-brain-wrap">
+          <canvas id="nf-brain" role="img" aria-label="点云脑图。输入经过拆解，分流到原始档案、长期记忆、情绪与世界线。"></canvas>
+          <canvas id="nf-flow" role="img" aria-label="文字从左侧飞入大脑，拆解后分别流向右侧六个功能点云：原始档案、事实沉淀、情绪变化、世界线、行动意图和短时注意。"></canvas>
+          <div class="nf-port-label"><span id="nf-neural-note">信息即将进入注意区</span><span class="nf-mono" id="nf-event-number">EVENT 001</span></div>
+        </div>
+        <div class="nf-phase-box">
+          <div class="nf-phase-head"><span id="nf-phase-name">准备接收一段经历</span><span class="nf-small nf-muted nf-mono" id="nf-phase-counter">01 / 07</span></div>
+          <div class="nf-phase-track" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+          <div class="nf-input-live"><span class="nf-source-badge" id="nf-source">对话</span><p id="nf-current-input">明天要面试了，有点紧张，你陪我聊会儿吧。</p></div>
+          <div class="nf-tokens" id="nf-tokens" aria-label="拆解后的信息片段"><span class="nf-token noise">等待拆解</span></div>
+        </div>
+      </section>
+      <aside class="nf-side">
+        <section class="nf-panel nf-affect-panel" aria-label="角色六维心情状态">
+          <div class="nf-panel-head"><span>心情的形状</span><span class="nf-sub">随事件变化</span></div>
+          <svg id="nf-radar" class="nf-radar" viewBox="0 0 220 170" role="img" aria-label="愉悦、好奇、兴奋、担忧、低落、不悦的模拟情绪值"><title>六维情绪</title></svg>
+          <div id="nf-affect-deltas" class="nf-affect-deltas"><span class="nf-delta neutral">等待情绪事件</span></div>
+        </section>
+        <section class="nf-panel nf-thought-panel" aria-label="简短的模拟判断与行动意图">
+          <div class="nf-panel-head"><span>此刻的想法</span><span class="nf-sub">模拟判断</span></div>
+          <div class="nf-thought-body"><div class="nf-thought-label">事件的意义</div><p id="nf-appraisal">等待输入。不是每句话都要变成长期记忆。</p></div>
+          <div class="nf-intention"><strong>行动意图</strong><br><span id="nf-intention">先听你说。</span></div>
+        </section>
+      </aside>
+    </div>
+    <section class="nf-world-system" aria-label="时间、天气、日程与偶发事件融合的持续世界线">
+      <header class="nf-world-header">
+        <div><h3>一条持续的世界线</h3><div class="nf-world-subtitle">虚构天气 · 时间驱动</div></div>
+        <div class="nf-world-clock-stack"><div id="nf-world-time" class="nf-mono">17:10:00</div><div id="nf-world-date">演示时间 · 北京时间</div></div>
+      </header>
+      <div class="nf-world-controls">
+        <label class="nf-world-control-label" for="nf-clock-mode">时钟<select id="nf-clock-mode" class="cursor-interaction"><option value="demo">加速演示 · 60×</option><option value="realtime">跟随当前时间 · 1×</option></select></label>
+        <button id="nf-world-jump" class="nf-world-action cursor-interaction" type="button">向前15分钟</button>
+        <label class="nf-world-control-label" for="nf-weather-mode">模拟天气<select id="nf-weather-mode" class="cursor-interaction"><option value="clear">晴</option><option value="cloudy">多云</option><option value="rain">小雨</option><option value="storm">雷雨</option></select></label>
+        <button id="nf-world-perturb" class="nf-world-action cursor-interaction" type="button">一次偶发事件</button>
+      </div>
+      <canvas id="nf-world-convergence" role="img" aria-label="时间节律、天气环境、日程待办与偶发扰动共同汇入一条当前世界线，再进入角色感知。">时间、天气、日程和偶发事件合并成当前处境。</canvas>
+      <div class="nf-world-details">
+        <section class="nf-world-detail" aria-label="当前活动">
+          <div class="nf-world-label">现在在做</div>
+          <h4 id="nf-activity-title">整理画稿</h4>
+          <div class="nf-activity-meta"><span id="nf-activity-location">窗边工作台</span><span id="nf-activity-status">进行中</span></div>
+          <div class="nf-activity-track" role="progressbar" aria-label="当前活动时段进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="nf-activity-progress" style="width:0%"></div></div>
+          <div id="nf-activity-window" class="nf-mono">17:00 — 17:25</div>
+          <p id="nf-activity-reason">专注完成手头的画稿，随后根据天气安排散步。</p>
+        </section>
+        <section class="nf-world-detail" aria-label="今天的安排">
+          <div class="nf-world-label">今天的安排</div>
+          <div id="nf-world-plan"><div class="nf-empty">日程即将同步</div></div>
+        </section>
+      </div>
+      <div id="nf-world-cause" aria-live="polite">时间、天气、日程与偶发事件共同决定当前处境。</div>
+      <div id="nf-world-events" aria-label="最近发生的世界事件"></div>
+      <p id="nf-world-rate">演示中1秒推进1分钟，聊天不会推动时钟</p>
+    </section>
+    <div class="nf-memory-grid">
+      <section class="nf-panel">
+        <div class="nf-panel-head"><span>原始档案</span><span><span class="nf-count nf-mono" id="nf-archive-count">0</span><span class="nf-sub"> 段</span></span></div>
+        <div class="nf-kicker"><span style="color:var(--nf-blue)">●</span>全部对话保留 · 按需回查</div>
+        <div id="nf-archive-bars" class="nf-archive-visual" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+        <div class="nf-storage-meta"><span>原始 <strong id="nf-raw-bytes">0 B</strong></span><span>压缩后 <strong id="nf-compressed-bytes">—</strong></span></div>
+        <button id="nf-archive-open" class="nf-text-button" type="button" aria-expanded="false" aria-controls="nf-archive-drawer">查询原始记录 <span aria-hidden="true">↗</span></button>
+      </section>
+      <section class="nf-panel">
+        <div class="nf-panel-head"><span>长期沉淀</span><span><span class="nf-count nf-mono" id="nf-fact-count">1</span><span class="nf-sub"> 条</span></span></div>
+        <div class="nf-kicker"><span style="color:var(--nf-cyan)">●</span>事实与经历 · 有价值才留下</div>
+        <div id="nf-facts" class="nf-fact-list"></div>
+        <div id="nf-recall-note" class="nf-recall-note">热度影响召回，不改变事实。</div>
+      </section>
+      <section class="nf-panel nf-world-panel">
+        <div class="nf-panel-head"><span>世界线</span><span class="nf-sub" id="nf-world-panel-sub">虚构角色世界</span></div>
+        <div class="nf-world-event"><span class="nf-world-line"></span><div class="nf-world-copy"><div class="nf-world-clock nf-mono" id="nf-world-clock">DAY 01 · 09:40</div><div id="nf-world-activity">雨天，在窗边整理未完成的画。</div></div></div>
+        <div class="nf-world-bottom"><span>正在关注</span><strong id="nf-world-concern">等待新的共同经历</strong></div>
+      </section>
+    </div>
+    <div class="nf-live-grid" id="nf-live-grid" hidden>
+      <section class="nf-panel" aria-label="待发主动意图">
+        <div class="nf-panel-head"><span>待发意图</span><span class="nf-sub" id="nf-intent-budget">预算 —</span></div>
+        <div id="nf-intent-list" class="nf-live-list"><div class="nf-empty">暂无排队中的主动私聊/朋友圈</div></div>
+      </section>
+      <section class="nf-panel" aria-label="心情变化来源">
+        <div class="nf-panel-head"><span>心情来源</span><span class="nf-sub">对话 / 世界线</span></div>
+        <div id="nf-affect-log" class="nf-live-list"><div class="nf-empty">尚无心情事件</div></div>
+      </section>
+      <section class="nf-panel" aria-label="最近回合">
+        <div class="nf-panel-head"><span>最近回合</span><span class="nf-sub">turn-trace</span></div>
+        <div id="nf-trace-list" class="nf-live-list"><div class="nf-empty">尚无回合记录</div></div>
+      </section>
+    </div>
+    <section class="nf-archive-drawer" id="nf-archive-drawer" hidden>
+      <div class="nf-drawer-top"><span>原始经历 · 可回溯</span><button id="nf-archive-close" type="button" aria-label="收起原始记录">收起 ×</button></div>
+      <input id="nf-archive-search" type="search" placeholder="搜索原始内容，例如「面试」「来福」" aria-label="搜索原始记录" autocomplete="off">
+      <div class="nf-archive-items" id="nf-archive-items"></div>
+    </section>
+    <div class="nf-reply" aria-live="polite"><span class="nf-reply-label">模拟回应</span><p id="nf-response">下一句话，会从刚刚发生的经历里长出来。</p></div>
+    <section class="nf-composer" aria-label="尝试输入一段对话或世界线事件">
+      <div class="nf-composer-top"><div class="nf-input-tabs"><button type="button" class="nf-mode-button" data-mode="chat" aria-pressed="true">对话输入</button><button type="button" class="nf-mode-button" data-mode="world" aria-pressed="false">世界事件</button></div><span id="nf-queue-note" class="nf-composer-info">选择示例，或输入你自己的话</span></div>
+      <form id="nf-form" class="nf-input-row"><input id="nf-message" placeholder="比如：我的狗不叫旺财，叫来福。" aria-label="输入对话或世界事件" autocomplete="off" maxlength="300"><button id="nf-send" type="submit">送入脑图 <span aria-hidden="true">↗</span></button></form>
+      <div id="nf-presets" class="nf-presets" aria-label="演示场景"></div>
+    </section>
+    <div class="nf-footer"><span>低价值信息退出注意区，原始记录仍完整保留。</span><span>规则模拟 · 无模型请求 · 原文仅留在本次页面</span></div>
+    <div id="nf-announcement" aria-live="polite" style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0"></div>
+  </div>
+</div>

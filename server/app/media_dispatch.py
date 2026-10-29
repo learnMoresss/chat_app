@@ -218,6 +218,10 @@ async def resolve_sticker_file(
 
 async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> DispatchCtx:
     """执行最多 3 条媒体意图（注册表风格分支）。"""
+    # sticker/image 分支直接用这些符号；不可依赖其它 handler 的局部 import
+    from .routers.chat import _insert_message, _set_typing
+    from .ws_hub import hub
+
     for intent in intents[:3]:
         kind = intent.get("kind")
         prompt = str(intent.get("prompt") or "").strip()
@@ -246,104 +250,105 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
             continue
         if kind == "sticker":
             await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
-            await asyncio.sleep(0.35)
-            fid, caption = await resolve_sticker_file(ctx=ctx, prompt=prompt)
-            if fid:
-                ctx.sticker_cooled = True
-                payload = json.dumps(
-                    {"v": 1, "files": [fid], "caption": caption},
-                    ensure_ascii=False,
-                )
-                img_msg = _insert_message(
-                    user_id=ctx.user_id,
-                    conv_id=ctx.conv_id,
-                    client_id=new_id("botcli_"),
-                    sender_id=ctx.persona_id,
-                    mine=False,
-                    kind="image",
-                    text=payload,
-                    state="sent",
-                )
+            try:
+                await asyncio.sleep(0.35)
+                fid, caption = await resolve_sticker_file(ctx=ctx, prompt=prompt)
+                if fid:
+                    ctx.sticker_cooled = True
+                    payload = json.dumps(
+                        {"v": 1, "files": [fid], "caption": caption},
+                        ensure_ascii=False,
+                    )
+                    img_msg = _insert_message(
+                        user_id=ctx.user_id,
+                        conv_id=ctx.conv_id,
+                        client_id=new_id("botcli_"),
+                        sender_id=ctx.persona_id,
+                        mine=False,
+                        kind="image",
+                        text=payload,
+                        state="sent",
+                    )
+                    await hub.send_user(ctx.user_id, "message", img_msg.model_dump())
+                else:
+                    note = f"（想发表情：{prompt}）"
+                    note_msg = _insert_message(
+                        user_id=ctx.user_id,
+                        conv_id=ctx.conv_id,
+                        client_id=new_id("botcli_"),
+                        sender_id=ctx.persona_id,
+                        mine=False,
+                        kind="text",
+                        text=note,
+                        state="sent",
+                    )
+                    await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
+            finally:
                 await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
-                await hub.send_user(ctx.user_id, "message", img_msg.model_dump())
-            else:
-                note = f"（想发表情：{prompt}）"
-                note_msg = _insert_message(
-                    user_id=ctx.user_id,
-                    conv_id=ctx.conv_id,
-                    client_id=new_id("botcli_"),
-                    sender_id=ctx.persona_id,
-                    mine=False,
-                    kind="text",
-                    text=note,
-                    state="sent",
-                )
-                await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
-                await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
             continue
         if kind == "image":
             await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
-            await asyncio.sleep(0.35)
-            from .image_quota import check_can_generate
+            try:
+                await asyncio.sleep(0.35)
+                from .image_quota import check_can_generate
 
-            q = check_can_generate(ctx.user_id)
-            if not q.get("ok"):
-                note = f"（今天图发够了，明天再画：{prompt}）"
-                note_msg = _insert_message(
-                    user_id=ctx.user_id,
-                    conv_id=ctx.conv_id,
-                    client_id=new_id("botcli_"),
-                    sender_id=ctx.persona_id,
-                    mine=False,
-                    kind="text",
-                    text=note,
-                    state="sent",
+                q = check_can_generate(ctx.user_id)
+                if not q.get("ok"):
+                    note = f"（今天图发够了，明天再画：{prompt}）"
+                    note_msg = _insert_message(
+                        user_id=ctx.user_id,
+                        conv_id=ctx.conv_id,
+                        client_id=new_id("botcli_"),
+                        sender_id=ctx.persona_id,
+                        mine=False,
+                        kind="text",
+                        text=note,
+                        state="sent",
+                    )
+                    await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
+                    continue
+                fid = (
+                    generate_or_mood(
+                        user_id=ctx.user_id,
+                        caption=prompt,
+                        persona_name=ctx.display,
+                        width=768,
+                        height=768,
+                        ref_file_id=ctx.persona_avatar_id,
+                    )
+                    or ""
                 )
+                if fid:
+                    payload = json.dumps(
+                        {"v": 1, "files": [fid], "caption": prompt},
+                        ensure_ascii=False,
+                    )
+                    img_msg = _insert_message(
+                        user_id=ctx.user_id,
+                        conv_id=ctx.conv_id,
+                        client_id=new_id("botcli_"),
+                        sender_id=ctx.persona_id,
+                        mine=False,
+                        kind="image",
+                        text=payload,
+                        state="sent",
+                    )
+                    await hub.send_user(ctx.user_id, "message", img_msg.model_dump())
+                else:
+                    note = f"（想发图：{prompt}）"
+                    note_msg = _insert_message(
+                        user_id=ctx.user_id,
+                        conv_id=ctx.conv_id,
+                        client_id=new_id("botcli_"),
+                        sender_id=ctx.persona_id,
+                        mine=False,
+                        kind="text",
+                        text=note,
+                        state="sent",
+                    )
+                    await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
+            finally:
                 await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
-                await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
-                continue
-            fid = (
-                generate_or_mood(
-                    user_id=ctx.user_id,
-                    caption=prompt,
-                    persona_name=ctx.display,
-                    width=768,
-                    height=768,
-                    ref_file_id=ctx.persona_avatar_id,
-                )
-                or ""
-            )
-            if fid:
-                payload = json.dumps(
-                    {"v": 1, "files": [fid], "caption": prompt},
-                    ensure_ascii=False,
-                )
-                img_msg = _insert_message(
-                    user_id=ctx.user_id,
-                    conv_id=ctx.conv_id,
-                    client_id=new_id("botcli_"),
-                    sender_id=ctx.persona_id,
-                    mine=False,
-                    kind="image",
-                    text=payload,
-                    state="sent",
-                )
-                await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
-                await hub.send_user(ctx.user_id, "message", img_msg.model_dump())
-            else:
-                note = f"（想发图：{prompt}）"
-                note_msg = _insert_message(
-                    user_id=ctx.user_id,
-                    conv_id=ctx.conv_id,
-                    client_id=new_id("botcli_"),
-                    sender_id=ctx.persona_id,
-                    mine=False,
-                    kind="text",
-                    text=note,
-                    state="sent",
-                )
-                await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
-                await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
             continue
     return ctx
 

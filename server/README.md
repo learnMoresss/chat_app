@@ -23,7 +23,7 @@ python -m app
 - 发消息：`POST /api/v1/conversations/{id}/messages`
 - WebSocket：`WS /api/v1/ws?token=<access_token>`
 
-第一个注册的用户自动成为管理员。新用户会预置人设「深深」和一个会话。
+第一个注册的用户自动成为管理员。新用户不会预置默认人设，需自行创建。
 
 模拟器连接：
 

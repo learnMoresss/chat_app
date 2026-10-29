@@ -1,10 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
-/// 按住说话：开始 / 结束录音，返回本地 m4a 路径与时长。
+/// 麦克风录音：开始 / 结束，返回本地 m4a 路径与时长；支持振幅流做 VAD。
 class VoiceRecorder {
   VoiceRecorder._();
   static final AudioRecorder _rec = AudioRecorder();
@@ -12,6 +13,13 @@ class VoiceRecorder {
   static String? _path;
 
   static Future<bool> ensurePermission() => _rec.hasPermission();
+
+  static Future<bool> isRecording() => _rec.isRecording();
+
+  /// dBFS 振幅流（通话页 VAD 用）。需在 start 之后订阅。
+  static Stream<Amplitude> onAmplitude([Duration interval = const Duration(milliseconds: 80)]) {
+    return _rec.onAmplitudeChanged(interval);
+  }
 
   static Future<void> start() async {
     final ok = await ensurePermission();

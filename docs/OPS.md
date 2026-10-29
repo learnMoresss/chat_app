@@ -56,25 +56,32 @@ python scripts/tunnel_ctl.py status
 - 管理台「用量」：上下文 / 缓存命中表格与 CSV（见 [`USAGE_METRICS.md`](./USAGE_METRICS.md)）。
 - 构建：`cd server/admin-ui && npm run build` → `server/web/dist`，由 FastAPI 托管。
 
-## PaddleOCR / RapidOCR（入站识图）
+## 入站识图 / 文档解析
 
-入站图片走本机 OCR（文字 + 坐标），**不走** llama-swap VL。
+优先本机开源 **Unlimited-OCR**（Transformers HTTP，GPU1，`:9898`）；不可用时回落 Paddle/Rapid。
 
-优先 HTTP（`OCR_BASE_URL`）；拉不到 docker 镜像时用 RapidOCR 进程内或本机 HTTP：
+文档链路：`doc_parse` 先抽原生正文（`pdftotext` / docx XML / 纯文本），字数够就不再打模型；扫面 PDF/图片再交 Unlimited。
 
 ```bash
-# 方案 A：docker（镜像可用时）
-docker run -d --name chat-paddle-ocr --restart unless-stopped \
-  -p 127.0.0.1:9899:9899 xylplm/media-saber-paddle-ocr:latest
-
-# 方案 B：RapidOCR HTTP（推荐；已装 systemd user 单元）
-systemctl --user enable --now chat-ocr.service
-# 或手动：
-# cd /home/joy/chat_app/server && .venv/bin/python scripts/ocr_http_server.py
+# 模型已在 /data/ai/cache/huggingface/.../Unlimited-OCR
+# 服务：systemd user
+systemctl --user enable --now chat-unlimited-ocr.service
+journalctl --user -u chat-unlimited-ocr.service -f
+# 手工：
+# CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/home/joy/envs/uocr-tf/lib/python3.10/site-packages:/data/ai/envs/torch-cu128/lib/python3.10/site-packages \
+#   /home/joy/envs/uocr-tf/bin/python scripts/unlimited_ocr_http.py --port 9898 --preload
 ```
 
-`.env`：`OCR_BASE_URL=http://127.0.0.1:9899`、`OCR_TIMEOUT_SECONDS=30`。  
-HTTP 不可达时 `vision_gen` 会自动回退进程内 RapidOCR。
+`.env`：
+
+```bash
+UNLIMITED_OCR_BASE_URL=http://127.0.0.1:9898/v1
+UNLIMITED_OCR_MODEL=/data/ai/cache/huggingface/hub/models--baidu--Unlimited-OCR/snapshots/8249d20b2822a7d8a4c22c8d8c9069b5ac36bda3
+UNLIMITED_OCR_TIMEOUT_SECONDS=180
+OCR_BASE_URL=http://127.0.0.1:9899
+```
+
+Paddle 回落仍可用 `:9899`。
 
 ## 产品能力注册
 

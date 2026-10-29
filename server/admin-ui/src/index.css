@@ -19,3 +19,76 @@ body {
   height: auto !important;
   line-height: normal !important;
 }
+
+/* 主栏禁止被宽表 / Row gutter 负边距撑出横向滚动条 */
+.ant-layout {
+  min-width: 0;
+}
+.admin-outlet {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.admin-outlet > * {
+  max-width: 100%;
+  min-width: 0;
+}
+/* Ant Row gutter 用负 margin，父级若不裁切就会整页横滚 */
+.admin-outlet .ant-row {
+  max-width: 100%;
+}
+.admin-outlet .ant-table-wrapper {
+  max-width: 100%;
+}
+.admin-outlet .ant-space {
+  max-width: 100%;
+}
+
+/* 角色详情：Tab 固定，下方独立滚动并铺满 */
+.personas-detail-card.ant-card {
+  height: 100%;
+}
+.personas-detail-card > .ant-card-body {
+  flex: 1 1 auto !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+.personas-detail-tabs {
+  flex: 0 0 auto;
+  width: 100%;
+}
+.personas-detail-tabs > .ant-tabs-nav {
+  margin-bottom: 0;
+}
+.personas-detail-tabs > .ant-tabs-content-holder {
+  display: none;
+}
+.personas-detail-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  width: 100%;
+  padding-top: 12px;
+}
+.personas-detail-scroll > .ant-card,
+.personas-detail-scroll > * {
+  width: 100%;
+  max-width: none;
+}
+
+/* 角色页：窄屏改为上下堆叠，由外层滚动 */
+@media (max-width: 767px) {
+  .personas-split {
+    flex-direction: column !important;
+    overflow: auto !important;
+    height: auto !important;
+  }
+  .personas-split > div {
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    overflow: visible !important;
+  }
+  .personas-detail-scroll {
+    overflow: visible;
+  }
+}

@@ -1136,5 +1136,105 @@ class ApiClient {
     });
   }
 
+  Future<Map<String, dynamic>> voiceRealtimeReady({String convId = ''}) {
+    return _json(
+      'GET',
+      '/api/v1/voice/realtime/ready',
+      auth: true,
+      query: {if (convId.isNotEmpty) 'conv_id': convId},
+    );
+  }
+
+  Future<Map<String, dynamic>> voiceRealtimeWarm() {
+    return _json('POST', '/api/v1/voice/realtime/warm', auth: true);
+  }
+
+  Future<Map<String, dynamic>> voiceRealtimeHangup({required String convId}) {
+    return _json(
+      'POST',
+      '/api/v1/voice/realtime/hangup',
+      auth: true,
+      body: {'conv_id': convId},
+    );
+  }
+
+  Future<Map<String, dynamic>> voiceRealtimeTurn({
+    required String convId,
+    required Uint8List bytes,
+    String filename = 'voice.m4a',
+    String contentType = 'audio/mp4',
+    bool allowAuthRetry = true,
+  }) async {
+    if (accessToken == null || accessToken!.isEmpty) {
+      throw ApiException('未登录', statusCode: 401, authNoise: true);
+    }
+    final uri = _u('/api/v1/voice/realtime/turn');
+    final req = MultipartRequest('POST', uri);
+    req.headers['Authorization'] = 'Bearer $accessToken';
+    req.headers['Accept'] = 'application/json';
+    req.fields['conv_id'] = convId;
+    MediaType? mt;
+    try {
+      mt = MediaType.parse(contentType);
+    } catch (_) {
+      mt = null;
+    }
+    req.files.add(MultipartFile.fromBytes('file', bytes, filename: filename, contentType: mt));
+    try {
+      final streamed = await req.send().timeout(const Duration(seconds: 60));
+      final res = await http.Response.fromStream(streamed);
+      Map<String, dynamic>? data;
+      if (res.body.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(res.body);
+          if (decoded is Map<String, dynamic>) data = decoded;
+        } catch (_) {}
+      }
+      if (res.statusCode == 401 && allowAuthRetry && (refreshToken ?? '').isNotEmpty) {
+        if (await trySilentRefresh()) {
+          return await voiceRealtimeTurn(
+            convId: convId,
+            bytes: bytes,
+            filename: filename,
+            contentType: contentType,
+            allowAuthRetry: false,
+          );
+        }
+      }
+      if (res.statusCode >= 400) {
+        final detail = data?['detail'];
+        throw ApiException(
+          detail is String ? detail : '语音回合失败（${res.statusCode}）',
+          statusCode: res.statusCode,
+        );
+      }
+      return data ?? {};
+    } on ApiException {
+      rethrow;
+    } catch (e) {
+      throw ApiException(_netFailMessage(e, action: '语音对话'));
+    }
+  }
+
+  Future<Uint8List> downloadMediaBytes(String fileId, {bool allowAuthRetry = true}) async {
+    if (accessToken == null || accessToken!.isEmpty) {
+      throw ApiException('未登录', statusCode: 401, authNoise: true);
+    }
+    final uri = _u('/api/v1/media/files/$fileId');
+    final res = await _http.get(uri, headers: {
+      'Authorization': 'Bearer $accessToken',
+      'Accept': '*/*',
+    }).timeout(const Duration(seconds: 60));
+    if (res.statusCode == 401 && allowAuthRetry && (refreshToken ?? '').isNotEmpty) {
+      if (await trySilentRefresh()) {
+        return downloadMediaBytes(fileId, allowAuthRetry: false);
+      }
+    }
+    if (res.statusCode >= 400 || res.bodyBytes.isEmpty) {
+      throw ApiException('音频下载失败（${res.statusCode}）', statusCode: res.statusCode);
+    }
+    return res.bodyBytes;
+  }
+
   void close() => _http.close();
 }

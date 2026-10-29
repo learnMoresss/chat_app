@@ -68,28 +68,8 @@ class MemoryRetriever:
         if fts_hits:
             return fts_hits[:limit]
 
-        # token 重叠（全量在 scope 内；规模大时应用 FTS）
-        qtok = _tokens(q)
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for row in self.store.list_active(user_id, persona_id, limit=500):
-            if self.store.is_source_suppressed(user_id, persona_id, row["id"]):
-                continue
-            text = row.get("text") or ""
-            tok = _tokens(text)
-            if not tok or not qtok:
-                continue
-            inter = len(qtok & tok)
-            if inter <= 0 and not any(w in text for w in qtok):
-                continue
-            score = inter / max(1, len(qtok))
-            for w in qtok:
-                if w in text:
-                    score += 0.15
-            # 温度辅助（不覆盖相关性）
-            score += self.store.effective_heat(row) / 1000.0
-            scored.append((score, row))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [r for s, r in scored if s > 0][:limit]
+        # FTS 未命中：不再全表扫 500；空召回合法
+        return []
 
     def hot_preload(self, user_id: str, persona_id: str, *, limit: int = 3) -> List[Dict[str, Any]]:
         rows = self.store.list_active(user_id, persona_id, limit=80)

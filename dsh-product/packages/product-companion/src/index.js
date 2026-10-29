@@ -83,6 +83,16 @@ function formatSnapshot(data) {
 export function apply(ctx) {
   console.error('[product-companion] loaded')
 
+  // 默认关闭 section 正文注入，避免与 FastAPI ContextCompiler 双重注入。
+  // 设 PRODUCT_COMPANION_INJECT=1|full|thin 可打开（thin 仅注入 snapshot_id 指针）。
+  const injectMode = String(process.env.PRODUCT_COMPANION_INJECT || '0').trim().toLowerCase()
+  const injectOn = injectMode === '1' || injectMode === 'true' || injectMode === 'full' || injectMode === 'thin'
+
+  if (!injectOn) {
+    console.error('[product-companion] section inject OFF (PRODUCT_COMPANION_INJECT=0); FastAPI owns snapshot')
+    return
+  }
+
   // 预取：agent 创建/换会话时（若平台有事件则监听；否则 text 回调内惰性拉）
   ctx.on?.('agent/ready', async (agent) => {
     await fetchSnapshot(agent)
@@ -101,10 +111,14 @@ export function apply(ctx) {
           const hit = snapshotCache.get(key)
           // 触发后台刷新，不阻塞
           fetchSnapshot(agent).catch(() => {})
+          if (injectMode === 'thin') {
+            const sid = hit?.raw?.snapshot_id
+            return sid ? `【陪伴快照指针】snapshot_id=${sid}` : ''
+          }
           return hit?.text || ''
         },
       })
-      console.error('[product-companion] systemPrompt.section registered')
+      console.error(`[product-companion] systemPrompt.section registered mode=${injectMode}`)
     } else {
       console.error('[product-companion] systemPrompt.section unavailable; snapshot via HTTP only')
     }

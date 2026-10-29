@@ -136,7 +136,7 @@ class _ShellState extends State<Shell> {
                   unselectedFontSize: 11,
                   elevation: 0,
                   items: [
-                    BottomNavigationBarItem(icon: RedBadge(count: store.unreadTotal, child: const Icon(Icons.chat_bubble)), label: '微信'),
+                    BottomNavigationBarItem(icon: RedBadge(count: store.unreadTotal, child: const Icon(Icons.chat_bubble)), label: '幻信'),
                     BottomNavigationBarItem(icon: RedBadge(count: store.requestCount, child: const Icon(Icons.contacts)), label: '通讯录'),
                     BottomNavigationBarItem(icon: RedBadge(count: store.noticeUnread, dot: true, child: const Icon(Icons.explore)), label: '发现'),
                     const BottomNavigationBarItem(icon: Icon(Icons.person), label: '我'),

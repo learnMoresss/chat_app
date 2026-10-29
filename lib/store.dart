@@ -329,7 +329,7 @@ class AppStore extends ChangeNotifier {
       id: _nid('p'),
       name: name,
       color: Color(0xFF000000 | (name.hashCode & 0xFFFFFF)),
-      bio: '新添加的人。记忆和深深分开。',
+      bio: '新添加的人。',
       channelId: channels.first.id,
       state: FriendState.pendingOut,
       verify: verify,
@@ -960,6 +960,16 @@ class AppStore extends ChangeNotifier {
     } catch (_) {}
   }
 
+  final List<void Function(String event, Map<String, dynamic> payload)> _voiceListeners = [];
+
+  void addVoiceRealtimeListener(void Function(String event, Map<String, dynamic> payload) fn) {
+    _voiceListeners.add(fn);
+  }
+
+  void removeVoiceRealtimeListener(void Function(String event, Map<String, dynamic> payload) fn) {
+    _voiceListeners.remove(fn);
+  }
+
   void startRealtime() {
     if (demo || api == null || accessToken == null) return;
     _realtime?.close();
@@ -978,6 +988,13 @@ class AppStore extends ChangeNotifier {
         } catch (_) {}
       },
       onEvent: (event, payload) {
+        if (event.startsWith('voice_')) {
+          for (final l in List.of(_voiceListeners)) {
+            try {
+              l(event, payload);
+            } catch (_) {}
+          }
+        }
         if (event == 'typing') {
           final convId = payload['conv_id'] as String?;
           if (convId == null) return;

@@ -43,6 +43,7 @@ from .routers import (
     tunnel_admin,
     usage,
     virtual_devices_api,
+    voice_realtime_api,
     ws,
 )
 
@@ -67,6 +68,13 @@ def create_app() -> FastAPI:
             pass
         start_reaper(interval_seconds=60.0)
         start_scheduler(interval_seconds=30.0)
+        # TTS 预热（实时语音首包）；失败不阻断启动
+        try:
+            from . import voice_realtime as _vr
+
+            asyncio.get_running_loop().run_in_executor(None, _vr.warm_in_background)
+        except Exception:
+            pass
         # 可选：启动时拉起公网穿透（无自有 VPS 时用 cloudflared/ngrok 等）
         if settings.public_tunnel_autostart and settings.public_tunnel_provider not in (
             "",
@@ -140,6 +148,7 @@ def create_app() -> FastAPI:
     app.include_router(listen_api.router)
     app.include_router(place_api.router)
     app.include_router(calls_api.router)
+    app.include_router(voice_realtime_api.router)
     app.include_router(ws.router)
     app.include_router(capabilities.router)
     app.include_router(media.router)

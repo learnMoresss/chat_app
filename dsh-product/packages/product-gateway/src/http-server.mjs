@@ -3,11 +3,12 @@
  *
  * POST /v1/dsh/turn          JSON 整段
  * POST /v1/dsh/turn/stream   SSE：delta 事件 + done
- * POST /v1/dsh/interrupt     打断当前 agent/会话
+ * POST /v1/dsh/interrupt     打断当前会话（chat/agent）
  *
  * 队列策略：
- * - chat 与 agent 分轨；chat 可抢占卡住的 agent，避免一人操作设备堵死所有人设。
- * - 同 conversationId 的 chat 串行；不同会话的 chat 可交错排队（仍共用一个 harness 锁）。
+ * - 同 conversationId 串行；不同会话可并发（上限 DSH_MAX_CONCURRENCY，默认 3）
+ * - chat 可打断同会话正在跑的任务；后台 sys-mem-* 不抢 chat
+ * - harness 按 provider/model 小池轮询
  */
 import http from 'node:http'
 import fs from 'node:fs'
@@ -17,12 +18,16 @@ import {
   getMappedSession,
   upsertMappedSession,
 } from '../../product-foundation/src/session-map.js'
-import { createProductHarness } from './dsh-runtime.js'
+import {
+  getPooledHarness,
+  closeAllHarnesses,
+  defaultProvider,
+  defaultModel,
+} from './dsh-runtime.js'
 import { authorize } from './auth.js'
 import { buildTurnPrompt } from './prompt.js'
 import { buildTurnMetrics } from './turn-metrics.js'
 
-/** 每轮写入隔离环境 + 短时票据（API 硬绑定用户，防伪造 Header） */
 function writeVdEnv({ userId, personaId, conversationId }) {
   const home = process.env.DSH_HOME || process.cwd()
   const dir = path.join(home, 'product-vd')
@@ -44,7 +49,6 @@ function writeVdEnv({ userId, personaId, conversationId }) {
     }),
     { mode: 0o600 },
   )
-  // 清理过期票据（轻量）
   try {
     const now = Math.floor(Date.now() / 1000)
     for (const name of fs.readdirSync(ticketDir)) {
@@ -76,30 +80,37 @@ function writeVdEnv({ userId, personaId, conversationId }) {
 
 const port = Number(process.env.DSH_GATEWAY_PORT || 8787)
 const db = openProductDb()
+const MAX_CONCURRENCY = Math.max(
+  1,
+  Math.min(8, Number(process.env.DSH_MAX_CONCURRENCY || 3) || 3),
+)
 
-/** @type {import('@deepseek-ai/dsh-sdk-client').DeepSeekHarness | null} */
-let harness = null
 const liveSessions = new Set()
 
-/** harness 互斥（SDK 单进程） */
-let harnessLock = Promise.resolve()
-/** @type {{ kind: 'chat'|'agent', convId: string, abort?: () => void } | null} */
-let currentJob = null
 /** conversationId -> Promise chain（同会话串行） */
 const convChains = new Map()
+/** @type {Map<string, { kind: string, convId: string, abort?: () => void, priority: number }>} */
+const activeJobs = new Map()
+let inflight = 0
+/** @type {{ resolve: () => void }[]} */
+const waiters = []
 
-async function getHarness() {
-  if (!harness) harness = createProductHarness()
-  return harness
+function acquireSlot() {
+  if (inflight < MAX_CONCURRENCY) {
+    inflight += 1
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => {
+    waiters.push({ resolve })
+  }).then(() => {
+    inflight += 1
+  })
 }
 
-function withHarness(fn) {
-  const run = harnessLock.then(fn, fn)
-  harnessLock = run.then(
-    () => {},
-    () => {},
-  )
-  return run
+function releaseSlot() {
+  inflight = Math.max(0, inflight - 1)
+  const next = waiters.shift()
+  if (next) next.resolve()
 }
 
 function enqueueConv(convId, fn) {
@@ -113,6 +124,10 @@ function enqueueConv(convId, fn) {
     ),
   )
   return run
+}
+
+function isBackgroundConv(conversationId) {
+  return String(conversationId || '').startsWith('sys-mem-')
 }
 
 function readJson(req) {
@@ -147,9 +162,23 @@ function parseBody(body) {
   const instructions = String(body.instructions || '').trim()
   const system = String(body.system || '').trim()
   const history = Array.isArray(body.history) ? body.history : []
-  // agent = 设备长任务专用会话轨；chat = 普通聊天（可打断 agent）
   const mode = String(body.mode || 'chat').toLowerCase() === 'agent' ? 'agent' : 'chat'
-  return { userId, conversationId, personaId, text, instructions, system, history, mode }
+  const provider = String(body.provider || '').trim() || defaultProvider()
+  const model = String(body.model || '').trim() || defaultModel()
+  const priority = isBackgroundConv(conversationId) ? 0 : mode === 'agent' ? 1 : 2
+  return {
+    userId,
+    conversationId,
+    personaId,
+    text,
+    instructions,
+    system,
+    history,
+    mode,
+    provider,
+    model,
+    priority,
+  }
 }
 
 function sessionKey(userId, conversationId, mode) {
@@ -157,16 +186,31 @@ function sessionKey(userId, conversationId, mode) {
 }
 
 async function runTurn(parsed) {
-  const { userId, conversationId, personaId, text, instructions, system, history, mode } = parsed
+  const { userId, conversationId, personaId, text, instructions, system, history, mode, provider, model } =
+    parsed
   if (!userId || !conversationId) throw new Error('userId/conversationId required')
 
   writeVdEnv({ userId, personaId, conversationId })
 
   const mapConv = sessionKey(userId, conversationId, mode)
   const mapped = getMappedSession(db, userId, mapConv)
-  const isNew = !mapped?.dshSessionId
-  const prompt = buildTurnPrompt({
-    isNew,
+  const routeProvider = (mapped?.provider && mapped.provider) || provider
+  const routeModel = (mapped?.model && mapped.model) || model
+  const routeChanged =
+    mapped?.dshSessionId &&
+    ((mapped.provider && mapped.provider !== provider) || (mapped.model && mapped.model !== model))
+  const useProvider = routeChanged ? provider : routeProvider
+  const useModel = routeChanged ? model : routeModel
+  // 同会话粘滞到固定 harness 槽，避免跨实例 resume 失败
+  const stickyKey = `${userId}::${mapConv}`
+  const { harness: h, provider: actualProvider, model: actualModel, key } = getPooledHarness({
+    provider: useProvider,
+    model: useModel,
+    stickyKey,
+  })
+
+  let isNew = !mapped?.dshSessionId || routeChanged
+  const promptBase = {
     system,
     instructions,
     history,
@@ -175,9 +219,9 @@ async function runTurn(parsed) {
     userId,
     personaId,
     conversationId,
-  })
+  }
 
-  const h = await getHarness()
+  let prompt = buildTurnPrompt({ ...promptBase, isNew })
   let result
   if (!isNew) {
     const sid = mapped.dshSessionId
@@ -190,14 +234,18 @@ async function runTurn(parsed) {
         liveSessions.add(sid)
       }
     } catch (err) {
-      const msg = err && err.message ? err.message : String(err)
-      throw new Error(`dsh_session_resume_failed:${sid}:${msg}`)
+      // resume 失败：开新会话，不整轮失败
+      console.error('[gateway] resume failed, starting fresh', sid, err?.message || err)
+      liveSessions.delete(sid)
+      isNew = true
+      prompt = buildTurnPrompt({ ...promptBase, isNew: true })
+      result = await h.run(prompt)
     }
   } else {
     result = await h.run(prompt)
   }
   liveSessions.add(result.sessionId)
-  upsertMappedSession(db, userId, mapConv, result.sessionId)
+  upsertMappedSession(db, userId, mapConv, result.sessionId, actualProvider, actualModel)
   const metrics = buildTurnMetrics({
     prompt,
     isNew,
@@ -208,46 +256,81 @@ async function runTurn(parsed) {
     result,
     mode,
   })
+  metrics.provider = actualProvider
+  metrics.model = actualModel
+  metrics.harnessKey = key
   return {
     ok: true,
     dshSessionId: result.sessionId,
     finalResponse: result.finalResponse || '',
     resumed: !isNew,
     mode,
+    provider: actualProvider,
+    model: actualModel,
     usage: metrics,
     metrics,
   }
 }
 
-/**
- * chat 可打断正在跑的 agent；同会话新消息覆盖排队意图由上层重发。
- */
-async function scheduleTurn(parsed) {
-  const { conversationId, mode } = parsed
-
-  // chat 打断当前 agent（设备长任务）
-  if (mode === 'chat' && currentJob?.kind === 'agent') {
-    try {
-      currentJob.abort?.()
-    } catch {
-      /* ignore */
+function interruptConv(conversationId) {
+  let interrupted = false
+  for (const [id, job] of activeJobs.entries()) {
+    if (!conversationId || job.convId === conversationId || id === conversationId) {
+      try {
+        job.abort?.()
+      } catch {
+        /* ignore */
+      }
+      interrupted = true
     }
   }
+  return interrupted
+}
 
-  return enqueueConv(conversationId, () =>
-    withHarness(async () => {
-      currentJob = { kind: mode, convId: conversationId }
-      try {
-        return await runTurn(parsed)
-      } finally {
-        if (currentJob?.convId === conversationId) currentJob = null
-      }
-    }),
-  )
+/**
+ * 同会话串行 + 全局并发上限；chat 可打断同会话在跑任务。
+ */
+async function scheduleTurn(parsed) {
+  const { conversationId, mode, priority } = parsed
+
+  // 新 chat 打断同会话旧任务（含 chat/agent）
+  if (mode === 'chat' && !isBackgroundConv(conversationId)) {
+    interruptConv(conversationId)
+  }
+
+  return enqueueConv(conversationId, async () => {
+    await acquireSlot()
+    const job = {
+      kind: mode,
+      convId: conversationId,
+      priority,
+      abort: null,
+    }
+    activeJobs.set(conversationId, job)
+    try {
+      return await runTurn(parsed)
+    } finally {
+      if (activeJobs.get(conversationId) === job) activeJobs.delete(conversationId)
+      releaseSlot()
+    }
+  })
 }
 
 function writeSse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+}
+
+function busySnapshot() {
+  const jobs = [...activeJobs.values()].map((j) => ({
+    kind: j.kind,
+    convId: j.convId,
+    priority: j.priority,
+  }))
+  return {
+    inflight,
+    max: MAX_CONCURRENCY,
+    jobs,
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -258,9 +341,9 @@ const server = http.createServer(async (req, res) => {
         service: 'product-gateway-dsh',
         jwt: Boolean(process.env.PRODUCT_JWT_SECRET),
         token: Boolean(process.env.DSH_GATEWAY_TOKEN),
-        busy: currentJob
-          ? { kind: currentJob.kind, convId: currentJob.convId }
-          : null,
+        defaultProvider: defaultProvider(),
+        defaultModel: defaultModel(),
+        busy: busySnapshot(),
       })
     }
 
@@ -270,19 +353,8 @@ const server = http.createServer(async (req, res) => {
       const conversationId = String(body.conversationId || '')
       const authz = authorize(req, userId || undefined)
       if (!authz.ok) return send(res, 401, { ok: false, error: authz.error })
-      let interrupted = false
-      if (
-        currentJob &&
-        (!conversationId || currentJob.convId === conversationId)
-      ) {
-        try {
-          currentJob.abort?.()
-        } catch {
-          /* ignore */
-        }
-        interrupted = true
-      }
-      return send(res, 200, { ok: true, interrupted, job: currentJob })
+      const interrupted = interruptConv(conversationId)
+      return send(res, 200, { ok: true, interrupted, busy: busySnapshot() })
     }
 
     const isStream = req.method === 'POST' && req.url === '/v1/dsh/turn/stream'
@@ -311,7 +383,7 @@ const server = http.createServer(async (req, res) => {
     writeSse(res, 'status', {
       phase: 'queued',
       mode: parsed.mode,
-      busy: currentJob,
+      busy: busySnapshot(),
     })
     try {
       writeSse(res, 'status', { phase: 'running', mode: parsed.mode })
@@ -327,6 +399,8 @@ const server = http.createServer(async (req, res) => {
         finalResponse: text,
         resumed: out.resumed,
         mode: out.mode,
+        provider: out.provider,
+        model: out.model,
         usage: out.usage || out.metrics || null,
         metrics: out.metrics || out.usage || null,
       })
@@ -343,13 +417,13 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, '127.0.0.1', () => {
   console.error(
-    `[product-gateway] :${port} token=${process.env.DSH_GATEWAY_TOKEN ? 'on' : 'off'} jwt=${process.env.PRODUCT_JWT_SECRET ? 'on' : 'off'}`,
+    `[product-gateway] :${port} token=${process.env.DSH_GATEWAY_TOKEN ? 'on' : 'off'} jwt=${process.env.PRODUCT_JWT_SECRET ? 'on' : 'off'} default=${defaultProvider()}/${defaultModel()} concurrency=${MAX_CONCURRENCY}`,
   )
 })
 
 async function shutdown() {
   try {
-    if (harness) await harness.close()
+    await closeAllHarnesses()
   } finally {
     process.exit(0)
   }

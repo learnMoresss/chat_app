@@ -3,12 +3,21 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .. import db
 from ..security import iso, new_id
+from .cjk_fts import fts_index_body
+
+# 阶段5：默认关闭旧 memories 双写；设 MEMORY_LEGACY_DUAL_WRITE=1 可临时打开
+_DUAL_WRITE = (os.environ.get("MEMORY_LEGACY_DUAL_WRITE") or "0").strip() in (
+    "1",
+    "true",
+    "yes",
+)
 
 STATUSES = ("candidate", "active", "superseded", "expired", "deleted", "legacy_unverified")
 TYPES = ("fact", "preference", "event", "lesson", "inference")
@@ -162,14 +171,15 @@ class MemoryStore:
                 now,
             ),
         )
-        # 同步旧表以便兼容现有 API
-        try:
-            db.execute(
-                "INSERT OR IGNORE INTO memories(id, user_id, persona_id, text, updated_at) VALUES (?,?,?,?,?)",
-                (mid, user_id, persona_id, text, now),
-            )
-        except Exception:
-            pass
+        # 可选双写旧表（默认关）
+        if _DUAL_WRITE:
+            try:
+                db.execute(
+                    "INSERT OR IGNORE INTO memories(id, user_id, persona_id, text, updated_at) VALUES (?,?,?,?,?)",
+                    (mid, user_id, persona_id, text, now),
+                )
+            except Exception:
+                pass
         self._fts_upsert(mid, user_id, persona_id, text)
         return self.get(user_id, persona_id, mid) or {"id": mid, "text": text}
 
@@ -338,13 +348,14 @@ class MemoryStore:
 
     def _fts_upsert(self, mid: str, user_id: str, persona_id: str, text: str) -> None:
         try:
+            body = fts_index_body(text)
             db.execute("DELETE FROM memory_facts_fts WHERE memory_id = ?", (mid,))
             db.execute(
                 """
                 INSERT INTO memory_facts_fts(memory_id, user_id, persona_id, body)
                 VALUES (?,?,?,?)
                 """,
-                (mid, user_id, persona_id, text),
+                (mid, user_id, persona_id, body),
             )
         except Exception:
             pass

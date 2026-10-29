@@ -200,7 +200,7 @@ def post_persona_moment(
     text: str,
     media_ids: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """角色自发动态（调度器调用）；同步写一条可读记忆便于聊天提起。"""
+    """角色自发动态（调度器/意图执行器调用）。只记发布事件，不把文案升格为事实记忆。"""
     from ..media_cards import extract_media_intents, generate_or_mood
 
     raw = (text or "").strip()
@@ -234,9 +234,15 @@ def post_persona_moment(
         (mid, user_id, persona_id, body[:2000], json.dumps(ids, ensure_ascii=False), iso()),
     )
     try:
-        from .. import memory as mem
+        from ..companion.events import emit_event
 
-        mem.add_memory(user_id, persona_id, f"我发过朋友圈：{body[:500] or '（一张图）'}")
+        emit_event(
+            user_id=user_id,
+            persona_id=persona_id,
+            kind="moment_published",
+            source="world",
+            payload={"moment_id": mid, "text_len": len(body)},
+        )
     except Exception:
         pass
     return mid

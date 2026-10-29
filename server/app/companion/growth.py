@@ -200,6 +200,27 @@ class GrowthService:
             """,
             (json.dumps(traits, ensure_ascii=False), rid, now, user_id, persona_id),
         )
+        # 证据修订链（阶段5）：before/after + evidence_ids 可撤回
+        try:
+            db.execute(
+                """
+                INSERT INTO growth_evidence_revisions(
+                  id, user_id, persona_id, before_json, after_json, evidence_ids_json, note, created_at
+                ) VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    new_id("ger_"),
+                    user_id,
+                    persona_id,
+                    json.dumps(st.get("traits") or {}, ensure_ascii=False),
+                    json.dumps(traits, ensure_ascii=False),
+                    json.dumps(evidence_ids or [], ensure_ascii=False),
+                    (note or "")[:300],
+                    now,
+                ),
+            )
+        except Exception:
+            pass
         return self.get_state(user_id, persona_id)
 
     def rollback(self, user_id: str, persona_id: str, revision_id: str = "") -> Dict[str, Any]:

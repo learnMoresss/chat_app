@@ -1,0 +1,19 @@
+[Unit]
+Description=Local Unlimited-OCR (transformers HTTP)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/joy/chat_app/server
+Environment=CUDA_VISIBLE_DEVICES=1
+Environment=HF_HOME=/data/ai/cache/huggingface
+Environment=HF_ENDPOINT=https://hf-mirror.com
+Environment=UNLIMITED_OCR_MODEL=/data/ai/cache/huggingface/hub/models--baidu--Unlimited-OCR/snapshots/8249d20b2822a7d8a4c22c8d8c9069b5ac36bda3
+Environment=UNLIMITED_OCR_DEVICE=cuda
+Environment=PYTHONPATH=/home/joy/envs/uocr-tf/lib/python3.10/site-packages:/data/ai/envs/torch-cu128/lib/python3.10/site-packages
+ExecStart=/home/joy/envs/uocr-tf/bin/python scripts/unlimited_ocr_http.py --host 127.0.0.1 --port 9898 --preload
+Restart=on-failure
+RestartSec=8
+
+[Install]
+WantedBy=default.target

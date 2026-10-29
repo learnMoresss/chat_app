@@ -19,6 +19,61 @@ logger = logging.getLogger(__name__)
 _FRIENDLY_CHAT_FAIL = "暂时没法回复，稍后再试试吧"
 _URL_ONLY_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 
+# 连发最新优先：会话生成代号；过期轮丢弃输出
+_CONV_GENERATION: Dict[str, int] = {}
+
+
+def _bump_generation(conv_id: str) -> int:
+    n = int(_CONV_GENERATION.get(conv_id) or 0) + 1
+    _CONV_GENERATION[conv_id] = n
+    return n
+
+
+def _current_generation(conv_id: str) -> int:
+    return int(_CONV_GENERATION.get(conv_id) or 0)
+
+
+def _generation_alive(conv_id: str, gen: int) -> bool:
+    return _current_generation(conv_id) == int(gen)
+
+
+def _pending_user_texts(user_id: str, conv_id: str) -> str:
+    """合并上一轮 bot 之后尚未被回答的用户消息（最新意图优先）。"""
+    try:
+        last_bot = db.fetchone(
+            """
+            SELECT seq FROM messages
+            WHERE user_id=? AND conv_id=? AND mine=0
+              AND kind IN ('text','image','voice','video','file','link')
+            ORDER BY seq DESC LIMIT 1
+            """,
+            (user_id, conv_id),
+        )
+        after = int(last_bot["seq"]) if last_bot else 0
+        rows = db.fetchall(
+            """
+            SELECT text, kind FROM messages
+            WHERE user_id=? AND conv_id=? AND mine=1 AND seq>?
+              AND kind IN ('text','image','voice','video','file','link')
+            ORDER BY seq ASC
+            """,
+            (user_id, conv_id, after),
+        )
+        parts: List[str] = []
+        for r in rows:
+            t = (r["text"] or "").strip()
+            if t:
+                parts.append(t)
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        # 多条：前面简要，最后一条完整（最新意图）
+        head = "；".join(p[:40] for p in parts[:-1])
+        return f"（用户连发）{head}\n最新一条：{parts[-1]}"
+    except Exception:
+        return ""
+
 
 def _system_warn_text(body: str = _FRIENDLY_CHAT_FAIL) -> str:
     return json.dumps({"v": 1, "level": "warn", "body": body}, ensure_ascii=False)
@@ -29,6 +84,7 @@ from ..media_cards import (
     fixed_voice_prompt,
     recent_persona_voice_secs,
 )
+from ..model_route import resolve_dsh_route, usage_model_label
 from ..routers.channels import list_visible, resolve_channel_for_persona
 from ..routers.prefs import bump_echo_streak, get_shape_flags
 from ..shape import (
@@ -449,11 +505,19 @@ async def _generate_reply(
     user_text: str = "",
     client: str = "app",
     internal: bool = False,
+    memory_receipt: Optional[Dict[str, Any]] = None,
+    generation: int = 0,
 ) -> None:
     """微信逻辑：先「对方正在输入」，有正文后才落库并推气泡。
 
     internal=True：主动问候等系统触发，指令只进模型上下文，不落用户气泡。
+    memory_receipt：显式记忆操作已前置提交的回执（成功才能对用户说记住了/改好了）。
+    generation：会话生成代号；若已被更新的消息顶替则丢弃本轮输出。
     """
+    gen = int(generation or 0)
+    if gen and not _generation_alive(conv_id, gen):
+        return
+
     persona = db.fetchone(
         "SELECT * FROM personas WHERE id = ? AND user_id = ?",
         (persona_id, user_id),
@@ -462,6 +526,11 @@ async def _generate_reply(
         return
 
     display = persona["remark"] or persona["name"] or "对方"
+    # 连发：合并上一轮 bot 之后的用户消息，回答最新意图
+    if not internal:
+        merged = _pending_user_texts(user_id, conv_id)
+        if merged:
+            user_text = merged
 
     # qq-bridge：免打扰时段可跳过模型（prefs.quiet_blocks_chat=1）→ 只记缓冲
     if not internal:
@@ -520,13 +589,34 @@ async def _generate_reply(
 
     channel = resolve_channel_for_persona(user_id, persona["channel_id"] or "")
     if channel is None:
-        # 用量展示用；思考环只走 DSH，不要求渠道 Key
+        # 用量展示用；思考环只走 DSH，不要求渠道 Key；默认日卡
         channel = {
             "id": "",
-            "model": "dsh/deepseek-flash",
+            "name": "",
+            "model": "daycard-deepseek/deepseek-v4.1-flash",
             "base_url": "",
             "key_enc": "",
         }
+    dsh_provider, dsh_model = resolve_dsh_route(channel)
+    # 本地 Qwen：健康检查失败直接报错，不回退官方/日卡
+    if dsh_provider == "local-qwen":
+        try:
+            import httpx as _httpx
+
+            base = str(channel.get("base_url") or "http://127.0.0.1:9292/v1").rstrip("/")
+            if not base.endswith("/v1"):
+                base = f"{base}/v1"
+            with _httpx.Client(timeout=8.0) as _c:
+                hr = _c.get(f"{base}/models")
+                if hr.status_code >= 400:
+                    raise RuntimeError(f"local_qwen_unhealthy:{hr.status_code}")
+        except Exception as exc:
+            await _fail(
+                detail=f"本地 Qwen 不可用（不回退其他模型）: {exc}",
+                channel_id=str(channel.get("id") or ""),
+                model=usage_model_label(dsh_provider, dsh_model),
+            )
+            return
 
     rows = db.fetchall(
         """
@@ -599,6 +689,7 @@ async def _generate_reply(
     affect_hint = ""
     growth_hint = ""
     affect_state: Dict[str, Any] = {}
+    turn_snap: Optional[Dict[str, Any]] = None
     try:
         from ..companion.budget import ContextBudgeter, approx_tokens
         from ..companion.snapshot import build_companion_snapshot
@@ -614,12 +705,13 @@ async def _generate_reply(
                 inj_on = True
         q = user_text or (history[-1]["content"] if history else "")
         snap = build_companion_snapshot(user_id, persona_id, query=q) if inj_on else None
+        turn_snap = snap
         if snap:
             mems = [m.get("text") or "" for m in (snap.get("memories") or []) if m.get("text")]
             a = snap.get("affect") or {}
             if isinstance(a, dict):
                 affect_state = a
-            affect_hint = (
+            affect_hint = snap.get("affect_strategy") or (
                 f"当前情绪锚点：愉悦{a.get('joy', 35)} 低落{a.get('sadness', 35)} "
                 f"兴奋{a.get('excitement', 35)} 担忧{a.get('worry', 35)} "
                 f"不悦{a.get('annoyance', 35)} 好奇{a.get('curiosity', 35)}"
@@ -627,6 +719,21 @@ async def _generate_reply(
             )
             if snap.get("growth_mode"):
                 growth_hint = f"人格模式：{snap.get('growth_mode')}"
+            world_hint = (snap.get("world_presence") or "").strip()
+            if world_hint:
+                affect_hint = (affect_hint + "\n" + world_hint).strip()
+            if memory_receipt and memory_receipt.get("handled"):
+                st = memory_receipt.get("status") or ""
+                if st == "ok":
+                    affect_hint += (
+                        f"\n记忆操作回执：{memory_receipt.get('message') or '已提交'}。"
+                        f"可如实告知用户（{memory_receipt.get('text') or ''}）。"
+                    )
+                elif st == "pending_confirm":
+                    affect_hint += (
+                        f"\n记忆操作未完成：{memory_receipt.get('message') or '需确认'}。"
+                        "不要假装已经记住或改好。"
+                    )
             notes = list_person_notes(user_id, persona_id)[:3]
             lines = []
             for n in notes:
@@ -635,6 +742,22 @@ async def _generate_reply(
                 lines.append(f"- [memory] {m.get('text') or ''}")
             if lines:
                 evidence_block = "本轮证据（人物档+记忆，单一管道）：\n" + "\n".join(lines)
+            # 集合查询：列出全部不占 8 条预算
+            uq = (user_text or "").strip()
+            if any(k in uq for k in ("列出全部", "有哪些", "全部编号", "都有什么")):
+                try:
+                    from ..companion.store import MemoryStore
+
+                    all_rows = MemoryStore().list_active(user_id, persona_id, limit=200)
+                    if all_rows:
+                        listing = "\n".join(
+                            f"- {r.get('text') or ''}" for r in all_rows[:80]
+                        )
+                        evidence_block = (
+                            (evidence_block + "\n") if evidence_block else ""
+                        ) + f"集合查询结果（完整列表节选）：\n{listing}"
+                except Exception:
+                    pass
             # 预算检查点（不足则裁近文在 build 侧靠 history 切片；此处只记日志）
             br = ContextBudgeter().check_final(
                 system=(persona["bio"] or "")[:800],
@@ -744,6 +867,9 @@ async def _generate_reply(
                 turn_text = prefix + turn_text
         except Exception:
             pass
+        if gen and not _generation_alive(conv_id, gen):
+            await _set_typing(user_id, conv_id, False, display)
+            return
         # 记忆只走 instructions 一侧，避免 system + evidence 双份常驻
         mem_patch = evidence_block or ""
         # 已注册能力才注入暗号；未开通/本机没有 → 明确告知勿装能用
@@ -826,6 +952,8 @@ async def _generate_reply(
                 history=hist_payload,
                 mode=dsh_mode,
                 persona_id=persona_id or "",
+                provider=dsh_provider,
+                model=dsh_model,
             ):
                 kind = ev.get("event") or ""
                 data = ev.get("data") or {}
@@ -848,6 +976,10 @@ async def _generate_reply(
                 if kind == "error":
                     raise RuntimeError(data.get("error") or "dsh stream error")
                 if kind == "delta":
+                    if gen and not _generation_alive(conv_id, gen):
+                        # 已被更新的用户消息顶替：丢弃本轮
+                        buf.clear()
+                        break
                     piece = str(data.get("text") or "")
                     if not piece:
                         continue
@@ -885,7 +1017,14 @@ async def _generate_reply(
                     if final and not buf:
                         buf.append(final)
                     metrics = data.get("metrics") or data.get("usage") or {}
-                    if isinstance(metrics, dict) and metrics:
+                    if not isinstance(metrics, dict):
+                        metrics = {}
+                    # 网关顶层 provider/model 写入 metrics，供 usage 记账
+                    if data.get("provider"):
+                        metrics["provider"] = data.get("provider")
+                    if data.get("model"):
+                        metrics["model"] = data.get("model")
+                    if metrics:
                         usage_out["metrics"] = metrics
                         usage_out["prompt_tokens"] = int(
                             metrics.get("contextTokens")
@@ -908,13 +1047,32 @@ async def _generate_reply(
                             "contextTokens": usage_out["prompt_tokens"],
                             "cacheHitRate": 0,
                             "source": "estimate",
+                            "provider": dsh_provider,
+                            "model": dsh_model,
                         }
         except Exception as exc:
             await _fail(
                 detail=f"DSH gateway error: {exc}",
                 channel_id=str(channel["id"] or ""),
-                model=str(channel["model"] or "dsh"),
+                model=usage_model_label(dsh_provider, dsh_model),
             )
+            return
+        # 以网关回包的真实模型为准
+        _m = usage_out.get("metrics") if isinstance(usage_out.get("metrics"), dict) else {}
+        if isinstance(_m, dict):
+            if _m.get("provider"):
+                dsh_provider = str(_m.get("provider") or dsh_provider)
+            if _m.get("model"):
+                dsh_model = str(_m.get("model") or dsh_model)
+        actual_model_label = usage_model_label(dsh_provider, dsh_model)
+        if gen and not _generation_alive(conv_id, gen):
+            # 过期轮：若已落了 sending 气泡，改成系统轻提示或撤回为空
+            if bot_msg_id is not None:
+                try:
+                    _update_message_text(bot_msg_id, "", state="sent", kind="text")
+                except Exception:
+                    pass
+            await _set_typing(user_id, conv_id, False, display)
             return
         raw_text = "".join(buf).strip() or "……"
         if shape_on:
@@ -1118,25 +1276,35 @@ async def _generate_reply(
         voice_max = int(_get_settings().voice_reply_max_chars or 80)
         sing_max = int(_get_settings().sing_prompt_max_chars or 200)
         if media_intents:
-            await dispatch_intents(
-                DispatchCtx(
-                    user_id=user_id,
-                    conv_id=conv_id,
-                    persona_id=persona_id,
-                    display=display,
-                    user_text=user_text or "",
-                    persona_avatar_id=persona_avatar_id or "",
-                    affect_state=affect_state if isinstance(affect_state, dict) else {},
-                    sticker_cooled=sticker_cooled,
-                    voice_cooled=voice_cooled,
-                    voice_prompt_fixed=voice_prompt_fixed,
-                    sing_enabled=sing_enabled,
-                    sing_cooled=sing_cooled,
-                    voice_max=voice_max,
-                    sing_max=sing_max,
-                ),
-                media_intents,
-            )
+            try:
+                await dispatch_intents(
+                    DispatchCtx(
+                        user_id=user_id,
+                        conv_id=conv_id,
+                        persona_id=persona_id,
+                        display=display,
+                        user_text=user_text or "",
+                        persona_avatar_id=persona_avatar_id or "",
+                        affect_state=affect_state if isinstance(affect_state, dict) else {},
+                        sticker_cooled=sticker_cooled,
+                        voice_cooled=voice_cooled,
+                        voice_prompt_fixed=voice_prompt_fixed,
+                        sing_enabled=sing_enabled,
+                        sing_cooled=sing_cooled,
+                        voice_max=voice_max,
+                        sing_max=sing_max,
+                    ),
+                    media_intents,
+                )
+            except Exception:
+                # 媒体失败不应吞掉已发出的文字回复，也不要一直「正在输入」
+                logger.exception(
+                    "media_dispatch failed user=%s conv=%s", user_id, conv_id
+                )
+                try:
+                    await _set_typing(user_id, conv_id, False, display)
+                except Exception:
+                    pass
 
         prompt_tokens = int(usage_out.get("prompt_tokens") or 0)
         completion_tokens = int(usage_out.get("completion_tokens") or 0)
@@ -1159,7 +1327,7 @@ async def _generate_reply(
             persona_id=persona_id,
             channel_id=channel["id"],
             conv_id=conv_id,
-            model=channel["model"],
+            model=actual_model_label,
             client=client,
             status="ok",
             prompt_tokens=prompt_tokens,
@@ -1191,21 +1359,113 @@ async def _generate_reply(
             )
         except Exception:
             pass
-        # 聊完后抽事实写回该人设记忆（失败不影响主回复）；主动问候不抽
+        # 聊完后抽取入队（可重试）；主动问候不抽
+        affect_delta: Dict[str, Any] = {}
         if (not internal) and user_text and text and not text.startswith("{"):
             try:
-                await mem.extract_and_store(
+                from ..companion.affect_rules import propose_after_reply
+
+                ev_id = ""
+                # 用本轮用户消息 id 幂等；internal 无则用 bot
+                try:
+                    last_user = db.fetchone(
+                        """
+                        SELECT id FROM messages
+                        WHERE user_id=? AND conv_id=? AND mine=1
+                        ORDER BY seq DESC LIMIT 1
+                        """,
+                        (user_id, conv_id),
+                    )
+                    ev_id = str((last_user["id"] if last_user else "") or bot_msg_id or "")
+                except Exception:
+                    ev_id = bot_msg_id or ""
+                affect_delta = propose_after_reply(
+                    user_id=user_id,
+                    persona_id=persona_id,
+                    user_text=user_text,
+                    event_id=ev_id,
+                )
+                if affect_delta.get("affect"):
+                    affect_state = affect_delta["affect"]
+            except Exception:
+                affect_delta = {}
+            try:
+                from ..companion.proactive import schedule_chat_followups, ProactivePlanner
+
+                schedule_chat_followups(user_id, persona_id, user_text)
+                ProactivePlanner().plan(user_id, persona_id, trigger="chat_reply")
+            except Exception:
+                pass
+            try:
+                from ..companion.runtime import CompanionRuntime
+
+                skip_ex = bool(
+                    isinstance(memory_receipt, dict)
+                    and memory_receipt.get("handled")
+                    and (memory_receipt.get("status") or "") in ("ok", "updated", "created", "remembered")
+                )
+                # handled 即跳过；兼容多种 status
+                if isinstance(memory_receipt, dict) and memory_receipt.get("handled"):
+                    skip_ex = True
+                CompanionRuntime().enqueue_extract_after_reply(
                     user_id=user_id,
                     persona_id=persona_id,
                     user_text=user_text,
                     assistant_text=text,
+                    skip_explicit_text=skip_ex,
+                    provider=dsh_provider,
+                    model=dsh_model,
+                )
+            except Exception:
+                pass
+        # 监控用回合过程（只读看板）；失败静默，不影响主路径
+        if (not internal) and user_text and text and not text.startswith("{"):
+            try:
+                from ..companion.turn_trace import record_turn_trace
+
+                mems_used = []
+                if turn_snap:
+                    for m in turn_snap.get("memories") or []:
+                        mems_used.append(
+                            {
+                                "id": m.get("id") or "",
+                                "text": (m.get("text") or "")[:200],
+                                "heat": m.get("heat"),
+                            }
+                        )
+                record_turn_trace(
+                    user_id=user_id,
+                    persona_id=persona_id,
+                    conv_id=conv_id,
+                    user_text=user_text,
+                    assistant_text=text,
+                    bot_message_id=bot_msg_id or "",
+                    explicit=memory_receipt if isinstance(memory_receipt, dict) else {},
+                    memories_used=mems_used,
+                    world_presence=(turn_snap or {}).get("world_presence") or "",
+                    affect_strategy=(turn_snap or {}).get("affect_strategy") or affect_hint or "",
+                    affect=(affect_delta.get("affect") if affect_delta else None)
+                    or (turn_snap or {}).get("affect")
+                    or affect_state
+                    or {},
+                    snapshot_id=(turn_snap or {}).get("snapshot_id") or "",
+                    state_version=int((turn_snap or {}).get("state_version") or 0),
+                    meta={
+                        "client": client,
+                        "model": actual_model_label,
+                        "affect_deltas": (affect_delta or {}).get("deltas") or {},
+                        "affect_changed": bool((affect_delta or {}).get("changed")),
+                    },
                 )
             except Exception:
                 pass
     except Exception as exc:  # noqa: BLE001
         detail = f"model error: {exc}"
+        fail_model = usage_model_label(dsh_provider, dsh_model) if "dsh_provider" in locals() else str(
+            (channel or {}).get("model") or "dsh"
+        )
         if bot_msg_id is None:
-            await _fail(detail=detail, channel_id=channel["id"], model=channel["model"])
+            await _fail(detail=detail, channel_id=channel["id"], model=fail_model)
         else:
             logger.warning("chat_fail user=%s conv=%s detail=%s", user_id, conv_id, detail)
             final = _update_message_text(
@@ -1222,7 +1482,7 @@ async def _generate_reply(
                 persona_id=persona_id,
                 channel_id=channel["id"],
                 conv_id=conv_id,
-                model=channel["model"],
+                model=fail_model,
                 client=client,
                 status="error",
                 error=detail,
@@ -1525,9 +1785,39 @@ async def send_message(
             + (f"（附言：{cap}）" if cap and cap not in (desc or "") else "")
         )
     elif kind == "file" and media_ids:
-        user_text_for_model = "[对方发来一个文件]" + (
-            f"：{body.text.strip()}" if body.text.strip() else ""
-        )
+        cap = body.text.strip()
+        file_summary = ""
+        try:
+            from pathlib import Path
+
+            from ..doc_parse import parse_inbound_file
+
+            row = db.fetchone(
+                "SELECT path FROM media_files WHERE id = ? AND user_id = ?",
+                (media_ids[0], user["id"]),
+            )
+            if row and (row["path"] or ""):
+                fname = Path(row["path"]).name
+                parsed = await asyncio.to_thread(
+                    parse_inbound_file, Path(row["path"]), hint=cap, filename=fname
+                )
+                file_summary = (parsed.get("summary") or "").strip()
+                # 坐标/行级信息塞进 instructions 风格后缀，便于模型定位表格
+                lines = parsed.get("lines") or []
+                if lines and parsed.get("source") == "unlimited":
+                    box_hint = []
+                    for ln in lines[:30]:
+                        t = (ln.get("text") or "").strip()
+                        if t:
+                            box_hint.append(f"{t[:80]}@{ln.get('box')}")
+                    if box_hint:
+                        file_summary = (file_summary + "\n[文档版式] " + "；".join(box_hint[:20])).strip()
+        except Exception:
+            file_summary = ""
+        if file_summary:
+            user_text_for_model = f"[对方发来一个文件] {file_summary}"
+        else:
+            user_text_for_model = "[对方发来一个文件]" + (f"：{cap}" if cap else "")
     elif kind == "voice":
         user_text_for_model = (
             f"[对方语音] {voice_asr}" if voice_asr else "[对方发来一段语音]"
@@ -1603,13 +1893,35 @@ async def send_message(
     # 用户聊天图不自动进全局表情库；需 DSH/管理台显式 collect
 
     if conv["persona_id"]:
+        memory_receipt: Optional[Dict[str, Any]] = None
+        try:
+            from ..companion.runtime import CompanionRuntime
+
+            rt = await CompanionRuntime().on_user_message(
+                user_id=user["id"],
+                persona_id=conv["persona_id"],
+                conv_id=conv_id,
+                text=user_text_for_model,
+                message_id=mine.id,
+                kind="chat",
+            )
+            memory_receipt = rt.get("explicit")
+        except Exception:
+            memory_receipt = None
         try:
             from ..schedules import reschedule_on_user_message
 
             reschedule_on_user_message(user["id"], conv["persona_id"])
         except Exception:
             pass
-        # 用户插话：直接打断该会话上卡住的 DSH/agent（不排队）
+        # 用户提起已完结事项 → 取消对应跟进意图
+        try:
+            from ..companion.proactive import cancel_matching_followups
+
+            cancel_matching_followups(user["id"], conv["persona_id"], user_text_for_model)
+        except Exception:
+            pass
+        # 用户插话：打断该会话上卡住的 DSH（chat/agent 均可）
         try:
             await dsh_interrupt(user_id=user["id"], conversation_id=conv_id)
         except Exception:
@@ -1629,6 +1941,7 @@ async def send_message(
                             pass
             except Exception:
                 pass
+        gen = _bump_generation(conv_id)
         background.add_task(
             _generate_reply,
             user_id=user["id"],
@@ -1636,6 +1949,8 @@ async def send_message(
             persona_id=conv["persona_id"],
             user_text=user_text_for_model,
             client="app",
+            memory_receipt=memory_receipt,
+            generation=gen,
         )
 
     return SendMessageResponse(message=mine, replies=[])

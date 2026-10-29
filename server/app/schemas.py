@@ -87,6 +87,7 @@ class PersonaOut(BaseModel):
     remark: str
     greet: bool
     moments_on: bool
+    worldline_enabled: bool = True
     avatar_file_id: str = ""
     voice_reply_pref: str = "sometimes"  # never | sometimes | always
     memories: List[Dict[str, str]] = []
@@ -100,6 +101,7 @@ class PersonaCreate(BaseModel):
     is_bot: bool = True
     greet: bool = False
     moments_on: bool = False
+    worldline_enabled: bool = True
     avatar_file_id: str = ""
 
 
@@ -175,6 +177,7 @@ class PersonaPatch(BaseModel):
     remark: Optional[str] = None
     greet: Optional[bool] = None
     moments_on: Optional[bool] = None
+    worldline_enabled: Optional[bool] = None
     color: Optional[int] = None
     avatar_file_id: Optional[str] = None
     voice_reply_pref: Optional[str] = None  # never | sometimes | always

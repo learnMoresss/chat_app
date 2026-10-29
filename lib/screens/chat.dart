@@ -23,6 +23,7 @@ import 'fullscreen_images.dart';
 import 'listen_together.dart';
 import 'location_picker.dart';
 import 'persona.dart';
+import 'persona_draw.dart';
 import 'realtime_voice.dart';
 import 'video_player_page.dart';
 import 'watch_ai.dart';
@@ -394,13 +395,78 @@ class _ChatPageState extends State<ChatPage> {
         case 'voice_call':
           setState(() => moreOpen = false);
           final p = conv.personaId != null ? store.persona(conv.personaId!) : null;
+          final api = store.api;
+          if (api == null) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未登录，无法语音通话')));
+            }
+            return;
+          }
+          if (p == null) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('当前会话没有人设，无法语音通话')));
+            }
+            return;
+          }
+          var hasFixed = false;
+          try {
+            final ready = await api.voiceRealtimeReady(convId: conv.id);
+            hasFixed = ready['has_fixed_voice'] == true;
+            if (!hasFixed) {
+              final assets = await api.listPersonaAssets(p.id, kind: 'voice');
+              hasFixed = assets.any((a) => a is Map && a['fixed'] == true);
+            }
+          } catch (e) {
+            if (mounted) _toastIfNeeded(context, e);
+            return;
+          }
+          if (!hasFixed) {
+            if (!mounted) return;
+            final go = await showDialog<bool>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: const Text('先固定音色'),
+                content: Text('语音通话需要先给「${p.display}」固定一条音色，固定后才能开始通话。'),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+                  TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('去固定')),
+                ],
+              ),
+            );
+            if (go != true || !mounted) return;
+            await Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => PersonaDrawPage(store: store, persona: p)),
+            );
+            if (!mounted) return;
+            try {
+              final ready2 = await api.voiceRealtimeReady(convId: conv.id);
+              hasFixed = ready2['has_fixed_voice'] == true;
+              if (!hasFixed) {
+                final assets = await api.listPersonaAssets(p.id, kind: 'voice');
+                hasFixed = assets.any((a) => a is Map && a['fixed'] == true);
+              }
+            } catch (e) {
+              if (mounted) _toastIfNeeded(context, e);
+              return;
+            }
+            if (!hasFixed) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('还没有固定音色，通话未开始')),
+                );
+              }
+              return;
+            }
+          }
+          if (!mounted) return;
           await Navigator.of(context).push(
             MaterialPageRoute(
               builder: (_) => RealtimeVoicePage(
-                peerName: p?.display ?? store.nameOfSender(conv.personaId ?? ''),
-                peerColor: p?.color ?? AppColors.name,
-                peerAvatarFileId: (p?.avatarFileId.isNotEmpty ?? false) ? p!.avatarFileId : null,
-                api: store.api,
+                store: store,
+                convId: conv.id,
+                peerName: p.display,
+                peerColor: p.color,
+                peerAvatarFileId: p.avatarFileId.isNotEmpty ? p.avatarFileId : null,
               ),
             ),
           );

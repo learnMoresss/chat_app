@@ -127,9 +127,10 @@ CREATE TABLE IF NOT EXISTS channels (
 CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id);
 """
 
-# 预设模板（无 Key）；用户可复制为自己的渠道或管理员填公共 Key
+# 预设模板（无 Key）；同一厂商可有多条（官方订阅 / 日卡等），管理员填公共 Key
 DEFAULT_CHANNEL_PRESETS = [
-    ("DeepSeek", "deepseek-chat", "https://api.deepseek.com"),
+    ("DeepSeek官方订阅", "deepseek-flash", "https://api.deepseek.com"),
+    ("DeepSeek日卡", "deepseek-v4.1-flash", "https://8888ok.cc/v1"),
     ("通义千问", "qwen-plus", "https://dashscope.aliyuncs.com/compatible-mode"),
     ("智谱", "glm-4-flash", "https://open.bigmodel.cn/api/paas"),
     ("Kimi", "moonshot-v1-8k", "https://api.moonshot.cn"),
@@ -1220,6 +1221,237 @@ def _migrate(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute("UPDATE meta SET value = '32' WHERE key = 'schema_version'")
+        conn.commit()
+        version = 32
+
+    if version < 33:
+        # 世界线 / 记忆底座：原始档案、后台任务、事件、意图、世界状态
+        pcols = {r[1] for r in conn.execute("PRAGMA table_info(personas)").fetchall()}
+        if "worldline_enabled" not in pcols:
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN worldline_enabled INTEGER NOT NULL DEFAULT 1"
+            )
+        mf_cols = {r[1] for r in conn.execute("PRAGMA table_info(memory_facts)").fetchall()}
+        for col, decl in (
+            ("subject_id", "TEXT NOT NULL DEFAULT ''"),
+            ("predicate", "TEXT NOT NULL DEFAULT ''"),
+            ("value", "TEXT NOT NULL DEFAULT ''"),
+            ("scope", "TEXT NOT NULL DEFAULT ''"),
+            ("source_kind", "TEXT NOT NULL DEFAULT ''"),
+            ("source_event_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            if col not in mf_cols:
+                conn.execute(f"ALTER TABLE memory_facts ADD COLUMN {col} {decl}")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS raw_records (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL DEFAULT '',
+              conv_id TEXT NOT NULL DEFAULT '',
+              kind TEXT NOT NULL DEFAULT 'chat',
+              role TEXT NOT NULL DEFAULT 'user',
+              text TEXT NOT NULL DEFAULT '',
+              source_ref TEXT NOT NULL DEFAULT '',
+              meta_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_raw_records_owner
+              ON raw_records(user_id, persona_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS companion_background_jobs (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              kind TEXT NOT NULL DEFAULT 'extract',
+              status TEXT NOT NULL DEFAULT 'pending',
+              payload_json TEXT NOT NULL DEFAULT '{}',
+              cursor_json TEXT NOT NULL DEFAULT '{}',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              max_attempts INTEGER NOT NULL DEFAULT 5,
+              last_error TEXT NOT NULL DEFAULT '',
+              not_before TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bg_jobs_due
+              ON companion_background_jobs(status, not_before, created_at);
+
+            CREATE TABLE IF NOT EXISTS companion_events (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT 'chat',
+              payload_json TEXT NOT NULL DEFAULT '{}',
+              seq INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_companion_events_owner
+              ON companion_events(user_id, persona_id, seq DESC);
+
+            CREATE TABLE IF NOT EXISTS action_intents (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT 'chat',
+              trigger_event_id TEXT NOT NULL DEFAULT '',
+              action_kind TEXT NOT NULL DEFAULT 'message',
+              reason_summary TEXT NOT NULL DEFAULT '',
+              payload_json TEXT NOT NULL DEFAULT '{}',
+              not_before TEXT NOT NULL DEFAULT '',
+              expires_at TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'pending',
+              cancel_reason TEXT NOT NULL DEFAULT '',
+              idempotency_key TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_action_intents_due
+              ON action_intents(user_id, persona_id, status, not_before);
+
+            CREATE TABLE IF NOT EXISTS world_profiles (
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              profile_json TEXT NOT NULL DEFAULT '{}',
+              source_kind TEXT NOT NULL DEFAULT 'fiction',
+              revision INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (user_id, persona_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS world_state (
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              location TEXT NOT NULL DEFAULT '',
+              weather TEXT NOT NULL DEFAULT '',
+              weather_source TEXT NOT NULL DEFAULT 'sim',
+              current_activity_id TEXT NOT NULL DEFAULT '',
+              current_activity TEXT NOT NULL DEFAULT '',
+              interrupt_policy TEXT NOT NULL DEFAULT 'busy_soft',
+              next_wake_at TEXT NOT NULL DEFAULT '',
+              day_plan_date TEXT NOT NULL DEFAULT '',
+              state_json TEXT NOT NULL DEFAULT '{}',
+              revision INTEGER NOT NULL DEFAULT 1,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (user_id, persona_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS world_plans (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              plan_date TEXT NOT NULL,
+              blocks_json TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL DEFAULT 'active',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_world_plans_owner
+              ON world_plans(user_id, persona_id, plan_date DESC);
+
+            CREATE TABLE IF NOT EXISTS world_activities (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              plan_id TEXT NOT NULL DEFAULT '',
+              title TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'planned',
+              interrupt_policy TEXT NOT NULL DEFAULT 'busy_soft',
+              starts_at TEXT NOT NULL DEFAULT '',
+              ends_at TEXT NOT NULL DEFAULT '',
+              meta_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_world_activities_owner
+              ON world_activities(user_id, persona_id, status, starts_at);
+
+            CREATE TABLE IF NOT EXISTS world_disturbances (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              rule_key TEXT NOT NULL DEFAULT '',
+              summary TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_world_disturb_owner
+              ON world_disturbances(user_id, persona_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS growth_evidence_revisions (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              before_json TEXT NOT NULL DEFAULT '{}',
+              after_json TEXT NOT NULL DEFAULT '{}',
+              evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+              note TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            """
+        )
+        # 重建 FTS body：索引端写入 CJK bigram（避免 import companion 包引发循环依赖）
+        try:
+            import importlib.util
+            from pathlib import Path
+
+            _cjk = Path(__file__).resolve().parent / "companion" / "cjk_fts.py"
+            _spec = importlib.util.spec_from_file_location("_cjk_fts_migrate", _cjk)
+            _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+            assert _spec and _spec.loader
+            _spec.loader.exec_module(_mod)
+            fts_index_body = _mod.fts_index_body
+            rows = conn.execute(
+                "SELECT id, user_id, persona_id, text FROM memory_facts WHERE status IN ('active','legacy_unverified','candidate')"
+            ).fetchall()
+            for r in rows:
+                body = fts_index_body(r["text"] or "")
+                conn.execute("DELETE FROM memory_facts_fts WHERE memory_id = ?", (r["id"],))
+                conn.execute(
+                    "INSERT INTO memory_facts_fts(memory_id, user_id, persona_id, body) VALUES (?,?,?,?)",
+                    (r["id"], r["user_id"], r["persona_id"], body),
+                )
+        except Exception:
+            pass
+        # 暂停存量 moment_daily 配方
+        try:
+            conn.execute(
+                "UPDATE schedules SET paused=1 WHERE kind LIKE 'moment%'"
+            )
+        except Exception:
+            pass
+        conn.execute("UPDATE meta SET value = '33' WHERE key = 'schema_version'")
+        conn.commit()
+        version = 33
+
+    if version < 34:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS companion_turn_traces (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL,
+              conv_id TEXT NOT NULL DEFAULT '',
+              user_text TEXT NOT NULL DEFAULT '',
+              assistant_text TEXT NOT NULL DEFAULT '',
+              user_message_id TEXT NOT NULL DEFAULT '',
+              bot_message_id TEXT NOT NULL DEFAULT '',
+              explicit_json TEXT NOT NULL DEFAULT '{}',
+              memories_used_json TEXT NOT NULL DEFAULT '[]',
+              world_presence TEXT NOT NULL DEFAULT '',
+              affect_strategy TEXT NOT NULL DEFAULT '',
+              affect_json TEXT NOT NULL DEFAULT '{}',
+              snapshot_id TEXT NOT NULL DEFAULT '',
+              state_version INTEGER NOT NULL DEFAULT 0,
+              meta_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_turn_traces_owner
+              ON companion_turn_traces(user_id, persona_id, created_at DESC);
+            """
+        )
+        conn.execute("UPDATE meta SET value = '34' WHERE key = 'schema_version'")
         conn.commit()
 
 

@@ -39,9 +39,11 @@ services:
     environment:
       PRODUCT_ROOT: /app
       DSH_HOME: /dsh-home
+      DAYCARD_DEEPSEEK_API_KEY: ${DAYCARD_DEEPSEEK_API_KEY:-}
+      # 默认日卡；勿默认官方 key
+      P0_PROVIDER: daycard-deepseek
+      P0_MODEL: deepseek-v4.1-flash
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      P0_PROVIDER: deepseek-official
-      P0_MODEL: deepseek-flash
     volumes:
       - ../packages:/app/packages:ro
       - ../profiles:/app/profiles:ro

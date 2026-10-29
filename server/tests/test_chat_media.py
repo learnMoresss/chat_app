@@ -35,9 +35,15 @@ def test_upload_and_send_images(client: TestClient):
     token = reg.json()["access_token"]
     h = {"Authorization": f"Bearer {token}"}
 
+    created = client.post(
+        "/api/v1/personas",
+        headers=h,
+        json={"name": "测图", "bio": "媒体上传测试人设"},
+    )
+    assert created.status_code == 200, created.text
     sync = client.get("/api/v1/sync", headers=h).json()
     convs = sync["conversations"]
-    assert convs, "注册应有深深会话"
+    assert convs, "创建人设后应有会话"
     conv_id = convs[0]["id"]
 
     ids = []

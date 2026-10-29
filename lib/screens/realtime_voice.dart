@@ -2,33 +2,38 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui';
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:record/record.dart';
 
 import '../api/api_client.dart';
+import '../media/app_audio.dart';
+import '../media/voice_record.dart';
+import '../store.dart';
 import '../widgets.dart';
 
-/// 本地实时语音对话页（仅 UI / 假数据）。
+/// 实时语音通话：进页即进入通话，VAD 自动分句，对方说完继续听。
 ///
-/// 后续接真音频时：
-/// - iOS: AVAudioSession category playAndRecord + mode voiceChat（内置 Voice Processing = AEC）
-/// - Android: AudioManager MODE_IN_COMMUNICATION + AcousticEchoCanceler
-/// TODO: AEC via AVAudioSession.voiceChat / AcousticEchoCanceler
-enum VoiceUiPhase { idle, listening, thinking, speaking }
+/// 说明：当前为「通话式连续半双工」——听/说自动轮转，无需按一次发一次；
+/// 真全双工（边听边说叠加）需平台 AEC，后续接 voiceChat session。
+enum VoiceUiPhase { connecting, inCall, listening, thinking, speaking, blocked }
 
 class RealtimeVoicePage extends StatefulWidget {
   const RealtimeVoicePage({
     super.key,
+    required this.store,
+    required this.convId,
     required this.peerName,
     required this.peerColor,
     this.peerAvatarFileId,
-    this.api,
   });
 
+  final AppStore store;
+  final String convId;
   final String peerName;
   final Color peerColor;
   final String? peerAvatarFileId;
-  final ApiClient? api;
 
   @override
   State<RealtimeVoicePage> createState() => _RealtimeVoicePageState();
@@ -39,14 +44,26 @@ class _CaptionLine {
   final bool mine;
   final String full;
   String revealed;
-  bool get done => revealed.length >= full.length;
+}
+
+class _PlayItem {
+  _PlayItem({required this.fileId, required this.bytes});
+  final String fileId;
+  final Uint8List bytes;
 }
 
 class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProviderStateMixin {
-  VoiceUiPhase _phase = VoiceUiPhase.idle;
+  VoiceUiPhase _phase = VoiceUiPhase.connecting;
   bool _muted = false;
-  bool _speakerOn = false; // 外放；开启后 UI 标 AEC
+  bool _speakerOn = true;
   bool _showCaptions = true;
+  bool _ready = false;
+  bool _inCall = false;
+  bool _busyTurn = false;
+  bool _hangingUp = false;
+  String? _turnId;
+  String _statusOverride = '';
+  String _asrInfo = '';
 
   late final AnimationController _breathe;
   late final AnimationController _ripple;
@@ -54,18 +71,27 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
 
   final _captions = <_CaptionLine>[];
   final _scroll = ScrollController();
-  Timer? _demoTimer;
-  Timer? _typeTimer;
-  int _demoStep = 0;
+  final _player = AudioPlayer(playerId: 'realtime_voice');
+  final _queue = <_PlayItem>[];
+  bool _playing = false;
+  StreamSubscription? _playerDone;
+  StreamSubscription<Amplitude>? _ampSub;
 
-  static const _demoScript = <(bool, String)>[
-    (true, '嗨，最近怎么样？'),
-    (false, '还不错呀，刚在想周末去哪转转。'),
-    (true, '要不要一起找个安静的地方坐坐？'),
-    (false, '好啊，我听你的。你先说，我在听。'),
-    (true, '那我们先随便聊聊近况吧。'),
-    (false, '嗯，我今天心情挺轻松的，有点想听你说话。'),
-  ];
+  bool _recording = false;
+  bool _speechStarted = false;
+  int _silenceTicks = 0;
+  DateTime? _listenStarted;
+  DateTime? _speechStartedAt;
+  int _listenGen = 0;
+
+  // dBFS：越大越响。经验阈值，可再调。
+  static const double _speechDb = -38;
+  static const double _silenceDb = -48;
+  static const int _silenceNeeded = 10; // ~800ms @80ms
+  static const int _minSpeechMs = 500;
+  static const int _maxListenSec = 22;
+
+  ApiClient? get _api => widget.store.api;
 
   @override
   void initState() {
@@ -73,98 +99,428 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     _breathe = AnimationController(vsync: this, duration: const Duration(milliseconds: 2400))..repeat(reverse: true);
     _ripple = AnimationController(vsync: this, duration: const Duration(milliseconds: 900));
     _wave = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))..repeat();
-    _seedCaptions();
-    _startDemoLoop();
+    widget.store.addVoiceRealtimeListener(_onVoiceEvent);
+    _playerDone = _player.onPlayerComplete.listen((_) => _onPlayComplete());
+    unawaited(_bootstrap());
   }
 
   @override
   void dispose() {
-    _demoTimer?.cancel();
-    _typeTimer?.cancel();
+    _hangingUp = true;
+    unawaited(_ampSub?.cancel());
+    widget.store.removeVoiceRealtimeListener(_onVoiceEvent);
+    _playerDone?.cancel();
+    unawaited(_player.stop());
+    _player.dispose();
     _breathe.dispose();
     _ripple.dispose();
     _wave.dispose();
     _scroll.dispose();
+    if (_recording) {
+      unawaited(VoiceRecorder.stop(cancel: true));
+    }
+    final api = _api;
+    if (api != null) {
+      unawaited(api.voiceRealtimeHangup(convId: widget.convId).catchError((_) => <String, dynamic>{}));
+    }
     super.dispose();
   }
 
-  void _seedCaptions() {
-    _captions.add(_CaptionLine(mine: false, full: '按住中间球体，或点一下切换说话方（演示）。', revealed: '按住中间球体，或点一下切换说话方（演示）。'));
-  }
-
-  void _startDemoLoop() {
-    _demoTimer?.cancel();
-    _demoTimer = Timer.periodic(const Duration(seconds: 4), (_) {
-      if (!mounted || _muted) return;
-      _advanceDemo();
-    });
-  }
-
-  void _advanceDemo() {
-    final next = _demoScript[_demoStep % _demoScript.length];
-    _demoStep++;
-    final mine = next.$1;
-    final text = next.$2;
+  Future<void> _bootstrap() async {
     setState(() {
-      _phase = mine ? VoiceUiPhase.listening : VoiceUiPhase.thinking;
+      _phase = VoiceUiPhase.connecting;
+      _statusOverride = '连接中…';
     });
-    if (!mine) {
-      Future.delayed(const Duration(milliseconds: 700), () {
-        if (!mounted) return;
-        setState(() => _phase = VoiceUiPhase.speaking);
-        _pushCaption(mine: false, text: text, typewriter: true);
-      });
-    } else {
-      _pushCaption(mine: true, text: text, typewriter: false);
-      Future.delayed(const Duration(milliseconds: 1600), () {
-        if (!mounted) return;
-        setState(() => _phase = VoiceUiPhase.idle);
-      });
+    await AppAudio.ensureConfigured();
+    final api = _api;
+    if (api == null) {
+      if (mounted) {
+        setState(() {
+          _statusOverride = '未登录，无法语音通话';
+          _phase = VoiceUiPhase.blocked;
+        });
+      }
+      return;
     }
-  }
+    try {
+      unawaited(api.voiceRealtimeWarm());
+      for (var i = 0; i < 40; i++) {
+        final r = await api.voiceRealtimeReady(convId: widget.convId);
+        if (!mounted || _hangingUp) return;
 
-  void _pushCaption({required bool mine, required String text, required bool typewriter}) {
-    final line = _CaptionLine(mine: mine, full: text, revealed: typewriter ? '' : text);
-    setState(() => _captions.add(line));
-    _typeTimer?.cancel();
-    if (typewriter) {
-      var i = 0;
-      _typeTimer = Timer.periodic(const Duration(milliseconds: 42), (t) {
-        if (!mounted) {
-          t.cancel();
+        if (r['need_fixed_voice'] == true) {
+          setState(() {
+            _ready = false;
+            _phase = VoiceUiPhase.blocked;
+            _statusOverride = '请先固定音色后再通话';
+          });
           return;
         }
-        i++;
-        setState(() => line.revealed = text.substring(0, i.clamp(0, text.length)));
-        _scrollToEnd();
-        if (i >= text.length) {
-          t.cancel();
-          Future.delayed(const Duration(milliseconds: 400), () {
-            if (mounted) setState(() => _phase = VoiceUiPhase.idle);
-          });
+
+        final backend = (r['asr_backend'] ?? '').toString();
+        final model = (r['asr_model'] ?? '').toString();
+        if (backend.isNotEmpty) {
+          _asrInfo = model.isEmpty ? backend : '$backend · $model';
         }
-      });
-    } else {
-      _scrollToEnd();
+
+        final ready = r['ready'] == true;
+        if (ready) {
+          setState(() {
+            _ready = true;
+            _inCall = true;
+            _phase = VoiceUiPhase.inCall;
+            _statusOverride = '';
+          });
+          await _startListenLoop();
+          return;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      }
+      if (mounted) {
+        setState(() {
+          _ready = false;
+          _phase = VoiceUiPhase.blocked;
+          _statusOverride = '连接超时，点球体重试';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _statusOverride = '连接失败，点球体重试';
+          _phase = VoiceUiPhase.blocked;
+        });
+      }
     }
   }
 
-  void _scrollToEnd() {
+  void _onVoiceEvent(String event, Map<String, dynamic> payload) {
+    final tid = payload['turn_id']?.toString();
+    if (_turnId != null && tid != null && tid != _turnId) return;
+    if (!mounted || _hangingUp) return;
+
+    switch (event) {
+      case 'voice_asr':
+        final text = payload['text']?.toString() ?? '';
+        if (text.isNotEmpty) _pushCaption(mine: true, text: text);
+        setState(() {
+          _phase = VoiceUiPhase.thinking;
+          _statusOverride = '';
+        });
+      case 'voice_status':
+        final phase = payload['phase']?.toString() ?? '';
+        setState(() {
+          if (phase == 'asr' || phase == 'thinking') _phase = VoiceUiPhase.thinking;
+          if (phase == 'speaking') _phase = VoiceUiPhase.speaking;
+        });
+      case 'voice_sentence':
+        final text = payload['text']?.toString() ?? '';
+        final fid = payload['file_id']?.toString() ?? '';
+        if (text.isNotEmpty) _pushCaption(mine: false, text: text);
+        if (fid.isNotEmpty) unawaited(_enqueuePlay(fid));
+        setState(() => _phase = VoiceUiPhase.speaking);
+      case 'voice_done':
+        setState(() {
+          _busyTurn = false;
+          if (!_playing && _queue.isEmpty) {
+            _phase = VoiceUiPhase.inCall;
+          }
+        });
+        if (!_playing && _queue.isEmpty && !_muted && _inCall) {
+          unawaited(_startListenLoop());
+        }
+      case 'voice_error':
+        final code = payload['error_code']?.toString() ?? '';
+        final err = payload['error']?.toString() ?? '出了点问题';
+        setState(() {
+          _busyTurn = false;
+          if (code == 'need_fixed_voice') {
+            _phase = VoiceUiPhase.blocked;
+            _inCall = false;
+            _statusOverride = err;
+          } else {
+            _phase = VoiceUiPhase.inCall;
+            _statusOverride = err;
+          }
+        });
+        if (code != 'need_fixed_voice' && !_muted && _inCall) {
+          // 听不清等：短暂提示后继续听
+          Future<void>.delayed(const Duration(milliseconds: 900), () {
+            if (!mounted || _hangingUp || _muted || !_inCall || _busyTurn || _recording) return;
+            setState(() => _statusOverride = '');
+            unawaited(_startListenLoop());
+          });
+        }
+    }
+  }
+
+  void _pushCaption({required bool mine, required String text}) {
+    setState(() {
+      _captions.add(_CaptionLine(mine: mine, full: text, revealed: text));
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
       _scroll.animateTo(
         _scroll.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 280),
+        duration: const Duration(milliseconds: 240),
         curve: Curves.easeOut,
       );
     });
   }
 
+  Future<void> _enqueuePlay(String fileId) async {
+    final api = _api;
+    if (api == null) return;
+    try {
+      final cached = await AppAudio.getCache(fileId);
+      Uint8List bytes;
+      if (cached != null) {
+        bytes = await cached.readAsBytes();
+      } else {
+        bytes = await api.downloadMediaBytes(fileId);
+        await AppAudio.putCache(fileId, bytes);
+      }
+      if (!mounted || _hangingUp) return;
+      _queue.add(_PlayItem(fileId: fileId, bytes: bytes));
+      if (!_playing) unawaited(_pumpQueue());
+    } catch (_) {}
+  }
+
+  Future<void> _pumpQueue() async {
+    if (_playing) return;
+    while (_queue.isNotEmpty && mounted && !_hangingUp) {
+      final item = _queue.removeAt(0);
+      _playing = true;
+      setState(() => _phase = VoiceUiPhase.speaking);
+      try {
+        await AppAudio.playBytes(_player, item.bytes, cacheFileId: item.fileId);
+        await _player.onPlayerComplete.first.timeout(
+          const Duration(seconds: 60),
+          onTimeout: () {},
+        );
+      } catch (_) {}
+      _playing = false;
+    }
+    if (!mounted || _hangingUp) return;
+    if (!_busyTurn) {
+      setState(() => _phase = VoiceUiPhase.inCall);
+      if (!_muted && _inCall) {
+        unawaited(_startListenLoop());
+      }
+    }
+  }
+
+  void _onPlayComplete() {
+    // pump 循环 await onPlayerComplete
+  }
+
+  Future<void> _interruptPlayback() async {
+    _queue.clear();
+    try {
+      await _player.stop();
+    } catch (_) {}
+    _playing = false;
+  }
+
+  Future<void> _stopAmp() async {
+    await _ampSub?.cancel();
+    _ampSub = null;
+  }
+
+  Future<void> _startListenLoop() async {
+    if (!_ready || !_inCall || _muted || _busyTurn || _recording || _hangingUp) return;
+    if (_playing || _queue.isNotEmpty) return;
+    final gen = ++_listenGen;
+    await _interruptPlayback();
+    try {
+      await VoiceRecorder.start();
+      if (!mounted || _hangingUp || gen != _listenGen) {
+        await VoiceRecorder.stop(cancel: true);
+        return;
+      }
+      _recording = true;
+      _speechStarted = false;
+      _silenceTicks = 0;
+      _listenStarted = DateTime.now();
+      _speechStartedAt = null;
+      setState(() {
+        _phase = VoiceUiPhase.listening;
+        _statusOverride = '';
+      });
+      await _stopAmp();
+      _ampSub = VoiceRecorder.onAmplitude().listen((amp) {
+        if (!mounted || _hangingUp || gen != _listenGen || !_recording) return;
+        _onAmp(amp);
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _statusOverride = '$e';
+          _phase = VoiceUiPhase.inCall;
+        });
+      }
+    }
+  }
+
+  void _onAmp(Amplitude amp) {
+    final now = DateTime.now();
+    final started = _listenStarted;
+    if (started == null) return;
+
+    final db = amp.current;
+    final elapsed = now.difference(started);
+
+    if (elapsed.inSeconds >= _maxListenSec) {
+      if (_speechStarted) {
+        unawaited(_stopListenAndSend());
+      } else {
+        // 一直没说话：丢掉重开一轮听，保持通话态
+        unawaited(_restartListenQuiet());
+      }
+      return;
+    }
+
+    if (db >= _speechDb) {
+      if (!_speechStarted) {
+        _speechStarted = true;
+        _speechStartedAt = now;
+      }
+      _silenceTicks = 0;
+      return;
+    }
+
+    if (!_speechStarted) return;
+    if (db > _silenceDb) {
+      _silenceTicks = 0;
+      return;
+    }
+    _silenceTicks += 1;
+    final spokenMs = _speechStartedAt == null ? 0 : now.difference(_speechStartedAt!).inMilliseconds;
+    if (_silenceTicks >= _silenceNeeded && spokenMs >= _minSpeechMs) {
+      unawaited(_stopListenAndSend());
+    }
+  }
+
+  Future<void> _restartListenQuiet() async {
+    await _stopAmp();
+    if (!_recording) return;
+    _recording = false;
+    await VoiceRecorder.stop(cancel: true);
+    if (!mounted || _hangingUp || _muted || !_inCall) return;
+    setState(() => _phase = VoiceUiPhase.inCall);
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    if (!mounted || _hangingUp || _muted || !_inCall || _busyTurn) return;
+    await _startListenLoop();
+  }
+
+  Future<void> _stopListenAndSend() async {
+    await _stopAmp();
+    if (!_recording) return;
+    _recording = false;
+    final captured = await VoiceRecorder.stop();
+    if (!mounted || _hangingUp) return;
+    if (captured == null) {
+      setState(() => _phase = VoiceUiPhase.inCall);
+      if (!_muted && _inCall) unawaited(_startListenLoop());
+      return;
+    }
+    if (captured.seconds < 1 && (_speechStartedAt == null ||
+        DateTime.now().difference(_speechStartedAt!).inMilliseconds < _minSpeechMs)) {
+      try {
+        captured.file.deleteSync();
+      } catch (_) {}
+      setState(() => _phase = VoiceUiPhase.inCall);
+      if (!_muted && _inCall) unawaited(_startListenLoop());
+      return;
+    }
+    final api = _api;
+    if (api == null) return;
+    setState(() {
+      _busyTurn = true;
+      _phase = VoiceUiPhase.thinking;
+      _statusOverride = '';
+    });
+    try {
+      final bytes = await captured.file.readAsBytes();
+      final r = await api.voiceRealtimeTurn(
+        convId: widget.convId,
+        bytes: Uint8List.fromList(bytes),
+        filename: 'voice.m4a',
+      );
+      _turnId = r['turn_id']?.toString();
+      try {
+        captured.file.deleteSync();
+      } catch (_) {}
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busyTurn = false;
+          _phase = VoiceUiPhase.inCall;
+          _statusOverride = '$e';
+        });
+        if (!_muted && _inCall) {
+          Future<void>.delayed(const Duration(milliseconds: 800), () {
+            if (!mounted || _hangingUp || _muted || !_inCall || _busyTurn) return;
+            setState(() => _statusOverride = '');
+            unawaited(_startListenLoop());
+          });
+        }
+      }
+    }
+  }
+
+  Future<void> _onOrbTap() async {
+    HapticFeedback.lightImpact();
+    _ripple
+      ..reset()
+      ..forward();
+
+    if (_phase == VoiceUiPhase.blocked || !_ready) {
+      await _bootstrap();
+      return;
+    }
+    if (_muted) {
+      setState(() => _muted = false);
+      await _startListenLoop();
+      return;
+    }
+
+    // 打断对方：立刻听你说
+    if (_phase == VoiceUiPhase.speaking || _playing || _queue.isNotEmpty || _busyTurn) {
+      _busyTurn = false;
+      await _interruptPlayback();
+      await _startListenLoop();
+      return;
+    }
+  }
+
+  Future<void> _hangup() async {
+    if (_hangingUp) return;
+    _hangingUp = true;
+    _inCall = false;
+    _listenGen++;
+    await _stopAmp();
+    if (_recording) {
+      _recording = false;
+      await VoiceRecorder.stop(cancel: true);
+    }
+    await _interruptPlayback();
+    final api = _api;
+    if (api != null) {
+      unawaited(api.voiceRealtimeHangup(convId: widget.convId).catchError((_) => <String, dynamic>{}));
+    }
+    if (mounted) Navigator.pop(context);
+  }
+
   String get _statusLabel {
+    if (_statusOverride.isNotEmpty) return _statusOverride;
     if (_muted) return '已静音';
     switch (_phase) {
-      case VoiceUiPhase.idle:
-        return '点球体开始说话';
+      case VoiceUiPhase.connecting:
+        return '连接中…';
+      case VoiceUiPhase.blocked:
+        return _statusOverride.isNotEmpty ? _statusOverride : '无法通话';
+      case VoiceUiPhase.inCall:
+        return '通话中';
       case VoiceUiPhase.listening:
         return '正在听你说…';
       case VoiceUiPhase.thinking:
@@ -174,41 +530,13 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     }
   }
 
-  void _onOrbTap() {
-    HapticFeedback.lightImpact();
-    _ripple
-      ..reset()
-      ..forward();
-    if (_muted) {
-      setState(() => _muted = false);
-    }
-    // 手动切换轮次：我 ↔ TA
-    if (_phase == VoiceUiPhase.listening || _phase == VoiceUiPhase.idle) {
-      setState(() => _phase = VoiceUiPhase.thinking);
-      Future.delayed(const Duration(milliseconds: 600), () {
-        if (!mounted) return;
-        setState(() => _phase = VoiceUiPhase.speaking);
-        final reply = _demoScript.where((e) => !e.$1).map((e) => e.$2).toList();
-        _pushCaption(
-          mine: false,
-          text: reply[_demoStep % reply.length],
-          typewriter: true,
-        );
-        _demoStep++;
-      });
-    } else {
-      setState(() => _phase = VoiceUiPhase.listening);
-      _pushCaption(mine: true, text: '嗯…（演示：轮到我说话）', typewriter: false);
-      Future.delayed(const Duration(milliseconds: 1400), () {
-        if (mounted) setState(() => _phase = VoiceUiPhase.idle);
-      });
-    }
-  }
-
   Color get _accent {
     if (_muted) return const Color(0xFF6B7280);
     switch (_phase) {
-      case VoiceUiPhase.idle:
+      case VoiceUiPhase.connecting:
+      case VoiceUiPhase.blocked:
+        return const Color(0xFF94A3B8);
+      case VoiceUiPhase.inCall:
         return const Color(0xFF7C9CFF);
       case VoiceUiPhase.listening:
         return const Color(0xFF34D399);
@@ -241,7 +569,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
                   _buildTopBar(),
                   Expanded(child: _buildOrbArea()),
                   _buildCaptions(),
-                  if (_speakerOn) _buildAecChip(),
+                  if (_asrInfo.isNotEmpty) _buildAsrChip(),
                   const SizedBox(height: 8),
                   _buildControls(pad.bottom),
                 ],
@@ -261,7 +589,6 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
         child: Stack(
           alignment: Alignment.center,
           children: [
-            // 中间：头像 + 名 + 状态，整体居中
             Column(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -272,7 +599,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
                       widget.peerName,
                       widget.peerColor,
                       size: 22,
-                      api: widget.api,
+                      api: _api,
                       avatarFileId: widget.peerAvatarFileId,
                     ),
                     const SizedBox(width: 8),
@@ -309,17 +636,16 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
                 ),
               ],
             ),
-            // 左右操作贴边，不挤中间
             Row(
               children: [
                 _TopIconBtn(
                   icon: Icons.close_rounded,
-                  onTap: () => Navigator.pop(context),
+                  onTap: () => unawaited(_hangup()),
                 ),
                 const Spacer(),
                 _TopChipBtn(
                   icon: _showCaptions ? Icons.subtitles_rounded : Icons.subtitles_off_rounded,
-                  label: _showCaptions ? '字幕' : '字幕',
+                  label: '字幕',
                   active: _showCaptions,
                   onTap: () => setState(() => _showCaptions = !_showCaptions),
                 ),
@@ -332,9 +658,10 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   }
 
   Widget _buildOrbArea() {
+    final connecting = _phase == VoiceUiPhase.connecting;
     return Center(
       child: GestureDetector(
-        onTap: _onOrbTap,
+        onTap: () => unawaited(_onOrbTap()),
         child: AnimatedBuilder(
           animation: Listenable.merge([_breathe, _ripple, _wave]),
           builder: (context, _) {
@@ -342,8 +669,8 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
             final amp = switch (_phase) {
               VoiceUiPhase.listening => 0.55 + math.sin(_wave.value * math.pi * 2) * 0.35,
               VoiceUiPhase.speaking => 0.45 + math.sin(_wave.value * math.pi * 2) * 0.25,
-              VoiceUiPhase.thinking => 0.35 + _breathe.value * 0.2,
-              VoiceUiPhase.idle => 0.22 + _breathe.value * 0.08,
+              VoiceUiPhase.thinking || VoiceUiPhase.connecting => 0.35 + _breathe.value * 0.2,
+              VoiceUiPhase.inCall || VoiceUiPhase.blocked => 0.22 + _breathe.value * 0.08,
             };
             final ripple = Curves.easeOut.transform(_ripple.value);
             return SizedBox(
@@ -380,23 +707,36 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
                   Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(
-                        _muted
-                            ? Icons.mic_off_rounded
-                            : (_phase == VoiceUiPhase.speaking ? Icons.graphic_eq_rounded : Icons.mic_none_rounded),
-                        color: Colors.white.withValues(alpha: 0.92),
-                        size: 36,
-                      ),
+                      if (connecting)
+                        SizedBox(
+                          width: 28,
+                          height: 28,
+                          child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.white.withValues(alpha: 0.85)),
+                        )
+                      else
+                        Icon(
+                          _muted
+                              ? Icons.mic_off_rounded
+                              : (_phase == VoiceUiPhase.speaking
+                                  ? Icons.graphic_eq_rounded
+                                  : Icons.mic_none_rounded),
+                          color: Colors.white.withValues(alpha: 0.92),
+                          size: 36,
+                        ),
                       const SizedBox(height: 8),
                       Text(
-                        _muted
-                            ? '已静音'
-                            : switch (_phase) {
-                                VoiceUiPhase.listening => '聆听中',
-                                VoiceUiPhase.thinking => '思考中',
-                                VoiceUiPhase.speaking => '对方在说',
-                                VoiceUiPhase.idle => '轻触切换',
-                              },
+                        connecting
+                            ? '连接中'
+                            : _muted
+                                ? '已静音'
+                                : switch (_phase) {
+                                    VoiceUiPhase.listening => '聆听中',
+                                    VoiceUiPhase.thinking => '思考中',
+                                    VoiceUiPhase.speaking => '对方在说',
+                                    VoiceUiPhase.inCall => '通话中',
+                                    VoiceUiPhase.blocked => '未就绪',
+                                    VoiceUiPhase.connecting => '连接中',
+                                  },
                         style: const TextStyle(color: Colors.white70, fontSize: 13, letterSpacing: 0.5),
                       ),
                     ],
@@ -417,61 +757,53 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       alignment: Alignment.bottomCenter,
       child: !_showCaptions
           ? const SizedBox(width: double.infinity, height: 0)
-          : AnimatedOpacity(
-              opacity: _showCaptions ? 1 : 0,
-              duration: const Duration(milliseconds: 200),
-              child: Container(
-                height: 148,
-                width: double.infinity,
-                margin: const EdgeInsets.symmetric(horizontal: 20),
-                padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.06),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
-                ),
-                child: ListView.builder(
-                  controller: _scroll,
-                  itemCount: _captions.length,
-                  itemBuilder: (context, i) {
-                    final c = _captions[i];
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: RichText(
-                        text: TextSpan(
-                          children: [
-                            TextSpan(
-                              text: c.mine ? '我  ' : '${widget.peerName}  ',
-                              style: TextStyle(
-                                color: c.mine ? const Color(0xFF34D399) : _accent,
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            TextSpan(
-                              text: c.revealed,
-                              style: const TextStyle(color: Color(0xFFE8E8ED), fontSize: 14, height: 1.35),
-                            ),
-                            if (!c.done && !c.mine)
-                              WidgetSpan(
-                                alignment: PlaceholderAlignment.middle,
-                                child: Padding(
-                                  padding: const EdgeInsets.only(left: 2),
-                                  child: _BlinkCaret(color: _accent),
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
+          : Container(
+              height: 148,
+              width: double.infinity,
+              margin: const EdgeInsets.symmetric(horizontal: 20),
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.06),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
               ),
+              child: _captions.isEmpty
+                  ? const Center(
+                      child: Text('通话字幕只在这里显示，不会进文字聊天', style: TextStyle(color: Colors.white38, fontSize: 13)),
+                    )
+                  : ListView.builder(
+                      controller: _scroll,
+                      itemCount: _captions.length,
+                      itemBuilder: (context, i) {
+                        final c = _captions[i];
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: RichText(
+                            text: TextSpan(
+                              children: [
+                                TextSpan(
+                                  text: c.mine ? '我  ' : '${widget.peerName}  ',
+                                  style: TextStyle(
+                                    color: c.mine ? const Color(0xFF34D399) : _accent,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                TextSpan(
+                                  text: c.revealed,
+                                  style: const TextStyle(color: Color(0xFFE8E8ED), fontSize: 14, height: 1.35),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
             ),
     );
   }
 
-  Widget _buildAecChip() {
+  Widget _buildAsrChip() {
     return Padding(
       padding: const EdgeInsets.only(top: 6),
       child: Container(
@@ -481,14 +813,14 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
           borderRadius: BorderRadius.circular(20),
           border: Border.all(color: const Color(0xFF374151)),
         ),
-        child: const Row(
+        child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.hearing_disabled, size: 14, color: Color(0xFF93C5FD)),
-            SizedBox(width: 6),
+            const Icon(Icons.hearing, size: 14, color: Color(0xFF93C5FD)),
+            const SizedBox(width: 6),
             Text(
-              'AEC 回声消除已就绪',
-              style: TextStyle(color: Color(0xFF93C5FD), fontSize: 11, fontWeight: FontWeight.w500),
+              '识别 $_asrInfo',
+              style: const TextStyle(color: Color(0xFF93C5FD), fontSize: 11, fontWeight: FontWeight.w500),
             ),
           ],
         ),
@@ -497,7 +829,6 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   }
 
   Widget _buildControls(double bottomInset) {
-    // 字幕在顶栏；底栏仅三钮，无托盘背景
     return Padding(
       padding: EdgeInsets.fromLTRB(36, 10, 36, 16 + bottomInset.clamp(0, 28)),
       child: Row(
@@ -510,13 +841,23 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
             active: _muted,
             onTap: () {
               HapticFeedback.selectionClick();
-              setState(() {
-                _muted = !_muted;
-                if (_muted) _phase = VoiceUiPhase.idle;
-              });
+              final next = !_muted;
+              setState(() => _muted = next);
+              if (next) {
+                _listenGen++;
+                unawaited(_stopAmp());
+                if (_recording) {
+                  _recording = false;
+                  unawaited(VoiceRecorder.stop(cancel: true));
+                }
+                unawaited(_interruptPlayback());
+                setState(() => _phase = VoiceUiPhase.inCall);
+              } else if (_inCall && _ready && !_busyTurn) {
+                unawaited(_startListenLoop());
+              }
             },
           ),
-          _HangupBtn(onTap: () => Navigator.pop(context)),
+          _HangupBtn(onTap: () => unawaited(_hangup())),
           _CtrlBtn(
             icon: _speakerOn ? Icons.volume_up_rounded : Icons.phone_in_talk_rounded,
             label: _speakerOn ? '外放' : '听筒',
@@ -524,7 +865,7 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
             onTap: () {
               HapticFeedback.selectionClick();
               setState(() => _speakerOn = !_speakerOn);
-              // TODO: AEC via AVAudioSession.voiceChat / AcousticEchoCanceler
+              unawaited(AppAudio.ensureConfigured());
             },
           ),
         ],
@@ -569,7 +910,6 @@ class _VoiceBackdrop extends StatelessWidget {
               left: -40,
               child: _GlowBlob(color: const Color(0xFF6366F1).withValues(alpha: 0.12), size: 180),
             ),
-            // 轻微磨砂感
             BackdropFilter(
               filter: ImageFilter.blur(sigmaX: 0.2, sigmaY: 0.2),
               child: const SizedBox.expand(),
@@ -628,13 +968,11 @@ class _OrbPainter extends CustomPainter {
       canvas.drawCircle(c, ringR, p);
     }
 
-    // 波形环
     final wave = Path();
     const n = 64;
     for (var i = 0; i <= n; i++) {
       final a = (i / n) * math.pi * 2;
-      final wobble = math.sin(a * 5 + t * math.pi * 2) * amp * 10
-          + math.sin(a * 3 - t * math.pi * 4) * amp * 5;
+      final wobble = math.sin(a * 5 + t * math.pi * 2) * amp * 10 + math.sin(a * 3 - t * math.pi * 4) * amp * 5;
       final rr = r + 28 + wobble;
       final x = c.dx + math.cos(a) * rr;
       final y = c.dy + math.sin(a) * rr;
@@ -663,7 +1001,6 @@ class _OrbPainter extends CustomPainter {
         stops: const [0.0, 0.45, 1.0],
       ).createShader(Rect.fromCircle(center: c, radius: r));
     canvas.drawCircle(c, r, core);
-
     canvas.drawCircle(
       c,
       r,
@@ -677,38 +1014,6 @@ class _OrbPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _OrbPainter old) =>
       old.accent != accent || old.breath != breath || old.amp != amp || old.phase != phase || old.t != t;
-}
-
-class _BlinkCaret extends StatefulWidget {
-  const _BlinkCaret({required this.color});
-  final Color color;
-
-  @override
-  State<_BlinkCaret> createState() => _BlinkCaretState();
-}
-
-class _BlinkCaretState extends State<_BlinkCaret> with SingleTickerProviderStateMixin {
-  late final AnimationController _c;
-
-  @override
-  void initState() {
-    super.initState();
-    _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 550))..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: _c,
-      child: Container(width: 2, height: 14, color: widget.color),
-    );
-  }
 }
 
 class _TopIconBtn extends StatelessWidget {

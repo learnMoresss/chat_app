@@ -161,6 +161,18 @@ def update_channel(
     return _out(row, user["id"], reveal=True)
 
 
+def _upstream_model_id(model: str) -> str:
+    """渠道 model 可能是 `provider/model`（给 DSH 路由用）；直连 OpenAI 兼容口时只传右侧 model id。"""
+    s = (model or "").strip()
+    if "/" in s:
+        left, right = s.split("/", 1)
+        left, right = left.strip(), right.strip()
+        # 仅剥离已知 DSH provider 前缀，避免误伤带斜杠的官方 id
+        if left in ("daycard-deepseek", "local-qwen", "deepseek-official") and right:
+            return right
+    return s
+
+
 @router.post("/{channel_id}/probe")
 def probe_channel(channel_id: str, user: Dict[str, Any] = Depends(current_user)) -> dict:
     """发一条最短 chat/completions，显示耗时与报错原文。"""
@@ -177,7 +189,7 @@ def probe_channel(channel_id: str, user: Dict[str, Any] = Depends(current_user))
         return {"ok": False, "ms": 0, "error": f"Key 解密失败: {e}"}
     url = f"{normalize_base(row['base_url'])}/chat/completions"
     body = {
-        "model": row["model"],
+        "model": _upstream_model_id(row["model"]),
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 1,
         "stream": False,
@@ -219,7 +231,10 @@ def delete_channel(channel_id: str, user: Dict[str, Any] = Depends(current_user)
 
 
 def resolve_channel_for_persona(user_id: str, channel_id: str):
-    """返回渠道行；无 Key 时返回 None。"""
+    """返回渠道行；无 Key 时返回 None。
+
+    未指定人设渠道时：优先日卡（8888ok / 名称含日卡），避免误落到官方订阅。
+    """
     if channel_id:
         row = db.fetchone(
             "SELECT * FROM channels WHERE id = ? AND (user_id IS NULL OR user_id = ?)",
@@ -227,12 +242,18 @@ def resolve_channel_for_persona(user_id: str, channel_id: str):
         )
         if row and row["key_enc"]:
             return row
-    # 回退：用户私有已填 Key → 公共已填 Key
+    # 回退：用户私有已填 Key → 公共已填 Key（日卡优先）
     row = db.fetchone(
         """
         SELECT * FROM channels
         WHERE user_id = ? AND key_enc != ''
-        ORDER BY created_at LIMIT 1
+        ORDER BY
+          CASE
+            WHEN lower(base_url) LIKE '%8888ok%' OR name LIKE '%日卡%' THEN 0
+            ELSE 1
+          END,
+          created_at
+        LIMIT 1
         """,
         (user_id,),
     )
@@ -242,6 +263,12 @@ def resolve_channel_for_persona(user_id: str, channel_id: str):
         """
         SELECT * FROM channels
         WHERE user_id IS NULL AND key_enc != ''
-        ORDER BY created_at LIMIT 1
+        ORDER BY
+          CASE
+            WHEN lower(base_url) LIKE '%8888ok%' OR name LIKE '%日卡%' THEN 0
+            ELSE 1
+          END,
+          created_at
+        LIMIT 1
         """
     )

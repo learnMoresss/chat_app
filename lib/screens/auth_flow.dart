@@ -224,7 +224,7 @@ class WelcomePage extends StatelessWidget {
                 ),
                 const SizedBox(height: 28),
                 const Text(
-                  '未读',
+                  '幻信',
                   style: TextStyle(
                     fontSize: 36,
                     height: 1.1,

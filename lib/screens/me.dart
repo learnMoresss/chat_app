@@ -330,7 +330,7 @@ class SettingsPage extends StatelessWidget {
                 ArrowTile(title: '聊天记录备份', subtitle: '入口已留'),
               ]),
               Section(children: [
-                ArrowTile(title: '关于未读', subtitle: '私域对话 · 人设与记忆'),
+                ArrowTile(title: '关于幻信', subtitle: '私域对话 · 人设与记忆'),
               ]),
               Section(children: [
                 ListTile(

@@ -30,23 +30,34 @@ export function openProductDb() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_dsh_session_id
       ON dsh_session_map(dsh_session_id);
   `)
+  // provider/model：跨 harness 池恢复会话
+  const cols = db.prepare(`PRAGMA table_info(dsh_session_map)`).all().map((c) => c.name)
+  if (!cols.includes('provider')) {
+    db.exec(`ALTER TABLE dsh_session_map ADD COLUMN provider TEXT NOT NULL DEFAULT ''`)
+  }
+  if (!cols.includes('model')) {
+    db.exec(`ALTER TABLE dsh_session_map ADD COLUMN model TEXT NOT NULL DEFAULT ''`)
+  }
   return db
 }
 
 export function getMappedSession(db, userId, conversationId) {
   return db.prepare(
-    `SELECT dsh_session_id AS dshSessionId, updated_at AS updatedAt
+    `SELECT dsh_session_id AS dshSessionId, updated_at AS updatedAt,
+            COALESCE(provider,'') AS provider, COALESCE(model,'') AS model
      FROM dsh_session_map
      WHERE product_user_id = ? AND product_conversation_id = ?`,
   ).get(userId, conversationId)
 }
 
-export function upsertMappedSession(db, userId, conversationId, dshSessionId) {
+export function upsertMappedSession(db, userId, conversationId, dshSessionId, provider = '', model = '') {
   db.prepare(
-    `INSERT INTO dsh_session_map(product_user_id, product_conversation_id, dsh_session_id, updated_at)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO dsh_session_map(product_user_id, product_conversation_id, dsh_session_id, updated_at, provider, model)
+     VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(product_user_id, product_conversation_id) DO UPDATE SET
        dsh_session_id = excluded.dsh_session_id,
-       updated_at = excluded.updated_at`,
-  ).run(userId, conversationId, dshSessionId, Date.now())
+       updated_at = excluded.updated_at,
+       provider = excluded.provider,
+       model = excluded.model`,
+  ).run(userId, conversationId, dshSessionId, Date.now(), provider || '', model || '')
 }

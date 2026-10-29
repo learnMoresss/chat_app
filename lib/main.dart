@@ -39,7 +39,7 @@ class ChatApp extends StatelessWidget {
       child: MaterialApp(
         navigatorKey: ListenSessionController.instance.navigatorKey,
         debugShowCheckedModeBanner: false,
-        title: '未读',
+        title: '幻信',
         theme: appTheme(),
         home: const BootstrapPage(),
         // 听歌浮窗挂在根 Navigator 之上；同时监听 session，登录后/收起时都能刷出来

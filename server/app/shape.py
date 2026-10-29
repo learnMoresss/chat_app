@@ -372,36 +372,35 @@ def shape_inbound_user_text(text: str, *, kind: str = "text") -> str:
     return got or "[对方发来一条消息]"
 
 
-def split_reply_parts(text: str, *, max_parts: int = 3) -> List[str]:
-    """按句号/问号/叹号拆成 2–3 条；太短不拆。"""
+def split_reply_parts(text: str, *, max_parts: int = 2) -> List[str]:
+    """按句号/叹号拆成最多 2 段；问句并入前一段；全文 <40 字不拆。"""
     raw = (text or "").strip()
     if not raw or max_parts < 2:
         return [raw] if raw else []
+    if len(raw) < 40:
+        return [raw]
     # 保留分隔符
     chunks = re.split(r"(?<=[。！？!?])\s*", raw)
     chunks = [c.strip() for c in chunks if c and c.strip()]
     if len(chunks) <= 1:
         return [raw]
-    # 合并过短片段
-    merged: List[str] = []
-    buf = ""
+    # 问句并入前一段，避免单独一条反问气泡
+    glued: List[str] = []
     for c in chunks:
-        if not buf:
-            buf = c
-        elif len(buf) < 12:
-            buf = buf + c
+        if glued and c.endswith(("?", "？")):
+            glued[-1] = glued[-1] + c
+        elif not glued:
+            glued.append(c)
+        elif len(glued[-1]) < 12:
+            glued[-1] = glued[-1] + c
         else:
-            merged.append(buf)
-            buf = c
-    if buf:
-        merged.append(buf)
-    if len(merged) <= 1:
+            glued.append(c)
+    if len(glued) <= 1:
         return [raw]
-    if len(merged) <= max_parts:
-        return merged
-    # 超出则把尾部并进最后一段
-    head = merged[: max_parts - 1]
-    tail = "".join(merged[max_parts - 1 :])
+    if len(glued) <= max_parts:
+        return glued
+    head = glued[: max_parts - 1]
+    tail = "".join(glued[max_parts - 1 :])
     return head + [tail]
 
 

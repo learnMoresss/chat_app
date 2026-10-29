@@ -42,6 +42,8 @@ def _payload(
     history: Optional[List[Dict[str, str]]] = None,
     mode: str = "chat",
     persona_id: str = "",
+    provider: str = "",
+    model: str = "",
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "userId": user_id,
@@ -57,6 +59,10 @@ def _payload(
         payload["history"] = history
     if (persona_id or "").strip():
         payload["personaId"] = persona_id.strip()
+    if (provider or "").strip():
+        payload["provider"] = provider.strip()
+    if (model or "").strip():
+        payload["model"] = model.strip()
     return payload
 
 
@@ -70,6 +76,8 @@ async def dsh_turn(
     history: Optional[List[Dict[str, str]]] = None,
     mode: str = "chat",
     persona_id: str = "",
+    provider: str = "",
+    model: str = "",
 ) -> Dict[str, Any]:
     require_dsh()
     s = get_settings()
@@ -87,6 +95,8 @@ async def dsh_turn(
                 history=history,
                 mode=mode,
                 persona_id=persona_id,
+                provider=provider,
+                model=model,
             ),
             headers=_headers(),
         )
@@ -123,6 +133,8 @@ async def dsh_complete(
     instructions: str = "",
     history: Optional[List[Dict[str, str]]] = None,
     persona_id: str = "",
+    provider: str = "",
+    model: str = "",
 ) -> str:
     data = await dsh_turn(
         user_id=user_id,
@@ -132,6 +144,8 @@ async def dsh_complete(
         instructions=instructions,
         history=history,
         persona_id=persona_id,
+        provider=provider,
+        model=model,
     )
     return str(data.get("finalResponse") or "").strip()
 
@@ -146,6 +160,8 @@ async def dsh_turn_stream(
     history: Optional[List[Dict[str, str]]] = None,
     mode: str = "chat",
     persona_id: str = "",
+    provider: str = "",
+    model: str = "",
 ) -> AsyncIterator[Dict[str, Any]]:
     require_dsh()
     s = get_settings()
@@ -164,6 +180,8 @@ async def dsh_turn_stream(
                 history=history,
                 mode=mode,
                 persona_id=persona_id,
+                provider=provider,
+                model=model,
             ),
             headers=_headers(),
         ) as resp:

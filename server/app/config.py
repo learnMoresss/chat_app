@@ -26,9 +26,11 @@ class Settings(BaseSettings):
     image_gen_comfy_url: str = "http://127.0.0.1:8188"
     image_gen_qwen_url: str = "http://127.0.0.1:8091"
     image_gen_timeout_seconds: float = 180.0
-    # 音色抽卡默认：真实 Breeze TTS 2（github.com/breezeblue-ai/breeze-tts）
+    # 音色抽卡 / 普通说话默认引擎
     tts_speech_url: str = "http://127.0.0.1:8883"
-    tts_engine: str = "breeze"  # breeze | voicedesign
+    tts_engine: str = "breeze"  # breeze | voicedesign | cosyvoice
+    # 实时语音半双工：默认 CosyVoice 3（固定参考声线，RTF 更适合边听边播）
+    tts_realtime_engine: str = "cosyvoice"  # cosyvoice | breeze | voicedesign
     # Qwen3-TTS VoiceDesign（旧后端，可作回退）
     tts_voicedesign_url: str = "http://127.0.0.1:8882"
     # 固定音色 CustomVoice（按需启动，默认 8881）
@@ -47,9 +49,16 @@ class Settings(BaseSettings):
     asr_timeout_seconds: float = 120.0
     asr_whisper_python: str = ""
     asr_whisper_model: str = "medium"
-    # 入站识图：本机 PaddleOCR（文字+坐标）；空则仅启发式。不用 VL。
+    # 入站识图/文档：优先本机 Unlimited-OCR（vLLM）；不可用时回落 Paddle/Rapid。
     ocr_base_url: str = "http://127.0.0.1:9899"
     ocr_timeout_seconds: float = 30.0
+    unlimited_ocr_base_url: str = "http://127.0.0.1:9898/v1"
+    unlimited_ocr_model: str = "baidu/Unlimited-OCR"
+    unlimited_ocr_timeout_seconds: float = 180.0
+    # 兼容旧 .env（忽略）
+    baidu_ocr_api_key: str = ""
+    baidu_ocr_secret_key: str = ""
+    baidu_ocr_timeout_seconds: float = 120.0
     # 旧 VL 配置保留字段以免 .env 报错，代码不再使用
     vision_chat_url: str = ""
     vision_api_token: str = ""
