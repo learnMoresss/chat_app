@@ -463,6 +463,23 @@ class ApiClient {
     return u.contains('119.45.30.73') || u.contains('/chat-api');
   }
 
+  Future<bool> _publicStagingAlive() async {
+    final io = _uploadHttpClient();
+    final client = IOClient(io);
+    try {
+      final res = await client
+          .get(Uri.parse('$publicStagingBase/health'))
+          .timeout(const Duration(seconds: 4));
+      return res.statusCode == 200 && res.body.contains('chat-upload-staging');
+    } catch (_) {
+      return false;
+    } finally {
+      try {
+        client.close();
+      } catch (_) {}
+    }
+  }
+
   HttpClient _uploadHttpClient() {
     return HttpClient()
       ..connectionTimeout = const Duration(seconds: 30)
@@ -486,9 +503,10 @@ class ApiClient {
       throw ApiException('未登录', statusCode: 401, authNoise: true);
     }
     Object? last;
+    final useStaging = _preferPublicStaging && await _publicStagingAlive();
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
-        if (_preferPublicStaging) {
+        if (useStaging) {
           try {
             return await _uploadViaPublicStaging(
               bytes: bytes,
@@ -499,21 +517,16 @@ class ApiClient {
               timeout: timeout,
             );
           } on ApiException catch (e) {
-            // 跳板未部署 → 本轮改直传；其它错误交给重试逻辑
-            if (e.statusCode == 404 ||
-                e.statusCode == 502 ||
-                e.statusCode == 503 ||
-                e.message.contains('跳板')) {
-              return await _uploadDirectChat(
-                bytes: bytes,
-                filename: filename,
-                kind: kind,
-                contentType: contentType,
-                allowAuthRetry: allowAuthRetry,
-                timeout: timeout,
-              );
-            }
-            rethrow;
+            // 跳板异常 → 本轮改直传（隧道路径）
+            if (e.statusCode == 408 || e.message.contains('超时')) rethrow;
+            return await _uploadDirectChat(
+              bytes: bytes,
+              filename: filename,
+              kind: kind,
+              contentType: contentType,
+              allowAuthRetry: allowAuthRetry,
+              timeout: timeout,
+            );
           }
         }
         return await _uploadDirectChat(
