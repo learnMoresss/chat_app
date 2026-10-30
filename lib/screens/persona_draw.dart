@@ -7,17 +7,25 @@ import 'package:flutter/material.dart';
 import '../api/api_client.dart';
 import '../media/app_audio.dart';
 import '../media/auth_image.dart';
+import '../media/media_pick.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../widgets.dart';
 import 'fullscreen_images.dart';
 
-/// 人设抽卡：音色 / 形象。多抽时先出 N 条 loading，出一条就能听/看。
+/// 人设音色 / 形象：每次生成一条，要换就改提示词再生成。
 class PersonaDrawPage extends StatefulWidget {
-  const PersonaDrawPage({super.key, required this.store, required this.persona});
+  const PersonaDrawPage({
+    super.key,
+    required this.store,
+    required this.persona,
+    this.initialTab = 0,
+  });
   final AppStore store;
   final Persona persona;
+  /// 0=音色，1=形象
+  final int initialTab;
 
   @override
   State<PersonaDrawPage> createState() => _PersonaDrawPageState();
@@ -26,16 +34,17 @@ class PersonaDrawPage extends StatefulWidget {
 class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProviderStateMixin {
   late final TabController _tabs;
   final _voicePrompt = TextEditingController(text: '温柔、轻快、略带笑意的年轻女声');
-  final _voiceSample = TextEditingController(text: '你好呀，我是你的专属陪伴，今天想听我说点什么？');
+  // 试听文案尽量短：抽卡主要听音色；服务端走常驻 CosyVoice（热态约数秒）
+  final _voiceSample = TextEditingController(text: '你好呀，今天过得怎么样？');
+  var _voiceWarming = false;
+  var _voiceWarmOk = false;
   final _imagePrompt = TextEditingController(
-    text: '单人半身肖像，只有一个人，禁止拼贴多人，自然光，干净背景，动漫风格',
+    text: 'solo upper body, anime style, soft natural light, clean background',
   );
-  int _voiceCount = 3;
-  int _imageCount = 3;
-  /// 默认开启：抽卡锚定人设（性别/简介），形象抽「长什么样」。
-  bool _refPersona = true;
   bool _drawingVoice = false;
   bool _drawingImage = false;
+  bool _uploadingVoice = false;
+  bool _uploadingImage = false;
   String? _err;
   final List<Map<String, dynamic>> _voices = [];
   final List<Map<String, dynamic>> _images = [];
@@ -43,15 +52,37 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
   String? _playingId;
   /// 点击后、字节到位前：按钮立刻转圈，避免「点了没反应」。
   String? _loadingPlayId;
+  final _voiceListKey = GlobalKey();
+  final _imageListKey = GlobalKey();
 
   ApiClient? get _api => widget.store.api;
 
   @override
   void initState() {
     super.initState();
-    _tabs = TabController(length: 2, vsync: this);
+    final tab = widget.initialTab.clamp(0, 1);
+    _tabs = TabController(length: 2, vsync: this, initialIndex: tab);
     AppAudio.ensureConfigured();
     _load();
+    unawaited(_warmVoice());
+  }
+
+  Future<void> _warmVoice() async {
+    final api = _api;
+    if (api == null || _voiceWarming) return;
+    setState(() {
+      _voiceWarming = true;
+    });
+    try {
+      final info = await api.warmPersonaVoice(widget.persona.id);
+      if (!mounted) return;
+      setState(() => _voiceWarmOk = info['ok'] == true);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _voiceWarmOk = false);
+    } finally {
+      if (mounted) setState(() => _voiceWarming = false);
+    }
   }
 
   @override
@@ -137,45 +168,45 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
       setState(() => _err = '请填写音色描述');
       return;
     }
-    final n = _voiceCount;
+    // 先等预热：冷启在 warm 阶段做完，抽卡请求只付合成时间
+    if (!_voiceWarmOk) {
+      await _warmVoice();
+      if (!mounted) return;
+    }
     final sample = _voiceSample.text.trim();
     final batchId = 'v_${DateTime.now().microsecondsSinceEpoch}';
-    final slots = List.generate(
-      n,
-      (i) => _placeholder(kind: 'voice', prompt: prompt, index: i, total: n),
-    );
+    final slot = _placeholder(kind: 'voice', prompt: prompt, index: 0, total: 1);
     setState(() {
       _drawingVoice = true;
       _err = null;
-      _voices.insertAll(0, slots);
+      _voices.insert(0, slot);
     });
     _tabs.animateTo(0);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _voiceListKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 280), alignment: 0.05);
+      }
+    });
 
-    for (var i = 0; i < n; i++) {
-      final slotId = slots[i]['id'] as String;
-      try {
-        final items = await api.drawPersonaVoice(
-          widget.persona.id,
-          prompt: prompt,
-          count: 1,
-          sampleText: sample,
-          batchId: batchId,
-          slotIndex: i,
-          refPersona: _refPersona,
-        );
-        if (!mounted) return;
-        if (items.isEmpty) {
-          setState(() {
-            final idx = _voices.indexWhere((a) => a['id'] == slotId);
-            if (idx >= 0) {
-              _voices[idx] = {..._voices[idx], '_pending': false, '_failed': true};
-            }
-          });
-          continue;
-        }
+    try {
+      final items = await api
+          .drawPersonaVoice(
+            widget.persona.id,
+            prompt: prompt,
+            count: 1,
+            sampleText: sample,
+            batchId: batchId,
+            slotIndex: 0,
+            refPersona: false,
+          )
+          .timeout(const Duration(seconds: 90));
+      if (!mounted) return;
+      final slotId = slot['id'] as String;
+      final idx = _voices.indexWhere((a) => a['id'] == slotId);
+      if (items.isNotEmpty) {
         final done = Map<String, dynamic>.from(items.first as Map);
         setState(() {
-          final idx = _voices.indexWhere((a) => a['id'] == slotId);
           if (idx >= 0) {
             _voices[idx] = done;
           } else {
@@ -183,21 +214,28 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
           }
         });
         unawaited(_prefetchVoice(done));
-      } catch (e) {
-        if (!mounted) return;
+      } else {
         setState(() {
-          final idx = _voices.indexWhere((a) => a['id'] == slotId);
           if (idx >= 0) {
-            _voices[idx] = {
-              ..._voices[idx],
-              '_pending': false,
-              '_failed': true,
-              '_error': '$e',
-            };
+            _voices[idx] = {..._voices[idx], '_pending': false, '_failed': true};
           }
-          _err = '$e';
+          _err = '音色生成失败，请稍后重试';
         });
       }
+    } catch (e) {
+      if (!mounted) return;
+      final idx = _voices.indexWhere((a) => a['id'] == slot['id']);
+      setState(() {
+        if (idx >= 0 && _voices[idx]['_pending'] == true) {
+          _voices[idx] = {
+            ..._voices[idx],
+            '_pending': false,
+            '_failed': true,
+            '_error': '$e',
+          };
+        }
+        _err = '$e';
+      });
     }
     if (mounted) setState(() => _drawingVoice = false);
   }
@@ -210,69 +248,167 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
       setState(() => _err = '请填写形象提示词');
       return;
     }
-    final n = _imageCount;
     final batchId = 'i_${DateTime.now().microsecondsSinceEpoch}';
-    final slots = List.generate(
-      n,
-      (i) => _placeholder(kind: 'image', prompt: prompt, index: i, total: n),
-    );
+    final slot = _placeholder(kind: 'image', prompt: prompt, index: 0, total: 1);
     setState(() {
       _drawingImage = true;
       _err = null;
-      _images.insertAll(0, slots);
+      _images.insert(0, slot);
     });
     _tabs.animateTo(1);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _imageListKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 280), alignment: 0.05);
+      }
+    });
 
-    for (var i = 0; i < n; i++) {
-      final slotId = slots[i]['id'] as String;
-      try {
-        final items = await api.drawPersonaImage(
-          widget.persona.id,
-          prompt: prompt,
-          count: 1,
-          batchId: batchId,
-          slotIndex: i,
-          refPersona: _refPersona,
-        );
-        if (!mounted) return;
-        if (items.isEmpty) {
-          setState(() {
-            final idx = _images.indexWhere((a) => a['id'] == slotId);
-            if (idx >= 0) {
-              _images[idx] = {..._images[idx], '_pending': false, '_failed': true};
-            }
-          });
-          continue;
-        }
+    final slotId = slot['id'] as String;
+    try {
+      final items = await api
+          .drawPersonaImage(
+            widget.persona.id,
+            prompt: prompt,
+            count: 1,
+            batchId: batchId,
+            slotIndex: 0,
+            refPersona: false,
+          )
+          .timeout(const Duration(seconds: 120));
+      if (!mounted) return;
+      final idx = _images.indexWhere((a) => a['id'] == slotId);
+      if (items.isEmpty) {
+        setState(() {
+          if (idx >= 0) {
+            _images[idx] = {..._images[idx], '_pending': false, '_failed': true};
+          }
+          _err = '形象生成失败，请稍后重试';
+        });
+      } else {
         final done = Map<String, dynamic>.from(items.first as Map);
         setState(() {
-          final idx = _images.indexWhere((a) => a['id'] == slotId);
           if (idx >= 0) {
             _images[idx] = done;
           } else {
             _images.insert(0, done);
           }
         });
-        // 预热图缓存，格子里尽快出图
         final fid = done['file_id'] as String? ?? '';
         if (fid.isNotEmpty) unawaited(AuthImageCache.load(api, fid));
-      } catch (e) {
-        if (!mounted) return;
-        setState(() {
-          final idx = _images.indexWhere((a) => a['id'] == slotId);
-          if (idx >= 0) {
-            _images[idx] = {
-              ..._images[idx],
-              '_pending': false,
-              '_failed': true,
-              '_error': '$e',
-            };
-          }
-          _err = '$e';
-        });
       }
+    } catch (e) {
+      if (!mounted) return;
+      final idx = _images.indexWhere((a) => a['id'] == slotId);
+      setState(() {
+        if (idx >= 0) {
+          _images[idx] = {
+            ..._images[idx],
+            '_pending': false,
+            '_failed': true,
+            '_error': '$e',
+          };
+        }
+        _err = '$e';
+      });
     }
     if (mounted) setState(() => _drawingImage = false);
+  }
+
+  Future<void> _uploadVoice() async {
+    final api = _api;
+    if (api == null || _uploadingVoice || _drawingVoice) return;
+    StagedMedia? picked;
+    try {
+      picked = await MediaPick.pickAudio();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _err = '$e');
+      return;
+    }
+    if (picked == null || picked.bytes == null || picked.bytes!.isEmpty) return;
+    setState(() {
+      _uploadingVoice = true;
+      _err = null;
+    });
+    _tabs.animateTo(0);
+    try {
+      final up = await api.uploadChatMedia(
+        bytes: picked.bytes!,
+        filename: picked.name,
+        kind: 'file',
+        contentType: picked.contentType ?? 'audio/wav',
+        timeout: const Duration(seconds: 90),
+      );
+      final fid = (up['file_id'] as String? ?? '').trim();
+      if (fid.isEmpty) throw StateError('上传失败');
+      final label = _voicePrompt.text.trim();
+      final asset = await api.personaAssetFromMedia(
+        widget.persona.id,
+        kind: 'voice',
+        fileId: fid,
+        prompt: label.isEmpty ? '上传参考音色' : label,
+        sampleText: _voiceSample.text.trim(),
+      );
+      if (!mounted) return;
+      setState(() {
+        _voices.insert(0, Map<String, dynamic>.from(asset));
+      });
+      unawaited(_prefetchVoice(Map<String, dynamic>.from(asset)));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('已加入音色列表，点「固定」后才会用于聊天')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _err = '$e');
+    } finally {
+      if (mounted) setState(() => _uploadingVoice = false);
+    }
+  }
+
+  Future<void> _uploadImage() async {
+    final api = _api;
+    if (api == null || _uploadingImage || _drawingImage) return;
+    final picked = await MediaPick.pickSingleImage();
+    if (picked == null || picked.bytes == null || picked.bytes!.isEmpty) return;
+    setState(() {
+      _uploadingImage = true;
+      _err = null;
+    });
+    _tabs.animateTo(1);
+    try {
+      final up = await api.uploadChatMedia(
+        bytes: picked.bytes!,
+        filename: picked.name,
+        kind: 'image',
+        contentType: picked.contentType ?? 'image/jpeg',
+        timeout: const Duration(seconds: 60),
+      );
+      final fid = (up['file_id'] as String? ?? '').trim();
+      if (fid.isEmpty) throw StateError('上传失败');
+      final label = _imagePrompt.text.trim();
+      final asset = await api.personaAssetFromMedia(
+        widget.persona.id,
+        kind: 'image',
+        fileId: fid,
+        prompt: label.isEmpty ? '上传形象' : label,
+      );
+      if (!mounted) return;
+      setState(() {
+        _images.insert(0, Map<String, dynamic>.from(asset));
+      });
+      final outFid = (asset['file_id'] as String? ?? '').trim();
+      if (outFid.isNotEmpty) unawaited(AuthImageCache.load(api, outFid));
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('已加入形象列表，点「固定」后才能发自拍/出镜')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _err = '$e');
+    } finally {
+      if (mounted) setState(() => _uploadingImage = false);
+    }
   }
 
   Future<void> _fix(Map<String, dynamic> asset) async {
@@ -296,11 +432,7 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
             if (a['_pending'] == true) continue;
             _images[i] = {...a, 'fixed': a['id'] == id};
           }
-          final fid = fixed['file_id'] as String? ?? '';
-          if (fid.isNotEmpty) {
-            widget.persona.avatarFileId = fid;
-            widget.store.ping();
-          }
+          // 形象 ≠ 头像：固定 look 不改 avatarFileId
         }
       });
       if (mounted) {
@@ -452,7 +584,6 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
   @override
   Widget build(BuildContext context) {
     final p = widget.persona;
-    final drawing = _drawingVoice || _drawingImage;
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(
@@ -486,36 +617,35 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
                 ),
               ),
             ),
-          if (drawing) const LinearProgressIndicator(minHeight: 2, color: AppColors.green),
           Expanded(
             child: TabBarView(
               controller: _tabs,
               children: [
                 _VoiceTab(
+                  listKey: _voiceListKey,
                   prompt: _voicePrompt,
                   sample: _voiceSample,
-                  count: _voiceCount,
                   drawing: _drawingVoice,
+                  uploading: _uploadingVoice,
                   assets: _voices,
                   playingId: _playingId,
                   loadingPlayId: _loadingPlayId,
-                  onCount: (v) => setState(() => _voiceCount = v),
+                  warming: _voiceWarming,
                   onDraw: _drawVoice,
+                  onUpload: _uploadVoice,
                   onPlay: _playVoice,
                   onFix: _fix,
                   onDelete: _delete,
                 ),
                 _ImageTab(
+                  listKey: _imageListKey,
                   prompt: _imagePrompt,
-                  count: _imageCount,
                   drawing: _drawingImage,
+                  uploading: _uploadingImage,
                   assets: _images,
                   api: _api,
-                  refPersona: _refPersona,
-                  personaName: widget.persona.display,
-                  onCount: (v) => setState(() => _imageCount = v),
-                  onRefPersona: (v) => setState(() => _refPersona = v),
                   onDraw: _drawImage,
+                  onUpload: _uploadImage,
                   onFix: _fix,
                   onDelete: _delete,
                   onOpen: _openImages,
@@ -531,41 +661,48 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
 
 class _VoiceTab extends StatelessWidget {
   const _VoiceTab({
+    required this.listKey,
     required this.prompt,
     required this.sample,
-    required this.count,
     required this.drawing,
+    required this.uploading,
     required this.assets,
     required this.playingId,
     required this.loadingPlayId,
-    required this.onCount,
+    required this.warming,
     required this.onDraw,
+    required this.onUpload,
     required this.onPlay,
     required this.onFix,
     required this.onDelete,
   });
 
+  final Key listKey;
   final TextEditingController prompt;
   final TextEditingController sample;
-  final int count;
   final bool drawing;
+  final bool uploading;
   final List<Map<String, dynamic>> assets;
   final String? playingId;
   final String? loadingPlayId;
-  final ValueChanged<int> onCount;
+  final bool warming;
   final VoidCallback onDraw;
+  final VoidCallback onUpload;
   final Future<void> Function(Map<String, dynamic>) onPlay;
   final Future<void> Function(Map<String, dynamic>) onFix;
   final Future<void> Function(Map<String, dynamic>) onDelete;
 
   @override
   Widget build(BuildContext context) {
+    final busy = drawing || uploading || warming;
     return ListView(
-      padding: const EdgeInsets.fromLTRB(0, 12, 0, 32),
+      padding: const EdgeInsets.fromLTRB(0, 4, 0, 24),
       children: [
-        Section(children: [
+        Section(
+          margin: EdgeInsets.zero,
+          children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
             child: TextField(
               controller: prompt,
               maxLines: 2,
@@ -577,7 +714,7 @@ class _VoiceTab extends StatelessWidget {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
             child: TextField(
               controller: sample,
               maxLines: 2,
@@ -588,52 +725,92 @@ class _VoiceTab extends StatelessWidget {
               ),
             ),
           ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Text(
+              '上传推荐：8～20 秒清晰人声，单人说话、少背景音乐与混响；wav/mp3/m4a 均可。读几句自然口语最好。',
+              style: TextStyle(color: AppColors.sub, fontSize: 12, height: 1.35),
+            ),
+          ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
             child: Row(
               children: [
-                const Text('条数', style: TextStyle(color: AppColors.muted)),
-                const SizedBox(width: 12),
-                for (final n in [1, 2, 3, 4])
-                  Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: ChoiceChip(
-                      label: Text('$n'),
-                      selected: count == n,
-                      onSelected: drawing ? null : (_) => onCount(n),
+                Expanded(
+                  child: SizedBox(
+                    height: 44,
+                    child: FilledButton(
+                      onPressed: busy ? null : onDraw,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.green,
+                        disabledBackgroundColor: const Color(0xFFA8E0BF),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      child: drawing
+                          ? const Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                ),
+                                SizedBox(width: 8),
+                                Text('生成中', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                              ],
+                            )
+                          : const Text('生成', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                     ),
                   ),
-                const Spacer(),
-                FilledButton(
-                  onPressed: drawing ? null : onDraw,
-                  style: FilledButton.styleFrom(backgroundColor: AppColors.green),
-                  child: Text(drawing ? '生成中…' : '抽音色'),
+                ),
+                const SizedBox(width: 10),
+                SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: busy ? null : onUpload,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.green,
+                      side: const BorderSide(color: AppColors.green),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: uploading
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.green),
+                          )
+                        : const Text('上传', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                  ),
                 ),
               ],
             ),
           ),
         ]),
-        const SizedBox(height: 12),
+        const SizedBox(height: 6),
         if (assets.isEmpty)
           const Padding(
-            padding: EdgeInsets.all(24),
-            child: Center(child: Text('还没有音色候选', style: TextStyle(color: AppColors.muted))),
+            padding: EdgeInsets.fromLTRB(16, 12, 16, 12),
+            child: Center(child: Text('还没有音色，可生成或上传一条', style: TextStyle(color: AppColors.muted))),
           )
         else
-          Section(
-            children: [
-              for (var i = 0; i < assets.length; i++) ...[
-                if (i > 0) const Divider(height: 1, indent: 16),
-                _VoiceTile(
-                  asset: assets[i],
-                  playing: playingId == (assets[i]['id'] as String?),
-                  loading: loadingPlayId == (assets[i]['id'] as String?),
-                  onPlay: () => onPlay(assets[i]),
-                  onFix: () => onFix(assets[i]),
-                  onDelete: () => onDelete(assets[i]),
-                ),
+          KeyedSubtree(
+            key: listKey,
+            child: Section(
+              margin: EdgeInsets.zero,
+              children: [
+                for (var i = 0; i < assets.length; i++) ...[
+                  if (i > 0) const Divider(height: 1, indent: 16),
+                  _VoiceTile(
+                    asset: assets[i],
+                    playing: playingId == (assets[i]['id'] as String?),
+                    loading: loadingPlayId == (assets[i]['id'] as String?),
+                    onPlay: () => onPlay(assets[i]),
+                    onFix: () => onFix(assets[i]),
+                    onDelete: () => onDelete(assets[i]),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
       ],
     );
@@ -656,24 +833,11 @@ class _VoiceTile extends StatelessWidget {
   final VoidCallback onFix;
   final VoidCallback onDelete;
 
-  Map<String, dynamic> get _meta {
-    final m = asset['meta'];
-    if (m is Map) return Map<String, dynamic>.from(m);
-    return const {};
-  }
-
-  /// 标题：本条音色特色，不再重复用户输入的总描述。
+  /// 标题：用户提示词（不再展示变体抽取文案）。
   String get _featureTitle {
-    final meta = _meta;
-    final desc = (meta['variant_desc'] as String?)?.trim() ?? '';
-    if (desc.isNotEmpty) return desc;
-    final label = (meta['variant'] as String?)?.trim() ?? '';
-    final extra = (meta['variant_extra'] as String?)?.trim() ?? '';
-    if (label.isNotEmpty && extra.isNotEmpty) return '$label：$extra';
-    if (label.isNotEmpty) return label;
-    final slot = asset['_slot'];
-    if (slot is int) return '音色候选 $slot';
-    return '音色候选';
+    final prompt = (asset['prompt'] as String?)?.trim() ?? '';
+    if (prompt.isNotEmpty) return prompt;
+    return '音色';
   }
 
   @override
@@ -681,8 +845,6 @@ class _VoiceTile extends StatelessWidget {
     final pending = asset['_pending'] == true;
     final failed = asset['_failed'] == true;
     final fixed = asset['fixed'] == true;
-    final slot = asset['_slot'];
-    final total = asset['_total'];
     Widget leading;
     if (pending) {
       leading = const SizedBox(
@@ -714,160 +876,214 @@ class _VoiceTile extends StatelessWidget {
         onPressed: onPlay,
       );
     }
-    final subtitle = pending
-        ? '出炉后可立即试听'
+    final statusLine = pending
+        ? '生成中…'
         : failed
             ? (asset['_error'] as String? ?? '请重试')
             : loading
-                ? '加载音频中…'
+                ? '加载中…'
                 : playing
-                    ? '播放中 · 再点停止'
-                    : (fixed ? '已固定 · 通话将用此音色' : '点播放试听 · 点固定用于通话');
+                    ? '播放中'
+                    : (fixed ? '已固定' : null);
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
       leading: leading,
       title: Text(
         pending
-            ? (slot is int && total is int ? '正在生成 $slot/$total…' : '正在生成…')
+            ? '正在生成…'
             : (failed ? '生成失败' : _featureTitle),
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(fontSize: 15, height: 1.25),
       ),
-      subtitle: Text(subtitle, style: const TextStyle(fontSize: 12)),
-      trailing: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (!pending && !failed)
-            TextButton(
-              onPressed: fixed ? null : onFix,
-              child: Text(fixed ? '已固定' : '固定', style: TextStyle(color: fixed ? AppColors.muted : AppColors.green)),
+      subtitle: statusLine == null
+          ? null
+          : Text(statusLine, style: const TextStyle(fontSize: 12, color: AppColors.sub), maxLines: 1, overflow: TextOverflow.ellipsis),
+      trailing: pending || failed
+          ? IconButton(
+              tooltip: '移除',
+              icon: const Icon(Icons.close, size: 20, color: AppColors.muted),
+              onPressed: onDelete,
+            )
+          : Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextButton(
+                  onPressed: fixed ? null : onFix,
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size(52, 36),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: Text(
+                    fixed ? '已固定' : '固定',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: fixed ? AppColors.muted : AppColors.green,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '删除',
+                  icon: const Icon(Icons.delete_outline, size: 20, color: Color(0xFF888888)),
+                  onPressed: onDelete,
+                ),
+              ],
             ),
-          IconButton(icon: const Icon(Icons.delete_outline, size: 20), onPressed: onDelete),
-        ],
-      ),
     );
   }
 }
 
 class _ImageTab extends StatelessWidget {
   const _ImageTab({
+    required this.listKey,
     required this.prompt,
-    required this.count,
     required this.drawing,
+    required this.uploading,
     required this.assets,
     required this.api,
-    required this.refPersona,
-    required this.personaName,
-    required this.onCount,
-    required this.onRefPersona,
     required this.onDraw,
+    required this.onUpload,
     required this.onFix,
     required this.onDelete,
     required this.onOpen,
   });
 
+  final Key listKey;
   final TextEditingController prompt;
-  final int count;
   final bool drawing;
+  final bool uploading;
   final List<Map<String, dynamic>> assets;
   final ApiClient? api;
-  final bool refPersona;
-  final String personaName;
-  final ValueChanged<int> onCount;
-  final ValueChanged<bool> onRefPersona;
   final VoidCallback onDraw;
+  final VoidCallback onUpload;
   final Future<void> Function(Map<String, dynamic>) onFix;
   final Future<void> Function(Map<String, dynamic>) onDelete;
   final ValueChanged<int> onOpen;
 
   @override
   Widget build(BuildContext context) {
+    final busy = drawing || uploading;
     return ListView(
-      padding: const EdgeInsets.fromLTRB(0, 12, 0, 32),
+      padding: const EdgeInsets.fromLTRB(0, 4, 0, 24),
       children: [
-        Section(children: [
+        Section(
+          margin: EdgeInsets.zero,
+          children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
             child: TextField(
               controller: prompt,
               maxLines: 3,
               decoration: const InputDecoration(
-                labelText: '形象提示词（默认单人半身，禁止拼贴多人）',
+                labelText: '形象提示词',
                 border: OutlineInputBorder(),
                 isDense: true,
               ),
             ),
           ),
-          SwitchListTile(
-            contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-            title: const Text('参考人设', style: TextStyle(fontSize: 15)),
-            subtitle: Text(
-              refPersona
-                  ? '锚定「$personaName」性别与简介，抽不同长相方案'
-                  : '关闭后仅按提示词，可能跑偏性别',
-              style: const TextStyle(fontSize: 12, color: AppColors.muted),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Text(
+              '上传推荐：单人正面或半身、脸清晰、背景干净；竖图约 3:4 更好。不要九宫格/拼贴/多人合影，画风尽量和人设一致。',
+              style: TextStyle(color: AppColors.sub, fontSize: 12, height: 1.35),
             ),
-            value: refPersona,
-            activeThumbColor: AppColors.green,
-            onChanged: drawing ? null : onRefPersona,
           ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
             child: Row(
               children: [
-                const Text('张数', style: TextStyle(color: AppColors.muted)),
-                const SizedBox(width: 12),
-                for (final n in [1, 2, 3, 4])
-                  Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: ChoiceChip(
-                      label: Text('$n'),
-                      selected: count == n,
-                      onSelected: drawing ? null : (_) => onCount(n),
+                Expanded(
+                  child: SizedBox(
+                    height: 44,
+                    child: FilledButton(
+                      onPressed: busy ? null : onDraw,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.green,
+                        disabledBackgroundColor: const Color(0xFFA8E0BF),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      child: drawing
+                          ? const Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                ),
+                                SizedBox(width: 8),
+                                Text('生成中', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                              ],
+                            )
+                          : const Text('生成', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                     ),
                   ),
-                const Spacer(),
-                FilledButton(
-                  onPressed: drawing ? null : onDraw,
-                  style: FilledButton.styleFrom(backgroundColor: AppColors.green),
-                  child: Text(drawing ? '生成中…' : '抽形象'),
+                ),
+                const SizedBox(width: 10),
+                SizedBox(
+                  height: 44,
+                  child: OutlinedButton(
+                    onPressed: busy ? null : onUpload,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.green,
+                      side: const BorderSide(color: AppColors.green),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: uploading
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.green),
+                          )
+                        : const Text('上传', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                  ),
                 ),
               ],
             ),
           ),
         ]),
-        const SizedBox(height: 12),
+        const SizedBox(height: 6),
         if (assets.isEmpty)
           const Padding(
-            padding: EdgeInsets.all(24),
-            child: Center(child: Text('还没有形象候选', style: TextStyle(color: AppColors.muted))),
+            padding: EdgeInsets.fromLTRB(16, 12, 16, 12),
+            child: Center(
+              child: Text(
+                '还没有形象。生成或上传后点「固定」，聊天里才能发自拍/出镜。',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.muted, height: 1.35),
+              ),
+            ),
           )
         else
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-            child: LayoutBuilder(
-              builder: (context, c) {
-                const gap = 10.0;
-                final cell = (c.maxWidth - gap) / 2;
-                return Wrap(
-                  spacing: gap,
-                  runSpacing: gap + 4,
-                  children: [
-                    for (var i = 0; i < assets.length; i++)
-                      SizedBox(
-                        width: cell,
-                        child: _ImageCard(
-                          asset: assets[i],
-                          api: api,
-                          onFix: () => onFix(assets[i]),
-                          onDelete: () => onDelete(assets[i]),
-                          onTap: () => onOpen(i),
+          KeyedSubtree(
+            key: listKey,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: LayoutBuilder(
+                builder: (context, c) {
+                  const gap = 10.0;
+                  final cell = (c.maxWidth - gap) / 2;
+                  return Wrap(
+                    spacing: gap,
+                    runSpacing: gap + 4,
+                    children: [
+                      for (var i = 0; i < assets.length; i++)
+                        SizedBox(
+                          width: cell,
+                          child: _ImageCard(
+                            asset: assets[i],
+                            api: api,
+                            onFix: () => onFix(assets[i]),
+                            onDelete: () => onDelete(assets[i]),
+                            onTap: () => onOpen(i),
+                          ),
                         ),
-                      ),
-                  ],
-                );
-              },
+                    ],
+                  );
+                },
+              ),
             ),
           ),
       ],
@@ -983,20 +1199,49 @@ class _ImageCard extends StatelessWidget {
             ),
           ),
         ),
-        const SizedBox(height: 2),
-        Row(
-          children: [
-            TextButton(
-              onPressed: pending || failed || fixed ? null : onFix,
-              child: Text(
-                fixed ? '已固定' : '固定',
-                style: TextStyle(color: fixed || pending || failed ? AppColors.muted : AppColors.green),
+        const SizedBox(height: 6),
+        if (pending)
+          const SizedBox(height: 36)
+        else
+          Row(
+            children: [
+              Expanded(
+                child: SizedBox(
+                  height: 34,
+                  child: OutlinedButton(
+                    onPressed: failed || fixed ? null : onFix,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.green,
+                      disabledForegroundColor: AppColors.muted,
+                      side: BorderSide(color: fixed || failed ? AppColors.line : AppColors.green),
+                      padding: EdgeInsets.zero,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                    ),
+                    child: Text(
+                      fixed ? '已固定' : '固定',
+                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ),
               ),
-            ),
-            const Spacer(),
-            IconButton(icon: const Icon(Icons.delete_outline, size: 20), onPressed: onDelete),
-          ],
-        ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: SizedBox(
+                  height: 34,
+                  child: OutlinedButton(
+                    onPressed: onDelete,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF666666),
+                      side: const BorderSide(color: AppColors.line),
+                      padding: EdgeInsets.zero,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                    ),
+                    child: const Text('删除', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500)),
+                  ),
+                ),
+              ),
+            ],
+          ),
       ],
     );
   }

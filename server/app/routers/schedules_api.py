@@ -44,13 +44,14 @@ class RecipeIn(BaseModel):
     recipe: str  # greet_sleep | greet_morning
 
 
-def _owned_persona(user_id: str, persona_id: str):
+def _owned_persona(user_id: str, persona_id: str) -> Dict[str, Any]:
     row = db.fetchone(
-        "SELECT id FROM personas WHERE id = ? AND user_id = ?",
+        "SELECT id, greet, moments_on FROM personas WHERE id = ? AND user_id = ?",
         (persona_id, user_id),
     )
     if row is None:
         raise HTTPException(status_code=404, detail="人设不存在")
+    return dict(row)
 
 
 @router.get("/recipes")
@@ -75,6 +76,18 @@ def list_all(
     persona_id: str = "",
     user: Dict[str, Any] = Depends(current_user),
 ) -> Dict[str, Any]:
+    # 打开人设定时页时先把旧钟点配方补齐并暂停，保证「旧数据」能同步看见
+    if persona_id.strip():
+        p = _owned_persona(user["id"], persona_id.strip())
+        try:
+            sched.sync_persona_proactive(
+                user["id"],
+                persona_id.strip(),
+                greet=bool(p.get("greet", True)),
+                moments_on=bool(p.get("moments_on", True)),
+            )
+        except Exception:
+            pass
     return {"schedules": sched.list_schedules(user["id"], persona_id)}
 
 

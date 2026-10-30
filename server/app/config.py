@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     image_gen_qwen_url: str = "http://127.0.0.1:8091"
     image_gen_timeout_seconds: float = 180.0
     # 音色抽卡 / 普通说话默认引擎
-    tts_speech_url: str = "http://127.0.0.1:8883"
+    tts_speech_url: str = "http://127.0.0.1:8890"
     tts_engine: str = "breeze"  # breeze | voicedesign | cosyvoice
     # 实时语音半双工：默认 CosyVoice 3（固定参考声线，RTF 更适合边听边播）
     tts_realtime_engine: str = "cosyvoice"  # cosyvoice | breeze | voicedesign
@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     tts_voicedesign_url: str = "http://127.0.0.1:8882"
     # 固定音色 CustomVoice（按需启动，默认 8881）
     tts_customvoice_url: str = "http://127.0.0.1:8881"
-    # Breeze TTS 2 流式 API（raw PCM 24kHz s16le）
-    tts_breeze_url: str = "http://127.0.0.1:8883"
+    # Breeze TTS 2 流式 API（raw PCM 24kHz s16le）；勿用 8883（dramaclaw-tts）
+    tts_breeze_url: str = "http://127.0.0.1:8890"
     # IndexTTS-2.5 / Fun-CosyVoice3 按需网关
     tts_indextts_url: str = "http://127.0.0.1:8884"
     tts_cosyvoice_url: str = "http://127.0.0.1:18885"

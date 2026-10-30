@@ -18,7 +18,9 @@ _lock = threading.Lock()
 _stop_timers: Dict[str, threading.Timer] = {}
 _last_used: Dict[str, float] = {}
 
-PROCESS_IDLE_SECONDS = 180.0
+PROCESS_IDLE_SECONDS = 120.0
+# 抽卡页预热后希望多留一会，避免刚点「抽音色」又冷启；但别太久占 GPU
+DRAW_IDLE_SECONDS = 300.0
 ENSURE_TIMEOUT = 240.0
 
 ENGINE_IDS = ("breeze", "voicedesign", "customvoice", "indextts", "cosyvoice")
@@ -27,7 +29,8 @@ ENGINE_IDS = ("breeze", "voicedesign", "customvoice", "indextts", "cosyvoice")
 def _urls() -> Dict[str, str]:
     s = get_settings()
     return {
-        "breeze": (getattr(s, "tts_breeze_url", None) or "http://127.0.0.1:8883").rstrip("/"),
+        # 8883 被 dramaclaw-tts（qwen gateway）占用；Breeze 独立端口
+        "breeze": (getattr(s, "tts_breeze_url", None) or "http://127.0.0.1:8890").rstrip("/"),
         "voicedesign": (getattr(s, "tts_voicedesign_url", None) or "http://127.0.0.1:8882").rstrip("/"),
         "customvoice": (s.tts_customvoice_url or "http://127.0.0.1:8881").rstrip("/"),
         "indextts": (getattr(s, "tts_indextts_url", None) or "http://127.0.0.1:8884").rstrip("/"),
@@ -42,7 +45,8 @@ def _port_up(base: str, paths: Optional[list] = None, timeout: float = 1.5) -> b
             for p in paths:
                 try:
                     r = client.get(f"{base}{p}")
-                    if r.status_code >= 500:
+                    # 只认 2xx：404/405 不能当“引擎已就绪”（8883 上 dramaclaw 会误伤 Breeze）
+                    if not (200 <= r.status_code < 300):
                         continue
                     # 8885 上常见 BaseHTTP 假 CosyVoice：health 200 但不会真合成
                     srv = (r.headers.get("server") or "").lower()
@@ -56,6 +60,11 @@ def _port_up(base: str, paths: Optional[list] = None, timeout: float = 1.5) -> b
                                 return False
                         except Exception:
                             return False
+                    # Breeze：/v1/model 必须像真 Breeze（避免误认其它 /health）
+                    if ":8890" in base or p == "/v1/model":
+                        body = (r.text or "").lower()
+                        if p == "/v1/model" and "breeze" not in body and "model" not in body:
+                            continue
                     return True
                 except Exception:
                     continue
@@ -156,13 +165,14 @@ if [ ! -x "$PY" ] || [ ! -d "$ROOT" ] || [ ! -d "$CKPT" ]; then
   echo "breeze not installed" >&2
   exit 1
 fi
-if curl -sf -m 2 http://127.0.0.1:8883/v1/model >/dev/null; then exit 0; fi
+PORT="${BREEZE_PORT:-8890}"
+if curl -sf -m 2 "http://127.0.0.1:${PORT}/v1/model" >/dev/null; then exit 0; fi
 pkill -f 'breeze_infer.api' 2>/dev/null || true
 sleep 1
 cd "$ROOT"
 export CUDA_VISIBLE_DEVICES="${BREEZE_GPU:-1}"
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
-setsid nohup "$PY" -m breeze_infer.api "$CKPT" --host 0.0.0.0 --port 8883 \
+setsid nohup "$PY" -m breeze_infer.api "$CKPT" --host 0.0.0.0 --port "$PORT" \
   >>"$LOG" 2>&1 < /dev/null &
 """,
         ],
@@ -332,13 +342,18 @@ _STOPPERS = {
 def ensure_engine(engine: str) -> None:
     if engine not in ENGINE_IDS:
         return
+    t0 = time.time()
+    cold = False
     with _lock:
         t = _stop_timers.pop(engine, None)
         if t:
             t.cancel()
-        unload_others(engine)
         base = _urls()[engine]
-        if not _port_up(base):
+        already = _port_up(base)
+        # 已热时不要再 unload_others：避免抽卡条条把刚预热的引擎连带折腾
+        if not already:
+            unload_others(engine)
+            cold = True
             starter = _STARTERS.get(engine)
             if not starter:
                 raise RuntimeError(f"{engine} 无启动器")
@@ -348,6 +363,13 @@ def ensure_engine(engine: str) -> None:
             if not _wait_ready(engine, timeout=wait):
                 raise RuntimeError(f"{engine} 启动超时，请稍后重试")
         _last_used[engine] = time.time()
+    ensure_ms = int((time.time() - t0) * 1000)
+    log.info(
+        "ensure_engine engine=%s cold=%s ensure_ms=%s",
+        engine,
+        cold,
+        ensure_ms,
+    )
 
 
 def _delayed_stop(engine: str) -> None:
@@ -365,9 +387,15 @@ def _delayed_stop(engine: str) -> None:
         log.info("ondemand stopped/unloaded %s", engine)
 
 
-def release_engine(engine: str, *, unload_now: bool = True) -> None:
+def release_engine(
+    engine: str,
+    *,
+    unload_now: bool = True,
+    idle_seconds: Optional[float] = None,
+) -> None:
     if engine not in ENGINE_IDS:
         return
+    delay = float(PROCESS_IDLE_SECONDS if idle_seconds is None else idle_seconds)
     with _lock:
         _last_used[engine] = time.time()
         base = _urls()[engine]
@@ -376,7 +404,7 @@ def release_engine(engine: str, *, unload_now: bool = True) -> None:
         old = _stop_timers.pop(engine, None)
         if old:
             old.cancel()
-        timer = threading.Timer(PROCESS_IDLE_SECONDS, _delayed_stop, args=(engine,))
+        timer = threading.Timer(delay, _delayed_stop, args=(engine,))
         timer.daemon = True
         _stop_timers[engine] = timer
         timer.start()

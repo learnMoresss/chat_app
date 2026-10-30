@@ -8,6 +8,7 @@ import '../store.dart';
 import '../theme.dart';
 import '../widgets.dart';
 import 'chat_history.dart';
+import 'fullscreen_images.dart';
 import 'persona.dart';
 
 Color conversationBgColor(String name) {
@@ -146,13 +147,39 @@ class _SingleInfoBody extends StatelessWidget {
                     color: persona.color,
                     api: store.api,
                     avatarFileId: persona.avatarFileId,
-                    onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PersonaPage(store: store, persona: persona))),
+                    onTap: () {
+                      final fid = persona.avatarFileId;
+                      if (fid.isNotEmpty) {
+                        openAvatarPreview(
+                          context,
+                          api: store.api,
+                          fileId: fid,
+                          label: persona.display,
+                        );
+                      } else {
+                        Navigator.push(context, MaterialPageRoute(builder: (_) => PersonaPage(store: store, persona: persona)));
+                      }
+                    },
+                    onLongPress: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => PersonaPage(store: store, persona: persona)),
+                    ),
                   ),
                 ),
               ),
             ],
           ),
           Section(children: [
+            ArrowTile(
+              title: '定时任务',
+              subtitle: '仅此人设的聊天提醒 / 每日任务',
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => PersonaSchedulesPage(store: store, persona: persona),
+                ),
+              ),
+            ),
             ArrowTile(
               title: '设置备注和标签',
               subtitle: [
@@ -316,18 +343,36 @@ class _GroupInfoBodyState extends State<_GroupInfoBody> {
                         api: store.api,
                         avatarFileId: id == store.meId ? store.meAvatarFileId : (store.persona(id)?.avatarFileId ?? ''),
                         onTap: () {
+                          final fid = id == store.meId
+                              ? store.meAvatarFileId
+                              : (store.persona(id)?.avatarFileId ?? '');
+                          if (fid.isNotEmpty) {
+                            openAvatarPreview(
+                              context,
+                              api: store.api,
+                              fileId: fid,
+                              label: store.memberDisplay(id, g),
+                            );
+                            return;
+                          }
                           if (id == store.meId) return;
                           final p = store.persona(id);
                           if (p != null) {
                             Navigator.push(context, MaterialPageRoute(builder: (_) => PersonaPage(store: store, persona: p)));
                           }
                         },
-                        onLongPress: isOwner && id != store.meId && id != g.ownerId
-                            ? () {
-                                setState(() => removing = true);
-                                HapticFeedback.selectionClick();
-                              }
-                            : null,
+                        onLongPress: () {
+                          if (isOwner && id != store.meId && id != g.ownerId) {
+                            setState(() => removing = true);
+                            HapticFeedback.selectionClick();
+                            return;
+                          }
+                          if (id == store.meId) return;
+                          final p = store.persona(id);
+                          if (p != null) {
+                            Navigator.push(context, MaterialPageRoute(builder: (_) => PersonaPage(store: store, persona: p)));
+                          }
+                        },
                       ),
                     _MemberCell(
                       name: '添加',
@@ -1023,6 +1068,347 @@ class _GroupQrPage extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+// ──────────────────────────── 人设定时任务（提醒 + 主动计划） ────────────────────────────
+
+class PersonaSchedulesPage extends StatefulWidget {
+  const PersonaSchedulesPage({super.key, required this.store, required this.persona});
+  final AppStore store;
+  final Persona persona;
+
+  @override
+  State<PersonaSchedulesPage> createState() => _PersonaSchedulesPageState();
+}
+
+class _PersonaSchedulesPageState extends State<PersonaSchedulesPage> {
+  var loading = true;
+  var saving = false;
+  String? error;
+  List<Map<String, dynamic>> items = const [];
+
+  bool _isUserReminder(String kind) => kind == 'user_once' || kind == 'user_daily';
+  bool _isLegacy(String kind) =>
+      kind.startsWith('greet_') || kind.startsWith('moment_') || kind == 'moment_daily';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final api = widget.store.api;
+    if (widget.store.demo || api == null) {
+      setState(() {
+        loading = false;
+        error = '演示模式不可用';
+        items = const [];
+      });
+      return;
+    }
+    setState(() {
+      loading = true;
+      error = null;
+    });
+    try {
+      final raw = await api.listSchedules(personaId: widget.persona.id);
+      final list = <Map<String, dynamic>>[
+        for (final e in raw)
+          if (e is Map) Map<String, dynamic>.from(e),
+      ];
+      list.sort((a, b) {
+        final ka = a['kind'] as String? ?? '';
+        final kb = b['kind'] as String? ?? '';
+        final ra = _isUserReminder(ka) ? 0 : (_isLegacy(ka) ? 2 : 1);
+        final rb = _isUserReminder(kb) ? 0 : (_isLegacy(kb) ? 2 : 1);
+        if (ra != rb) return ra.compareTo(rb);
+        final ha = (a['hour'] as num?)?.toInt() ?? 0;
+        final hb = (b['hour'] as num?)?.toInt() ?? 0;
+        if (ha != hb) return ha.compareTo(hb);
+        return ((a['minute'] as num?)?.toInt() ?? 0).compareTo((b['minute'] as num?)?.toInt() ?? 0);
+      });
+      if (!mounted) return;
+      setState(() {
+        items = list;
+        loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        loading = false;
+        error = '$e';
+      });
+    }
+  }
+
+  String _kindLabel(String kind) {
+    return switch (kind) {
+      'user_daily' => '每日提醒',
+      'user_once' => '一次提醒',
+      'custom' => '自定义',
+      _ when kind.startsWith('greet_') => '旧问候',
+      _ when kind.startsWith('moment_') => '旧朋友圈',
+      _ => kind,
+    };
+  }
+
+  String _formatNext(String? nxt) {
+    if (nxt == null || nxt.isEmpty) return '';
+    final dt = DateTime.tryParse(nxt);
+    if (dt == null) return nxt;
+    final local = dt.toLocal();
+    return '${local.month.toString().padLeft(2, '0')}-${local.day.toString().padLeft(2, '0')} '
+        '${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}';
+  }
+
+  String _subtitle(Map<String, dynamic> s) {
+    final kind = s['kind'] as String? ?? '';
+    final hour = (s['hour'] as num?)?.toInt() ?? 0;
+    final minute = (s['minute'] as num?)?.toInt() ?? 0;
+    final when = _formatNext(s['next_run_at'] as String?);
+    final hm = '${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+    if (kind == 'user_daily') {
+      return '每天 $hm${when.isEmpty ? '' : ' · 下次 $when'}';
+    }
+    if (kind == 'user_once') {
+      return when.isEmpty ? '一次 · 待触发' : '一次 · $when';
+    }
+    return '定点 $hm${when.isEmpty ? '' : ' · 下次 $when'}';
+  }
+
+  Future<void> _toggle(Map<String, dynamic> s) async {
+    final id = s['id'] as String? ?? '';
+    if (id.isEmpty || widget.store.api == null || saving) return;
+    final enabled = s['enabled'] == true && s['paused'] != true;
+    setState(() => saving = true);
+    try {
+      final next = await widget.store.api!.patchSchedule(
+        id,
+        enabled: !enabled,
+        paused: enabled,
+        reschedule: !enabled,
+      );
+      if (!mounted) return;
+      setState(() {
+        items = [
+          for (final e in items)
+            if (e['id'] == id) Map<String, dynamic>.from(next) else e,
+        ];
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('更新失败：$e')));
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+
+  Future<void> _delete(Map<String, dynamic> s) async {
+    final id = s['id'] as String? ?? '';
+    if (id.isEmpty || widget.store.api == null) return;
+    final ok = await showWxConfirmDialog(
+      context,
+      title: '删除任务',
+      message: '确定删除「${s['title'] ?? '任务'}」？',
+      confirmText: '删除',
+      destructive: true,
+    );
+    if (ok != true) return;
+    try {
+      await widget.store.api!.deleteSchedule(id);
+      if (!mounted) return;
+      setState(() => items = items.where((e) => e['id'] != id).toList());
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已删除')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('删除失败：$e')));
+    }
+  }
+
+  Future<void> _addDaily() async {
+    final api = widget.store.api;
+    if (api == null || widget.store.demo) return;
+    final titleCtrl = TextEditingController();
+    final timeCtrl = TextEditingController(text: '08:00');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('添加每日提醒'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: titleCtrl,
+              decoration: const InputDecoration(labelText: '内容', hintText: '如：叫我起床'),
+              autofocus: true,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: timeCtrl,
+              decoration: const InputDecoration(labelText: '时间', hintText: 'HH:MM'),
+              keyboardType: TextInputType.datetime,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('添加')),
+        ],
+      ),
+    );
+    final title = titleCtrl.text.trim();
+    final timeRaw = timeCtrl.text.trim();
+    titleCtrl.dispose();
+    timeCtrl.dispose();
+    if (ok != true || !mounted) return;
+    if (title.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请填写内容')));
+      return;
+    }
+    final m = RegExp(r'^(\d{1,2})[:：](\d{1,2})$').firstMatch(timeRaw);
+    if (m == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('时间格式用 08:00')));
+      return;
+    }
+    final hour = int.parse(m.group(1)!).clamp(0, 23);
+    final minute = int.parse(m.group(2)!).clamp(0, 59);
+    setState(() => saving = true);
+    try {
+      await api.createSchedule(
+        personaId: widget.persona.id,
+        kind: 'user_daily',
+        title: title,
+        hour: hour,
+        minute: minute,
+        prompt: '到点了，用平常聊天语气提醒对方：$title。一两句话就好，不要说这是定时任务。',
+        jitterMinutes: 0,
+        minIntervalMinutes: 0,
+      );
+      await _load();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已添加每日提醒')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('添加失败：$e')));
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+
+  Widget _sectionHeader(String title) {
+    return Container(
+      width: double.infinity,
+      color: AppColors.bg,
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
+      child: Text(title, style: const TextStyle(fontSize: 13, color: AppColors.sub)),
+    );
+  }
+
+  Widget _tile(Map<String, dynamic> s) {
+    final kind = s['kind'] as String? ?? '';
+    final enabled = s['enabled'] == true && s['paused'] != true;
+    final title = (s['title'] as String?)?.trim();
+    return ListTile(
+      title: Text(title?.isNotEmpty == true ? title! : _kindLabel(kind)),
+      subtitle: Text(
+        '${_kindLabel(kind)} · ${_subtitle(s)}${enabled ? '' : ' · 已停用'}',
+        style: const TextStyle(fontSize: 13, color: AppColors.sub),
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Switch(
+            value: enabled,
+            activeTrackColor: AppColors.green,
+            onChanged: saving ? null : (_) => _toggle(s),
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_outline, color: AppColors.badge),
+            onPressed: saving ? null : () => _delete(s),
+          ),
+        ],
+      ),
+      isThreeLine: true,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reminders = items.where((e) => _isUserReminder(e['kind'] as String? ?? '')).toList();
+    final others = items.where((e) {
+      final k = e['kind'] as String? ?? '';
+      return !_isUserReminder(k) && !_isLegacy(k);
+    }).toList();
+    final legacy = items.where((e) => _isLegacy(e['kind'] as String? ?? '')).toList();
+
+    return Scaffold(
+      backgroundColor: AppColors.bg,
+      appBar: AppBar(
+        title: Text('定时任务 · ${widget.persona.display}'),
+        actions: [
+          IconButton(onPressed: loading || saving ? null : _load, icon: const Icon(Icons.refresh)),
+          TextButton(onPressed: loading || saving ? null : _addDaily, child: const Text('添加')),
+        ],
+      ),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : error != null
+              ? Center(child: Text(error!, style: const TextStyle(color: AppColors.sub)))
+              : ListView(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                      child: Text(
+                        '仅「${widget.persona.display}」此人设。和她/他聊天时说的提醒写在这里，不会混到别人设。',
+                        style: const TextStyle(fontSize: 13, color: AppColors.sub, height: 1.35),
+                      ),
+                    ),
+                    _sectionHeader('聊天提醒 / 每日任务（${reminders.length}）'),
+                    if (reminders.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.fromLTRB(16, 8, 16, 16),
+                        child: Text('此人设暂无提醒。可点右上角「添加」，或在与此人设的聊天里口述创建。', style: TextStyle(color: AppColors.muted)),
+                      )
+                    else
+                      Section(
+                        margin: EdgeInsets.zero,
+                        children: [
+                          for (var i = 0; i < reminders.length; i++) ...[
+                            if (i > 0) const Divider(height: 1, indent: 16),
+                            _tile(reminders[i]),
+                          ],
+                        ],
+                      ),
+                    if (others.isNotEmpty) ...[
+                      _sectionHeader('其他计划（${others.length}）'),
+                      Section(
+                        margin: EdgeInsets.zero,
+                        children: [
+                          for (var i = 0; i < others.length; i++) ...[
+                            if (i > 0) const Divider(height: 1, indent: 16),
+                            _tile(others[i]),
+                          ],
+                        ],
+                      ),
+                    ],
+                    if (legacy.isNotEmpty) ...[
+                      _sectionHeader('旧钟点配方（可删，${legacy.length}）'),
+                      Section(
+                        margin: EdgeInsets.zero,
+                        children: [
+                          for (var i = 0; i < legacy.length; i++) ...[
+                            if (i > 0) const Divider(height: 1, indent: 16),
+                            _tile(legacy[i]),
+                          ],
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 32),
+                  ],
+                ),
     );
   }
 }

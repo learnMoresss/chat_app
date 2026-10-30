@@ -108,6 +108,24 @@ Future<void> openFullscreenImages(
   );
 }
 
+/// 头像 / 单图预览（有 fileId 或本地 bytes 才打开）。
+Future<void> openAvatarPreview(
+  BuildContext context, {
+  ApiClient? api,
+  String? fileId,
+  Uint8List? bytes,
+  String label = '',
+}) {
+  final slides = <ImageSlide>[];
+  if (bytes != null && bytes.isNotEmpty) {
+    slides.add(ImageSlide(bytes: bytes, label: label));
+  } else if (fileId != null && fileId.isNotEmpty) {
+    slides.add(ImageSlide(fileId: fileId, label: label));
+  }
+  if (slides.isEmpty) return Future.value();
+  return openFullscreenImages(context, slides: slides, api: api);
+}
+
 class _FullscreenImagesPage extends StatefulWidget {
   const _FullscreenImagesPage({
     required this.slides,

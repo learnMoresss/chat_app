@@ -277,18 +277,13 @@ def synthesize_sing(
     job = f"job_{int(time.time())}_{persona_id[-6:]}"
     out_dir = Path(f"/data/ai/tmp/sing-jobs/{job}")
 
-    ref_source = "default"
+    # 硬门：必须已固定人设音色，禁止回落默认样音
     local_ref = resolve_persona_ref_local(user_id=user_id, persona_id=persona_id)
-    if local_ref is not None and local_ref.is_file():
-        persona_ref = local_ref
-        ref_source = "persona_fixed"
-    else:
-        default_ref = (settings.sing_default_persona_ref or "").strip()
-        if not default_ref or not Path(default_ref).is_file():
-            log.warning("sing: no persona ref and default missing: %s", default_ref)
-            return None
-        persona_ref = Path(default_ref)
-        log.info("sing using default persona ref: %s", persona_ref)
+    if local_ref is None or not local_ref.is_file():
+        log.warning("sing: refuse without fixed persona voice user=%s persona=%s", user_id, persona_id)
+        return None
+    persona_ref = local_ref
+    ref_source = "persona_fixed"
 
     song_path: Optional[Path] = None
     track_id = ""

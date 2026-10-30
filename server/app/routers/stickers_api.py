@@ -188,7 +188,7 @@ async def _emit_pack_added_card(
         "item_count": pack.get("item_count") or added,
         "cover_file_ids": (pack.get("cover_file_ids") or [])[:9],
         "subscribed": subscribed,
-        "body": f"表情包「{pack.get('title') or '未命名'}」已加入（{pack.get('item_count') or added} 张）",
+        "body": f"推荐表情组「{pack.get('title') or '未命名'}」（{pack.get('item_count') or added} 张）·长按可加到我的",
     }
     text = json.dumps(card, ensure_ascii=False)
     row = insert_message(
@@ -457,6 +457,20 @@ def fork_pack(
         return stk.fork_pack(user_id=user["id"], pack_id=pack_id, title=body.title)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.delete("/packs/{pack_id}")
+def delete_pack(
+    pack_id: str,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """删除「我的」表情组（仅 owner 的 account 组）。"""
+    try:
+        return stk.delete_pack(user_id=user["id"], pack_id=pack_id)
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "不存在" in msg else 403
+        raise HTTPException(code, msg) from exc
 
 
 @router.post("/packs/web_collect")

@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -428,8 +429,13 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
         if kind == "image":
             await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
             try:
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(0.25)
                 from .image_quota import check_can_generate
+                from .media_cards import (
+                    fixed_look_file_id,
+                    generate_or_mood,
+                    image_needs_persona_look,
+                )
 
                 q = check_can_generate(ctx.user_id)
                 if not q.get("ok"):
@@ -446,20 +452,40 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
                     )
                     await hub.send_user(ctx.user_id, "message", note_msg.model_dump())
                     continue
+                look_ref = (
+                    fixed_look_file_id(
+                        user_id=ctx.user_id,
+                        persona_id=ctx.persona_id,
+                        allow_avatar_fallback=False,
+                    )
+                    or ""
+                )
+                # 出镜/自拍：必须用固定形象做参考图生图；风景等可不带参考
+                need_look = bool(intent.get("use_look_ref")) or image_needs_persona_look(
+                    prompt
+                )
+                ref_id = ""
+                if need_look:
+                    ref_id = look_ref or ctx.persona_avatar_id
                 fid = (
                     generate_or_mood(
                         user_id=ctx.user_id,
                         caption=prompt,
                         persona_name=ctx.display,
                         width=768,
-                        height=768,
-                        ref_file_id=ctx.persona_avatar_id,
+                        height=1024,
+                        ref_file_id=ref_id,
+                        # 出镜必须 Qwen 图生图；失败不要落缺字氛围卡 / 勿退 Z-Image
+                        backend="qwen" if need_look else "",
+                        allow_mood_fallback=not need_look,
                     )
                     or ""
                 )
                 if fid:
+                    # 出镜图不把生图提示词当气泡配文（显得很怪）
+                    cap = "" if need_look else prompt
                     payload = json.dumps(
-                        {"v": 1, "files": [fid], "caption": prompt},
+                        {"v": 1, "files": [fid], "caption": cap},
                         ensure_ascii=False,
                     )
                     img_msg = _insert_message(
@@ -474,7 +500,11 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
                     )
                     await hub.send_user(ctx.user_id, "message", img_msg.model_dump())
                 else:
-                    note = f"（想发图：{prompt}）"
+                    note = (
+                        "这张没拍好，等会儿再叫我拍～"
+                        if need_look
+                        else f"（想发图：{prompt}）"
+                    )
                     note_msg = _insert_message(
                         user_id=ctx.user_id,
                         conv_id=ctx.conv_id,
@@ -750,6 +780,8 @@ async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
 
     if not ctx.sing_enabled or ctx.sing_cooled:
         return
+    if not ctx.voice_prompt_fixed:
+        return
     if len(prompt) > ctx.sing_max:
         prompt = prompt[: ctx.sing_max]
     await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
@@ -841,14 +873,27 @@ async def _handle_voice(ctx: DispatchCtx, prompt: str) -> None:
     await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
     await asyncio.sleep(0.25)
     try:
+        from .media_cards import fixed_voice_wav_path
         from .tts_gen import synthesize_voice_wav
 
         speak_instr = speak_instructions(ctx.voice_prompt_fixed, ctx.affect_state)
+        ref_wav = (
+            fixed_voice_wav_path(user_id=ctx.user_id, persona_id=ctx.persona_id) or ""
+        )
+        t0 = time.perf_counter()
         wav = await asyncio.to_thread(
             synthesize_voice_wav,
             text=prompt,
             instructions=speak_instr,
             seed=None,
+            keep_loaded=True,
+            prompt_wav=ref_wav,
+        )
+        logger.info(
+            "chat_voice synth_ms=%s ok=%s conv=%s",
+            int((time.perf_counter() - t0) * 1000),
+            bool(wav),
+            ctx.conv_id,
         )
     except Exception:
         wav = None

@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from .. import db
 from ..config import get_settings
 from ..gateway.signed_urls import make_download_url, verify_download, verify_upload
-from ..media_store import files_root, put_bytes
+from ..media_store import files_root, find_by_hash, put_bytes
 from ..security import current_user, iso, new_id
 
 log = logging.getLogger("media")
@@ -21,6 +21,34 @@ router = APIRouter(prefix="/api/v1/media", tags=["media"])
 
 def _files_root() -> Path:
     return files_root()
+
+
+class CheckHashBody(BaseModel):
+    sha256: str = Field(min_length=64, max_length=64)
+    size: int = Field(ge=1, le=80 * 1024 * 1024)
+    content_type: str = ""
+
+
+@router.post("/check-hash")
+def check_hash(body: CheckHashBody, user=Depends(current_user)) -> Dict[str, Any]:
+    """客户端上传前预检：同账号同 sha256+size 已存在则直接复用，跳过传字节。"""
+    sha = (body.sha256 or "").strip().lower()
+    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        raise HTTPException(status_code=400, detail="sha256 无效")
+    hit = find_by_hash(user_id=user["id"], sha=sha, size=int(body.size))
+    if not hit:
+        return {"exists": False, "deduped": False}
+    file_id = hit["id"]
+    ctype = hit.get("content_type") or body.content_type or "application/octet-stream"
+    return {
+        "exists": True,
+        "deduped": True,
+        "file_id": file_id,
+        "size": hit.get("size") or body.size,
+        "content_type": ctype,
+        "url": make_download_url(file_id=file_id, user_id=user["id"], ttl_seconds=86400 * 7),
+        "auth_url": f"/api/v1/media/files/{file_id}",
+    }
 
 
 @router.get("/download")

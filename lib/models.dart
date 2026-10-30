@@ -51,6 +51,7 @@ class Persona {
     this.gapMinutes = 120,
     this.avatarFileId = '',
     this.voiceReplyPref = 'sometimes',
+    this.signature = '',
     List<MemoryItem>? memories,
     List<String>? tagNames,
   })  : memories = memories ?? [],
@@ -62,6 +63,8 @@ class Persona {
   String bio;
   String channelId;
   String avatarFileId;
+  /// 朋友圈个性签名（短句，不是人设提示词）
+  String signature;
   FriendState state;
   bool isBot;
   String verify;

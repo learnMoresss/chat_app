@@ -153,10 +153,13 @@ def create_schedule(
     require_chatted_today: bool = False,
     min_interval_minutes: int = 60,
     enabled: bool = True,
+    next_run_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     sid = new_id("sch_")
     now = iso()
-    next_at = compute_next_run(hour=hour, minute=minute, jitter_minutes=jitter_minutes)
+    next_at = (next_run_at or "").strip() or compute_next_run(
+        hour=hour, minute=minute, jitter_minutes=jitter_minutes
+    )
     db.execute(
         """
         INSERT INTO schedules(
@@ -186,6 +189,27 @@ def create_schedule(
         ),
     )
     return get_schedule(user_id, sid)  # type: ignore[return-value]
+
+
+def delete_user_reminders(*, user_id: str, persona_id: str, query: str = "") -> int:
+    """删除 user_once / user_daily；query 非空时按标题模糊匹配。"""
+    q = (query or "").strip()
+    rows = db.fetchall(
+        """
+        SELECT id, title FROM schedules
+        WHERE user_id = ? AND persona_id = ?
+          AND kind IN ('user_once', 'user_daily')
+        """,
+        (user_id, persona_id),
+    )
+    n = 0
+    for r in rows:
+        title = r["title"] or ""
+        if q and q not in title and title not in q:
+            continue
+        if delete_schedule(user_id, r["id"]):
+            n += 1
+    return n
 
 
 def install_recipe(user_id: str, persona_id: str, recipe_key: str) -> Dict[str, Any]:
@@ -258,13 +282,36 @@ def sync_persona_proactive(
     """人设开关语义：greet=允许主动私聊，moments_on=允许发朋友圈。
 
     固定钟点 greet_morning/greet_sleep 已退役，改由 ProactivePlanner 机会驱动；
-    此处一律暂停旧配方，避免定点轰炸。
+    此处确保旧配方行存在（便于客户端「旧钟点配方」列表同步展示），再一律暂停，避免定点轰炸。
     """
     _ = greet
+    for key in ("greet_morning", "greet_sleep"):
+        try:
+            install_recipe(user_id, persona_id, key)
+        except Exception:
+            pass
     _pause_kinds(user_id, persona_id, "greet_")
-    # 朋友圈改由世界线/规划器意图驱动，不再安装 moment_daily
+    # 朋友圈改由世界线/规划器意图驱动；保留旧 moment_* 行仅供清理展示
     _pause_kinds(user_id, persona_id, "moment_")
     _ = moments_on  # 开关仍由 ActionDispatcher / ProactiveGates 检查
+
+
+def sync_all_personas_legacy(user_id: str) -> int:
+    """把账号下所有人设的旧钟点配方补齐并暂停；返回处理人设数。"""
+    rows = db.fetchall(
+        "SELECT id, greet, moments_on FROM personas WHERE user_id = ?",
+        (user_id,),
+    )
+    n = 0
+    for r in rows:
+        sync_persona_proactive(
+            user_id,
+            r["id"],
+            greet=bool(r["greet"]),
+            moments_on=bool(r["moments_on"]),
+        )
+        n += 1
+    return n
 
 
 def patch_schedule(user_id: str, schedule_id: str, **fields) -> Optional[Dict[str, Any]]:
@@ -460,6 +507,18 @@ def _record_run(schedule_id: str, user_id: str, status: str, detail: str = "") -
 
 
 def _advance_next(row) -> None:
+    kind = (row["kind"] or "").strip()
+    # 一次性用户提醒：触发后关闭，不再排期
+    if kind == "user_once":
+        db.execute(
+            """
+            UPDATE schedules
+            SET enabled=0, paused=1, next_run_at=NULL, last_run_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (iso(), iso(), row["id"]),
+        )
+        return
     next_at = compute_next_run(
         hour=int(row["hour"]),
         minute=int(row["minute"]),
@@ -533,14 +592,17 @@ def upcoming_for_persona(user_id: str, persona_id: str, limit: int = 5) -> List[
 def due_schedules(now: Optional[datetime] = None) -> List[Any]:
     now = now or _now()
     # 只取 next_run_at <= now；过期超过 grace 的仍取出，由 tick 决定只补一次
-    # 尊重 user_prefs.pause_proactive：用户全局暂停时不再触发
+    # pause_proactive 只挡主动/问候类；人设级 user_* 提醒仍按点触发
     return db.fetchall(
         """
         SELECT s.* FROM schedules s
         LEFT JOIN user_prefs p ON p.user_id = s.user_id
         WHERE s.enabled = 1 AND s.paused = 0
           AND s.next_run_at IS NOT NULL AND s.next_run_at <= ?
-          AND COALESCE(p.pause_proactive, 0) = 0
+          AND (
+            s.kind LIKE 'user_%'
+            OR COALESCE(p.pause_proactive, 0) = 0
+          )
         ORDER BY s.next_run_at ASC
         LIMIT 50
         """,
@@ -549,15 +611,23 @@ def due_schedules(now: Optional[datetime] = None) -> List[Any]:
 
 
 def pause_all_for_user(user_id: str, *, paused: bool = True) -> int:
-    """一键暂停/恢复该用户全部定时任务。"""
+    """一键暂停/恢复该用户主动类定时；不改动人设聊天提醒 user_*。"""
     from .security import iso as _iso
 
     before = db.fetchall(
-        "SELECT id FROM schedules WHERE user_id = ? AND enabled = 1",
+        """
+        SELECT id FROM schedules
+        WHERE user_id = ? AND enabled = 1
+          AND kind NOT LIKE 'user_%'
+        """,
         (user_id,),
     )
     db.execute(
-        "UPDATE schedules SET paused = ?, updated_at = ? WHERE user_id = ? AND enabled = 1",
+        """
+        UPDATE schedules SET paused = ?, updated_at = ?
+        WHERE user_id = ? AND enabled = 1
+          AND kind NOT LIKE 'user_%'
+        """,
         (1 if paused else 0, _iso(), user_id),
     )
     return len(before)
@@ -566,6 +636,12 @@ def pause_all_for_user(user_id: str, *, paused: bool = True) -> int:
 def evaluate_skip(row, *, conv_id: str) -> Optional[str]:
     """返回跳过原因，或 None 表示可发。"""
     user_id = row["user_id"]
+    kind = (row["kind"] or "").strip()
+    # 用户显式提醒：尽量按时发，不受「刚聊过/停追」拦截
+    if kind.startswith("user_"):
+        if _runs_today(row["id"]) >= int(row["daily_limit"] or 1):
+            return "已达每日上限"
+        return None
     if _in_quiet(user_id):
         return "免打扰时段"
     if _runs_today(row["id"]) >= int(row["daily_limit"] or 1):

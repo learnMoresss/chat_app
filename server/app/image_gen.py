@@ -21,11 +21,13 @@ def generate_image_bytes(
     ratio: str = "",
     seed: int | None = None,
     ref_image: bytes | None = None,
+    negative: str = "",
 ) -> Optional[bytes]:
     """返回 PNG/JPEG 字节；失败返回 None。
 
     ratio 如 "3:4"：走 Qwen Web 时优先用画幅。
     ref_image：有则走图生图，尽量保持同一张脸/人设。
+    negative：Z-Image 负向提示（有则用真实 CLIP 编码，替代 ZeroOut）。
     """
     prompt = (prompt or "").strip()
     if not prompt:
@@ -41,10 +43,12 @@ def generate_image_bytes(
         # 有参考图时优先 qwen（支持 i2i）；否则聊天要快 → zimage 再 qwen
         order = ["qwen", "zimage"] if ref_image else ["zimage", "qwen"]
 
+    # 有参考图：只能走 Qwen 编辑/图生图；Z-Image 无 i2i，禁止回退乱出一张不像的
+    if ref_image:
+        order = ["qwen"]
     for name in order:
         try:
             if name == "zimage":
-                # Z-Image 路径暂不接参考图
                 if ref_image:
                     continue
                 data = _gen_zimage(
@@ -53,6 +57,7 @@ def generate_image_bytes(
                     height=height,
                     timeout=timeout,
                     seed=seed,
+                    negative=negative,
                 )
             else:
                 data = _gen_qwen_web(
@@ -75,6 +80,7 @@ def _gen_zimage(
     height: int,
     timeout: float,
     seed: int | None = None,
+    negative: str = "",
 ) -> Optional[bytes]:
     base = (get_settings().image_gen_comfy_url or "").rstrip("/")
     if not base:
@@ -85,6 +91,10 @@ def _gen_zimage(
         seed = int(uuid.uuid4().int % (2**31))
     else:
         seed = int(seed) % (2**31)
+    neg = (negative or "").strip() or (
+        "multiple people, crowd, group photo, collage, grid, many faces, "
+        "two girls, two boys, couple, low quality"
+    )
     workflow = {
         "1": {
             "class_type": "DiffusionModelLoaderKJ",
@@ -103,7 +113,8 @@ def _gen_zimage(
         },
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
-        "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+        # 真负向（多人/拼贴），替代 ZeroOut；turbo 仍用低 cfg，略抬到 1.2 帮助压多人
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["2", 0]}},
         "6": {
             "class_type": "EmptySD3LatentImage",
             "inputs": {"width": width, "height": height, "batch_size": 1},
@@ -118,7 +129,7 @@ def _gen_zimage(
                 "latent_image": ["6", 0],
                 "seed": seed,
                 "steps": 8,
-                "cfg": 1,
+                "cfg": 1.2,
                 "sampler_name": "res_multistep",
                 "scheduler": "simple",
                 "denoise": 1,

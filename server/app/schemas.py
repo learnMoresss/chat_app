@@ -90,6 +90,7 @@ class PersonaOut(BaseModel):
     worldline_enabled: bool = True
     avatar_file_id: str = ""
     voice_reply_pref: str = "sometimes"  # never | sometimes | always
+    signature: str = ""
     memories: List[Dict[str, str]] = []
 
 
@@ -103,6 +104,8 @@ class PersonaCreate(BaseModel):
     moments_on: bool = False
     worldline_enabled: bool = True
     avatar_file_id: str = ""
+    verify: str = Field(default="", max_length=120)
+    signature: str = Field(default="", max_length=40)
 
 
 class ConversationOut(BaseModel):
@@ -181,3 +184,4 @@ class PersonaPatch(BaseModel):
     color: Optional[int] = None
     avatar_file_id: Optional[str] = None
     voice_reply_pref: Optional[str] = None  # never | sometimes | always
+    signature: Optional[str] = Field(default=None, max_length=40)

@@ -28,6 +28,10 @@ def _persona_out(row, memories: Optional[List] = None) -> PersonaOut:
         wl = bool(int(row["worldline_enabled"]))
     except Exception:
         wl = True
+    try:
+        signature = (row["signature"] or "").strip()[:40]
+    except Exception:
+        signature = ""
     return PersonaOut(
         id=row["id"],
         name=row["name"],
@@ -43,9 +47,9 @@ def _persona_out(row, memories: Optional[List] = None) -> PersonaOut:
         worldline_enabled=wl,
         avatar_file_id=avatar,
         voice_reply_pref=pref,
+        signature=signature,
         memories=memories or [],
     )
-
 
 def _owned(user_id: str, persona_id: str):
     row = db.fetchone(
@@ -57,14 +61,186 @@ def _owned(user_id: str, persona_id: str):
     return row
 
 
+def _heuristic_extract_prompts(*, name: str, bio: str) -> Dict[str, str]:
+    """从人设说明抽短提示词/签名（无 LLM 时的兜底）。"""
+    import re
+
+    n = (name or "").strip() or "她"
+    raw = re.sub(r"\s+", " ", (bio or "").strip())
+    # 签名：取首句，去掉「你是」类指令
+    sig = raw
+    for sep in ("。", "！", "？", "\n", ".", "!", "?"):
+        if sep in sig:
+            sig = sig.split(sep)[0]
+            break
+    sig = re.sub(r"^(你是一个?|作为|扮演)", "", sig).strip(" ，,")
+    # 朋友圈签名要短，禁止整段人设说明落成签名
+    if len(sig) > 18:
+        sig = sig[:18].rstrip("，, ")
+    if len(sig) < 2:
+        sig = f"{n}的日常"
+    look = f"二次元头像，{n}，清爽正面半身"
+    # 从 bio 里捞外貌关键词
+    for kw in ("长发", "短发", "黑发", "金发", "眼镜", "制服", "连衣裙", "少年", "少女", "温柔", "冷淡"):
+        if kw in raw and kw not in look:
+            look = f"{look}，{kw}"
+    voice = f"年轻女声，语速适中，语气自然，像{n}"
+    if any(k in raw for k in ("少年", "男生", "男性", "他")):
+        voice = f"年轻男声，语速适中，语气自然，像{n}"
+    return {
+        "avatar_prompt": look[:200],
+        "image_prompt": f"{look}，全身站姿，干净背景"[:200],
+        "voice_prompt": voice[:200],
+        "signature": sig[:40],
+    }
+
+
+def _parse_extract_json(content: str, *, name: str, bio: str) -> Optional[Dict[str, str]]:
+    import json
+    import re
+
+    m = re.search(r"\{[\s\S]*\}", (content or "").strip())
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    out = _heuristic_extract_prompts(name=name, bio=bio)
+    for k in ("avatar_prompt", "image_prompt", "voice_prompt", "signature"):
+        v = str(data.get(k) or "").strip()
+        if v:
+            out[k] = v[:200] if k != "signature" else v[:40]
+    return out
+
+
+def _extract_user_prompt(*, name: str, bio: str) -> str:
+    return (
+        f"人设名：{name}\n说明：{(bio or '')[:800]}\n"
+        "根据人设用中文输出一个 JSON 对象，字段："
+        "avatar_prompt(头像文生图短提示≤40字)、image_prompt(形象短提示≤60字)、"
+        "voice_prompt(音色描述≤40字)、signature(朋友圈签名≤20字，不是人设指令)。"
+        "只输出 JSON。"
+    )
+
+
+def _llm_extract_via_channel(
+    *, user_id: str, channel_id: str, name: str, bio: str
+) -> Optional[Dict[str, str]]:
+    """用人设绑定渠道的 API Key 直打 OpenAI 兼容接口（不经 DSH）。"""
+    import httpx
+
+    from ..crypto import decrypt_secret
+    from ..llm import normalize_base
+
+    cid = (channel_id or "").strip()
+    if not cid:
+        return None
+    row = db.fetchone(
+        """
+        SELECT * FROM channels
+        WHERE id = ? AND (user_id = ? OR shared = 1)
+        """,
+        (cid, user_id),
+    )
+    if not row or not (row["key_enc"] or "").strip():
+        return None
+    try:
+        api_key = decrypt_secret(row["key_enc"])
+    except Exception:
+        return None
+    if not api_key:
+        return None
+    model = (row["model"] or "").strip() or "deepseek-chat"
+    # DSH 路由前缀剥掉，直连上游
+    if "/" in model and not model.startswith("http"):
+        model = model.split("/", 1)[-1]
+    url = f"{normalize_base(row['base_url'])}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": _extract_user_prompt(name=name, bio=bio)}],
+        "max_tokens": 220,
+        "temperature": 0.3,
+    }
+    try:
+        with httpx.Client(timeout=18.0) as client:
+            r = client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if r.status_code >= 400:
+            return None
+        content = (
+            ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        )
+        return _parse_extract_json(content, name=name, bio=bio)
+    except Exception:
+        return None
+
+
+def _llm_extract_prompts(
+    *, name: str, bio: str, user_id: str = "", channel_id: str = ""
+) -> Optional[Dict[str, str]]:
+    """抽取提示词：渠道 Key → 本机 :9292 → None（外层再启发式）。不经 DSH。"""
+    import httpx
+
+    from ..config import get_settings
+
+    if user_id and channel_id:
+        hit = _llm_extract_via_channel(
+            user_id=user_id, channel_id=channel_id, name=name, bio=bio
+        )
+        if hit:
+            return hit
+
+    s = get_settings()
+    text_base = "http://127.0.0.1:9292/v1"
+    token = (s.vision_api_token or "").strip()
+    model = "qwen3.8-flash-next-iq3_xxs"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": _extract_user_prompt(name=name, bio=bio)}],
+        "max_tokens": 220,
+        "temperature": 0.3,
+    }
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            r = client.post(f"{text_base}/chat/completions", headers=headers, json=payload)
+        if r.status_code >= 400:
+            return None
+        content = (
+            ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        )
+        return _parse_extract_json(content, name=name, bio=bio)
+    except Exception:
+        return None
+
+
 @router.post("", response_model=PersonaOut)
 def create_persona(body: PersonaCreate, user: Dict[str, Any] = Depends(current_user)) -> PersonaOut:
+    """新建人设：进入「新的朋友」申请（pendingIn），通过后才建会话。"""
     pid = new_id("p_")
     now = iso()
+    verify = (body.verify or "").strip() or "想加你为朋友"
+    signature = (body.signature or "").strip()
+    if not signature:
+        signature = _heuristic_extract_prompts(name=body.name, bio=body.bio).get("signature") or ""
     db.execute(
         """
-        INSERT INTO personas(id, user_id, name, color, bio, channel_id, state, is_bot, verify, remark, greet, moments_on, created_at, avatar_file_id, worldline_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, 'friend', ?, '', '', ?, ?, ?, ?, ?)
+        INSERT INTO personas(
+          id, user_id, name, color, bio, channel_id, state, is_bot, verify, remark,
+          greet, moments_on, created_at, avatar_file_id, worldline_enabled, signature
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'pendingIn', ?, ?, '', ?, ?, ?, ?, ?, ?)
         """,
         (
             pid,
@@ -74,30 +250,73 @@ def create_persona(body: PersonaCreate, user: Dict[str, Any] = Depends(current_u
             body.bio,
             body.channel_id,
             1 if body.is_bot else 0,
+            verify[:120],
             1 if body.greet else 0,
             1 if body.moments_on else 0,
             now,
             body.avatar_file_id or "",
             1 if body.worldline_enabled else 0,
+            signature[:40],
         ),
     )
-    conv_id = new_id("c_")
-    db.execute(
-        """
-        INSERT INTO conversations(id, user_id, persona_id, preview, last_time, unread, pinned, muted, draft, last_seq)
-        VALUES (?, ?, ?, '', ?, 0, 0, 0, '', 0)
-        """,
-        (conv_id, user["id"], pid, now),
-    )
+    # pending 不建会话、不启主动任务；通过后再做
     row = _owned(user["id"], pid)
+    return _persona_out(row)
+
+
+@router.post("/{persona_id}/accept", response_model=PersonaOut)
+def accept_persona(persona_id: str, user: Dict[str, Any] = Depends(current_user)) -> PersonaOut:
+    """通过好友申请：变 friend、建会话、系统气泡。"""
+    row = _owned(user["id"], persona_id)
+    if (row["state"] or "") == "friend":
+        return _persona_out(row)
+    now = iso()
+    db.execute(
+        "UPDATE personas SET state = 'friend' WHERE id = ? AND user_id = ?",
+        (persona_id, user["id"]),
+    )
+    existing = db.fetchone(
+        "SELECT id FROM conversations WHERE user_id = ? AND persona_id = ?",
+        (user["id"], persona_id),
+    )
+    if existing is None:
+        conv_id = new_id("c_")
+        db.execute(
+            """
+            INSERT INTO conversations(id, user_id, persona_id, preview, last_time, unread, pinned, muted, draft, last_seq)
+            VALUES (?, ?, ?, ?, ?, 1, 0, 0, '', 0)
+            """,
+            (
+                conv_id,
+                user["id"],
+                persona_id,
+                "我通过了你的朋友验证请求，现在我们可以开始聊天了",
+                now,
+            ),
+        )
+        try:
+            from ..msg_store import insert_message
+
+            insert_message(
+                user_id=user["id"],
+                conv_id=conv_id,
+                client_id=new_id("sys_"),
+                sender_id="system",
+                mine=False,
+                kind="system",
+                text="我通过了你的朋友验证请求，现在我们可以开始聊天了",
+                state="sent",
+            )
+        except Exception:
+            pass
     try:
         from ..schedules import sync_persona_proactive
 
         sync_persona_proactive(
             user["id"],
-            pid,
-            greet=bool(body.greet),
-            moments_on=bool(body.moments_on),
+            persona_id,
+            greet=bool(row["greet"]),
+            moments_on=bool(row["moments_on"]),
         )
     except Exception:
         pass
@@ -106,13 +325,89 @@ def create_persona(body: PersonaCreate, user: Dict[str, Any] = Depends(current_u
 
         stk.ensure_persona_stickers(
             user_id=user["id"],
-            persona_id=pid,
-            persona_name=body.name or "",
+            persona_id=persona_id,
+            persona_name=row["name"] or "",
         )
     except Exception:
         pass
-    return _persona_out(row)
+    row = _owned(user["id"], persona_id)
+    memories = [{"id": m["id"], "text": m["text"]} for m in mem.list_memories(user["id"], persona_id)]
+    return _persona_out(row, memories)
 
+
+@router.post("/{persona_id}/ignore")
+def ignore_persona(persona_id: str, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """忽略待通过申请：删除人设。"""
+    row = _owned(user["id"], persona_id)
+    if (row["state"] or "") == "friend":
+        raise HTTPException(400, "已是好友，请用人设删除")
+    db.execute("DELETE FROM personas WHERE id = ? AND user_id = ?", (persona_id, user["id"]))
+    return {"ok": True, "id": persona_id}
+
+
+class ExtractPromptsIn(BaseModel):
+    name: str = Field(default="", max_length=32)
+    bio: str = Field(default="", max_length=4000)
+
+
+def _do_extract(
+    *, name: str, bio: str, user_id: str = "", channel_id: str = ""
+) -> Dict[str, str]:
+    return _llm_extract_prompts(
+        name=name or "她",
+        bio=bio,
+        user_id=user_id,
+        channel_id=channel_id,
+    ) or _heuristic_extract_prompts(name=name or "她", bio=bio)
+
+
+@router.post("/extract-prompts")
+def extract_prompts_preview(
+    body: ExtractPromptsIn,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, str]:
+    """创建前人设说明预览抽取（无需 persona_id）。优先用户任一已填 Key 渠道。"""
+    name = (body.name or "").strip()
+    bio = (body.bio or "").strip()
+    if not name and not bio:
+        raise HTTPException(400, "需要 name 或 bio")
+    ch = db.fetchone(
+        """
+        SELECT id FROM channels
+        WHERE (user_id = ? OR shared = 1) AND key_enc != ''
+        ORDER BY shared ASC, created_at DESC LIMIT 1
+        """,
+        (user["id"],),
+    )
+    return _do_extract(
+        name=name or "她",
+        bio=bio,
+        user_id=user["id"],
+        channel_id=(ch["id"] if ch else ""),
+    )
+
+
+@router.post("/{persona_id}/extract-prompts")
+def extract_prompts_for_persona(
+    persona_id: str,
+    body: Optional[ExtractPromptsIn] = None,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, str]:
+    """从已有人设抽取头像/形象/音色提示词与签名（渠道 Key，不经 DSH）。"""
+    row = _owned(user["id"], persona_id)
+    name = (row["remark"] or row["name"] or "").strip()
+    bio = (row["bio"] or "").strip()
+    if body:
+        if (body.name or "").strip():
+            name = body.name.strip()
+        if (body.bio or "").strip():
+            bio = body.bio.strip()
+    return _do_extract(
+        name=name or "她",
+        bio=bio,
+        user_id=user["id"],
+        channel_id=(row["channel_id"] or ""),
+    )
 
 @router.get("", response_model=List[PersonaOut])
 def list_personas(user: Dict[str, Any] = Depends(current_user)) -> List[PersonaOut]:
@@ -169,6 +464,15 @@ def patch_persona(
     pref = (pref or "sometimes").strip()
     if pref not in ("never", "sometimes", "always"):
         raise HTTPException(status_code=400, detail="voice_reply_pref 须为 never|sometimes|always")
+    try:
+        cur_sig = (row["signature"] or "").strip()
+    except Exception:
+        cur_sig = ""
+    signature = (
+        body.signature.strip()[:40]
+        if body.signature is not None
+        else cur_sig
+    )
     if avatar:
         owned = db.fetchone(
             "SELECT id FROM media_files WHERE id = ? AND user_id = ?",
@@ -190,7 +494,7 @@ def patch_persona(
         """
         UPDATE personas
         SET name = ?, bio = ?, channel_id = ?, remark = ?, greet = ?, moments_on = ?, color = ?,
-            avatar_file_id = ?, voice_reply_pref = ?
+            avatar_file_id = ?, voice_reply_pref = ?, signature = ?
         WHERE id = ? AND user_id = ?
         """,
         (
@@ -203,6 +507,7 @@ def patch_persona(
             color,
             avatar or "",
             pref,
+            signature or "",
             persona_id,
             user["id"],
         ),

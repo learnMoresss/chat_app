@@ -272,12 +272,20 @@ def pcm16_mono_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
     return _pcm16_mono_to_wav(pcm, sample_rate)
 
 
-def resolve_tts_engine(*, for_realtime: bool = False) -> str:
+def resolve_tts_engine(*, for_realtime: bool = False, for_draw: bool = False) -> str:
+    """选引擎。
+
+    - 实时通话：tts_realtime_engine（默认 cosyvoice）
+    - 音色抽卡/试听：breeze（VoiceDesign 风格描述 → 合成）
+    - 其它：tts_engine
+    """
     settings = get_settings()
     if for_realtime:
         rt = (getattr(settings, "tts_realtime_engine", None) or "").strip().lower()
         if rt:
             return rt
+    if for_draw:
+        return "breeze"
     return (settings.tts_engine or "breeze").strip().lower() or "breeze"
 
 
@@ -290,17 +298,19 @@ def synthesize_voice_wav(
     keep_loaded: bool = False,
     engine: Optional[str] = None,
     for_realtime: bool = False,
+    prompt_wav: str = "",
 ) -> Optional[bytes]:
     """按音色描述 instructions 合成一段 WAV；失败返回 None。
 
     keep_loaded=True：合成后不立刻 unload（实时逐句对话用）。
     engine / for_realtime：指定引擎；实时默认走 tts_realtime_engine。
+    prompt_wav：固定/上传参考音色 wav，供 CosyVoice 克隆。
     """
     import random
 
     text = (text or "").strip()
-    instructions = (instructions or "").strip()
-    if not text or not instructions:
+    instructions = (instructions or "").strip() or "自然说话。"
+    if not text:
         return None
     if len(text) > 120:
         for sep in ("。", "！", "？", "；", "\n", ".", "!", "?"):
@@ -315,6 +325,7 @@ def synthesize_voice_wav(
     eng = (engine or resolve_tts_engine(for_realtime=for_realtime)).strip().lower()
     use_seed = int(seed) if seed is not None else random.randint(1, 2**31 - 1)
     cfg = round(3.2 + random.random() * 1.6, 2)
+    ref = (prompt_wav or "").strip()
     from . import tts_ondemand
 
     def _with_engine(name: str, fn):
@@ -322,12 +333,20 @@ def synthesize_voice_wav(
             tts_ondemand.ensure_engine(name)
             return fn()
         finally:
-            tts_ondemand.release_engine(name, unload_now=not keep_loaded)
+            # 抽卡 keep_loaded：拉长闲置，减少「预热完又被卸」
+            idle = getattr(tts_ondemand, "DRAW_IDLE_SECONDS", 600.0) if keep_loaded else None
+            tts_ondemand.release_engine(
+                name,
+                unload_now=not keep_loaded,
+                idle_seconds=idle,
+            )
 
     if eng == "cosyvoice":
         wav = _with_engine(
             "cosyvoice",
-            lambda: _cosyvoice_wav(text=text, instructions=instructions, timeout=to),
+            lambda: _cosyvoice_wav(
+                text=text, instructions=instructions, timeout=to, prompt_wav=ref
+            ),
         )
         if wav:
             return wav
@@ -348,8 +367,17 @@ def synthesize_voice_wav(
         )
         if wav:
             return wav
-        return _with_engine(
+        # breeze 挂了时依次试 voicedesign / cosy，避免抽卡整批 503 卡死感
+        wav = _with_engine(
             "voicedesign", lambda: _voicedesign_wav(text=text, instructions=instructions, timeout=to)
+        )
+        if wav:
+            return wav
+        return _with_engine(
+            "cosyvoice",
+            lambda: _cosyvoice_wav(
+                text=text, instructions=instructions, timeout=to, prompt_wav=ref
+            ),
         )
     if eng == "voicedesign":
         return _with_engine(
@@ -358,7 +386,9 @@ def synthesize_voice_wav(
     # 未知引擎：试 cosy → breeze
     return _with_engine(
         "cosyvoice",
-        lambda: _cosyvoice_wav(text=text, instructions=instructions, timeout=to),
+        lambda: _cosyvoice_wav(
+            text=text, instructions=instructions, timeout=to, prompt_wav=ref
+        ),
     ) or _with_engine(
         "breeze",
         lambda: _breeze_wav(
@@ -367,15 +397,20 @@ def synthesize_voice_wav(
     )
 
 
-def warm_tts_engine(*, for_realtime: bool = True, prompt_wav: str = "") -> dict:
-    """通话进页预热：ensure 引擎；CosyVoice 走 /v1/warm（模型+声线声学缓存）。
+def warm_tts_engine(
+    *,
+    for_realtime: bool = True,
+    for_draw: bool = False,
+    prompt_wav: str = "",
+) -> dict:
+    """通话/抽卡进页预热：ensure 引擎；CosyVoice 走 /v1/warm（模型+声线声学缓存）。
 
-    预热发生在用户点开通话时，不计入「说完→首声」等待。
+    预热发生在用户点开通话/抽卡时，不计入「说完→首声」等待。
     prompt_wav：固定音色试听 wav，供 CosyVoice 克隆。
     """
     from . import tts_ondemand
 
-    engine = resolve_tts_engine(for_realtime=for_realtime)
+    engine = resolve_tts_engine(for_realtime=for_realtime, for_draw=for_draw)
     try:
         tts_ondemand.ensure_engine(engine)
     except Exception as e:

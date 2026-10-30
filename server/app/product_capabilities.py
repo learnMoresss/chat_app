@@ -231,7 +231,13 @@ def set_user_grants(user_id: str, grants: Dict[str, bool]) -> List[Dict[str, Any
     return list_for_user(user_id, is_admin=bool(user and user["is_admin"]))
 
 
-def prompt_hints(user_id: str, *, is_admin: bool = False, has_fixed_voice: bool = False) -> str:
+def prompt_hints(
+    user_id: str,
+    *,
+    is_admin: bool = False,
+    has_fixed_voice: bool = False,
+    has_fixed_look: bool = False,
+) -> str:
     """只注入已注册能力短暗号；目录检索留给 media_dispatch，不在此罗列文件。"""
     enabled = enabled_ids_for_user(user_id, is_admin=is_admin)
     lines: List[str] = ["【已注册能力】只用下列暗号；未列出的不要假装能做。"]
@@ -241,6 +247,17 @@ def prompt_hints(user_id: str, *, is_admin: bool = False, has_fixed_voice: bool 
         if c.id == "voice" and not has_fixed_voice:
             continue
         lines.append(f"- {c.label}：{c.prompt_hint}")
+    if "image" in enabled:
+        if has_fixed_look:
+            lines.append(
+                "【形象】已固定。对方要自拍/看你在干啥：先短回「正在拍」，"
+                "再写 ⟦图：当前场景自拍一句话⟧；系统会图生图。表情包才常带字。"
+            )
+        else:
+            lines.append(
+                "【形象】未固定（头像不算）。对方要自拍/看你时不要写自拍 ⟦图⟧、不要假装已发；"
+                "口语提去抽卡固定，系统会引导。"
+            )
     missing = [c.label for c in CATALOG if system_available().get(c.id) and c.id not in enabled]
     if missing:
         lines.append("【未开通】" + "、".join(missing) + "。对方要时如实说还没开。")
@@ -262,6 +279,7 @@ def filter_media_intents(
     enabled = enabled_ids_for_user(user_id, is_admin=is_admin)
     kind_map = {
         "sticker": "sticker",
+        "sticker_pack": "sticker",
         "image": "image",
         "video": "video",
         "voice": "voice",

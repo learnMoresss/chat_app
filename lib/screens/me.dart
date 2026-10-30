@@ -11,6 +11,7 @@ import '../store.dart';
 import '../theme.dart';
 import '../widgets.dart';
 import 'bootstrap.dart';
+import 'fullscreen_images.dart';
 import 'moments.dart';
 import 'usage.dart';
 
@@ -166,15 +167,32 @@ class _ProfileEditPageState extends State<ProfileEditPage> {
             children: [
               ListTile(
                 title: const Text('头像'),
-                trailing: Avatar(
-                  name.text.isEmpty ? widget.store.meName : name.text,
-                  const Color(0xFF4C8DFF),
-                  size: 48,
-                  api: widget.store.api,
-                  avatarFileId: avatarFileId.isEmpty ? null : avatarFileId,
-                  localBytes: avatarBytes,
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    GestureDetector(
+                      onTap: () {
+                        openAvatarPreview(
+                          context,
+                          api: widget.store.api,
+                          fileId: avatarFileId.isEmpty ? null : avatarFileId,
+                          bytes: avatarBytes,
+                          label: name.text.isEmpty ? widget.store.meName : name.text,
+                        );
+                      },
+                      child: Avatar(
+                        name.text.isEmpty ? widget.store.meName : name.text,
+                        const Color(0xFF4C8DFF),
+                        size: 48,
+                        api: widget.store.api,
+                        avatarFileId: avatarFileId.isEmpty ? null : avatarFileId,
+                        localBytes: avatarBytes,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    TextButton(onPressed: _pickAvatar, child: const Text('上传')),
+                  ],
                 ),
-                onTap: _pickAvatar,
               ),
               const Divider(height: 1),
               Padding(

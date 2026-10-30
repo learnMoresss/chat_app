@@ -7,6 +7,7 @@ import '../theme.dart';
 import '../widgets.dart';
 import 'chat.dart';
 import 'create_persona.dart';
+import 'fullscreen_images.dart';
 import 'persona.dart';
 import 'requests.dart';
 import 'tags.dart';
@@ -65,7 +66,29 @@ class ContactsPage extends StatelessWidget {
                 Container(width: double.infinity, color: AppColors.bg, padding: const EdgeInsets.fromLTRB(16, 4, 16, 4), child: Text(letter, style: const TextStyle(color: AppColors.sub, fontSize: 13))),
                 for (final p in grouped[letter]!)
                   ListTile(
-                    leading: Avatar(p.display, p.color, api: store.api, avatarFileId: p.avatarFileId.isEmpty ? null : p.avatarFileId),
+                    leading: SizedBox(
+                      width: 48,
+                      height: 48,
+                      child: GestureDetector(
+                        onTap: () {
+                          final fid = p.avatarFileId;
+                          if (fid.isEmpty) return;
+                          openAvatarPreview(
+                            context,
+                            api: store.api,
+                            fileId: fid,
+                            label: p.display,
+                          );
+                        },
+                        child: Avatar(
+                          p.display,
+                          p.color,
+                          size: 48,
+                          api: store.api,
+                          avatarFileId: p.avatarFileId.isEmpty ? null : p.avatarFileId,
+                        ),
+                      ),
+                    ),
                     title: Text(p.display),
                     subtitle: p.isBot ? const Text('人设 · 查看配置') : null,
                     onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PersonaPage(store: store, persona: p))),

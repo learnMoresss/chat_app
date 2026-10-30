@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -1763,21 +1765,14 @@ class _EmojiPanelState extends State<_EmojiPanel> {
   Future<void> _createMyPack() async {
     final api = widget.store.api;
     if (api == null) return;
-    final ctrl = TextEditingController(text: '我的组');
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('新建表情组'),
-        content: TextField(controller: ctrl, decoration: const InputDecoration(hintText: '组名')),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('创建')),
-        ],
-      ),
+    final title = await showWxInputDialog(
+      context,
+      title: '新建表情组',
+      initial: '我的组',
+      hint: '组名',
+      confirmText: '创建',
     );
-    if (ok != true) return;
-    final title = ctrl.text.trim();
-    if (title.isEmpty) return;
+    if (title == null || title.isEmpty) return;
     try {
       await api.createStickerPack(title: title);
       await widget.store.refreshStickersFromApi();
@@ -1825,6 +1820,7 @@ class _EmojiPanelState extends State<_EmojiPanel> {
         final cover = pack.coverFileIds.isNotEmpty ? pack.coverFileIds.first : '';
         return InkWell(
           onTap: () => _openPack(pack),
+          onLongPress: mine ? () => _confirmDeletePack(pack) : null,
           borderRadius: BorderRadius.circular(8),
           child: Column(
             children: [
@@ -1849,7 +1845,80 @@ class _EmojiPanelState extends State<_EmojiPanel> {
     );
   }
 
+  Future<void> _confirmDeletePack(StickerPack pack) async {
+    final api = widget.store.api;
+    if (api == null) return;
+    final ok = await showWxConfirmDialog(
+      context,
+      title: '删除此组？',
+      message: '将删除「${pack.title}」整组表情，此操作不可恢复。',
+      confirmText: '删除',
+      busyText: '删除中…',
+      destructive: true,
+      runOnConfirm: () async {
+        await api.deleteStickerPack(pack.id);
+        if (openPackId == pack.id) {
+          openPackId = null;
+          packItems = const [];
+        }
+        await widget.store.refreshStickersFromApi();
+        if (mounted) setState(() {});
+      },
+    );
+    if (ok == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已删除表情组')));
+    }
+  }
+
+  void _showPackItemMenu(Sticker s, Rect anchor) {
+    HapticFeedback.mediumImpact();
+    final canDelete = openPackId != null &&
+        widget.store.stickerPacks.any((p) => p.id == openPackId && p.scope == 'account');
+    final items = <_WxMenuItem>[
+      _WxMenuItem(Icons.send_outlined, '发送', () => widget.onPickSticker(s)),
+      if (canDelete)
+        _WxMenuItem(Icons.delete_outline, '删除', () => _deletePackItem(s), danger: true),
+    ];
+    final overlay = Overlay.of(context);
+    late OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (ctx) => _WxMsgMenuOverlay(
+        bubble: anchor,
+        mine: true,
+        items: items,
+        onDismiss: () => entry.remove(),
+      ),
+    );
+    overlay.insert(entry);
+  }
+
+  Future<void> _deletePackItem(Sticker s) async {
+    final api = widget.store.api;
+    if (api == null || s.id.isEmpty) return;
+    final ok = await showWxConfirmDialog(
+      context,
+      title: '删除表情？',
+      message: '将从本组移除这张表情。',
+      confirmText: '删除',
+      destructive: true,
+      busyText: '删除中…',
+      runOnConfirm: () async {
+        await api.deleteSticker(s.id);
+        widget.store.removeSticker(s.id);
+        if (openPackId != null) {
+          await _openPack(StickerPack(id: openPackId!, title: ''));
+        }
+        await widget.store.refreshStickersFromApi();
+      },
+    );
+    if (ok == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已删除')));
+    }
+  }
+
   Widget _packItemsGrid() {
+    final minePack = openPackId != null &&
+        widget.store.stickerPacks.any((p) => p.id == openPackId && p.scope == 'account');
     return Column(
       children: [
         SizedBox(
@@ -1864,10 +1933,11 @@ class _EmojiPanelState extends State<_EmojiPanel> {
                 }),
               ),
               const Expanded(child: Text('组内表情', style: TextStyle(fontSize: 13))),
-              IconButton(
-                icon: const Icon(Icons.add, size: 20),
-                onPressed: () => _addFromAlbum(packId: openPackId ?? ''),
-              ),
+              if (minePack)
+                IconButton(
+                  icon: const Icon(Icons.add, size: 20),
+                  onPressed: () => _addFromAlbum(packId: openPackId ?? ''),
+                ),
             ],
           ),
         ),
@@ -1879,9 +1949,9 @@ class _EmojiPanelState extends State<_EmojiPanel> {
               mainAxisSpacing: 10,
               crossAxisSpacing: 10,
             ),
-            itemCount: packItems.length + 1,
+            itemCount: packItems.length + (minePack ? 1 : 0),
             itemBuilder: (context, i) {
-              if (i == 0) {
+              if (minePack && i == 0) {
                 return InkWell(
                   onTap: () => _addFromAlbum(packId: openPackId ?? ''),
                   borderRadius: BorderRadius.circular(6),
@@ -1895,15 +1965,25 @@ class _EmojiPanelState extends State<_EmojiPanel> {
                   ),
                 );
               }
-              final s = packItems[i - 1];
-              return InkWell(
-                onTap: () => widget.onPickSticker(s),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: s.fileId.isNotEmpty && widget.store.api != null
-                      ? AuthFileImage(api: widget.store.api, fileId: s.fileId, placeholder: ColoredBox(color: s.color))
-                      : ColoredBox(color: s.color),
-                ),
+              final s = packItems[minePack ? i - 1 : i];
+              return Builder(
+                builder: (cellCtx) {
+                  return InkWell(
+                    onTap: () => widget.onPickSticker(s),
+                    onLongPress: () {
+                      final box = cellCtx.findRenderObject() as RenderBox?;
+                      if (box == null || !box.hasSize) return;
+                      final rect = box.localToGlobal(Offset.zero) & box.size;
+                      _showPackItemMenu(s, rect);
+                    },
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: s.fileId.isNotEmpty && widget.store.api != null
+                          ? AuthFileImage(api: widget.store.api, fileId: s.fileId, placeholder: ColoredBox(color: s.color))
+                          : ColoredBox(color: s.color),
+                    ),
+                  );
+                },
               );
             },
           ),
@@ -2091,19 +2171,65 @@ class _Bubble extends StatelessWidget {
     if (msg.kind == MsgKind.system) {
       final level = (msg.meta?['level'] as String?) ?? '';
       final warn = level == 'warn';
+      final action = (msg.meta?['action'] as String?) ?? '';
+      final link = (msg.meta?['link'] as String?) ?? '';
+      final setupKind = ((msg.meta?['setup'] as String?) ?? '').trim().toLowerCase();
+      final setupPid = ((msg.meta?['persona_id'] as String?) ?? conv.personaId ?? '').trim();
+      final body = msg.text;
+      Widget child;
+      if (action == 'open_persona_draw' && link.isNotEmpty) {
+        final idx = body.indexOf(link);
+        final before = idx >= 0 ? body.substring(0, idx) : body;
+        final after = idx >= 0 ? body.substring(idx + link.length) : '';
+        final drawTab = setupKind == 'image' ? 1 : 0;
+        child = Text.rich(
+          TextSpan(
+            style: TextStyle(fontSize: 12, height: 1.35, color: warn ? AppColors.badge : AppColors.sub),
+            children: [
+              if (before.isNotEmpty) TextSpan(text: before),
+              TextSpan(
+                text: link,
+                style: const TextStyle(
+                  color: AppColors.name,
+                  decoration: TextDecoration.underline,
+                  fontWeight: FontWeight.w600,
+                ),
+                recognizer: (TapGestureRecognizer()
+                  ..onTap = () {
+                    if (setupPid.isEmpty) return;
+                    final p = store.persona(setupPid);
+                    if (p == null) return;
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => PersonaDrawPage(
+                          store: store,
+                          persona: p,
+                          initialTab: drawTab,
+                        ),
+                      ),
+                    );
+                  }),
+              ),
+              if (after.isNotEmpty) TextSpan(text: after),
+            ],
+          ),
+          textAlign: TextAlign.center,
+        );
+      } else {
+        child = Text(
+          body,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 12,
+            height: 1.35,
+            color: warn ? AppColors.badge : AppColors.sub,
+          ),
+        );
+      }
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 24),
-        child: Center(
-          child: Text(
-            msg.text,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.35,
-              color: warn ? AppColors.badge : AppColors.sub,
-            ),
-          ),
-        ),
+        child: Center(child: child),
       );
     }
 
@@ -2265,7 +2391,15 @@ class _Bubble extends StatelessWidget {
             ),
           if (!mine)
             GestureDetector(
-              onTap: onAvatar,
+              onTap: () {
+                final fid = store.persona(msg.senderId)?.avatarFileId ?? '';
+                if (fid.isNotEmpty) {
+                  openAvatarPreview(context, api: store.api, fileId: fid, label: senderName);
+                } else {
+                  onAvatar();
+                }
+              },
+              onLongPress: onAvatar,
               child: Avatar(
                 senderName,
                 senderColor,
@@ -2305,12 +2439,19 @@ class _Bubble extends StatelessWidget {
           ),
           if (mine) const SizedBox(width: 8),
           if (mine)
-            Avatar(
-              store.meName,
-              const Color(0xFF4C8DFF),
-              size: 40,
-              api: store.api,
-              avatarFileId: store.meAvatarFileId.isEmpty ? null : store.meAvatarFileId,
+            GestureDetector(
+              onTap: () {
+                final fid = store.meAvatarFileId;
+                if (fid.isEmpty) return;
+                openAvatarPreview(context, api: store.api, fileId: fid, label: store.meName);
+              },
+              child: Avatar(
+                store.meName,
+                const Color(0xFF4C8DFF),
+                size: 40,
+                api: store.api,
+                avatarFileId: store.meAvatarFileId.isEmpty ? null : store.meAvatarFileId,
+              ),
             ),
         ],
       ),
@@ -2329,15 +2470,6 @@ class _ImageCard extends StatefulWidget {
 }
 
 class _ImageCardState extends State<_ImageCard> {
-  late final PageController _page = PageController();
-  int _index = 0;
-
-  @override
-  void dispose() {
-    _page.dispose();
-    super.dispose();
-  }
-
   Widget _slideChild(ImageSlide s) {
     if (s.bytes != null) {
       return Image.memory(
@@ -2386,95 +2518,22 @@ class _ImageCardState extends State<_ImageCard> {
     late Widget card;
     if (n == 1) {
       card = SizedBox(
-        width: 168,
-        height: 168,
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(6),
-          child: ColoredBox(
-            color: const Color(0xFFE8E8E8),
-            child: GestureDetector(
-              onTap: () => openAt(0),
-              child: slides.isEmpty ? const SizedBox.shrink() : _slideChild(slides.first),
-            ),
+        width: 120,
+        height: 160,
+        child: _FanCardShell(
+          child: GestureDetector(
+            onTap: () => openAt(0),
+            child: slides.isEmpty ? const SizedBox.shrink() : _slideChild(slides.first),
           ),
         ),
       );
     } else {
-      // 叠层错开：后面几张略偏移，前面是可滑动 PageView
-      const w = 168.0;
-      const h = 168.0;
-      final stackDepth = (n - 1).clamp(1, 3);
-      card = SizedBox(
-        width: w + stackDepth * 5,
-        height: h + stackDepth * 5,
-        child: Stack(
-          clipBehavior: Clip.none,
-          children: [
-            for (var layer = stackDepth; layer >= 1; layer--)
-              Positioned(
-                left: layer * 5.0,
-                top: layer * 5.0,
-                child: Container(
-                  width: w,
-                  height: h,
-                  decoration: BoxDecoration(
-                    color: Color.lerp(const Color(0xFFD8D8D8), const Color(0xFFBEBEBE), layer / 3),
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: Colors.white, width: 1.5),
-                    boxShadow: const [BoxShadow(color: Color(0x14000000), blurRadius: 4, offset: Offset(0, 1))],
-                  ),
-                ),
-              ),
-            Positioned(
-              left: 0,
-              top: 0,
-              child: Container(
-                width: w,
-                height: h,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: Colors.white, width: 1.5),
-                  boxShadow: const [BoxShadow(color: Color(0x22000000), blurRadius: 6, offset: Offset(0, 2))],
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(5),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      PageView.builder(
-                        controller: _page,
-                        itemCount: n,
-                        onPageChanged: (i) => setState(() => _index = i),
-                        itemBuilder: (_, i) => GestureDetector(
-                          onTap: () => openAt(i),
-                          child: ColoredBox(
-                            color: const Color(0xFFE8E8E8),
-                            child: _slideChild(slides[i]),
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        right: 6,
-                        bottom: 6,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: const Color(0x99000000),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Text(
-                            '${_index + 1}/$n',
-                            style: const TextStyle(color: Colors.white, fontSize: 11, height: 1.2),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
+      card = _FanStackCards(
+        onOpenAt: openAt,
+        children: [
+          for (var i = 0; i < n; i++)
+            slides.isEmpty ? const SizedBox.shrink() : _slideChild(slides[i]),
+        ],
       );
     }
 
@@ -2489,6 +2548,222 @@ class _ImageCardState extends State<_ImageCard> {
             child: Text(caption ?? widget.msg.text, style: const TextStyle(fontSize: 15, height: 1.3)),
           ),
       ],
+    );
+  }
+}
+
+/// 竖长方形黑底卡片壳。
+class _FanCardShell extends StatelessWidget {
+  const _FanCardShell({required this.child, this.width = 120, this.height = 160});
+  final Widget child;
+  final double width;
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: width,
+      height: height,
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: const [
+          BoxShadow(color: Color(0x44000000), blurRadius: 8, offset: Offset(0, 3)),
+        ],
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: child,
+    );
+  }
+}
+
+/// 多图扇形堆叠：竖长方形、黑底、底中为旋转原点；
+/// 顶卡 0°（竖着），后面错开角度；左右滑切换顶卡；点按进全屏预览。
+class _FanStackCards extends StatefulWidget {
+  const _FanStackCards({
+    required this.children,
+    required this.onOpenAt,
+    this.onLongPress,
+    this.cardWidth = 120,
+    this.cardHeight = 160,
+  });
+
+  final List<Widget> children;
+  final ValueChanged<int> onOpenAt;
+  final VoidCallback? onLongPress;
+  final double cardWidth;
+  final double cardHeight;
+
+  @override
+  State<_FanStackCards> createState() => _FanStackCardsState();
+}
+
+class _FanStackCardsState extends State<_FanStackCards> with TickerProviderStateMixin {
+  static const _maxVisible = 9;
+  /// 只露 2 张后卡：露边就是「下一张」，避免更后面的图抢镜
+  static const _maxBehind = 2;
+  /// 半开向右：后卡顺时针错开，顶边露在右侧（实测负角会跑到左边）
+  static const _stepDeg = 5.5;
+
+  int _top = 0;
+  double _dragDeg = 0;
+  bool _busy = false;
+
+  int get _n => widget.children.length.clamp(0, _maxVisible);
+
+  /// depth=0 竖直；后面只往右偏
+  double _depthRest(int depth) {
+    if (depth <= 0) return 0;
+    return _stepDeg * depth;
+  }
+
+  /// 堆叠顺序：顶卡 → 下一张 → 下下张（和左右滑切到的下一张一致）
+  int _indexAtDepth(int depth) => (_top + depth) % _n;
+
+  Future<void> _flipToNext({required bool forward}) async {
+    if (_busy || _n <= 1) return;
+    _busy = true;
+    final startDrag = _dragDeg;
+    // 右往左滑：顶卡往左甩走（负角），露出右侧下一张
+    final endDrag = forward ? -52.0 : 52.0;
+    final nextTop = forward ? (_top + 1) % _n : (_top + _n - 1) % _n;
+
+    final t = AnimationController(vsync: this, duration: const Duration(milliseconds: 260));
+    final curved = CurvedAnimation(parent: t, curve: Curves.easeInOut);
+    void tick() {
+      setState(() {
+        _dragDeg = startDrag + (endDrag - startDrag) * curved.value;
+      });
+    }
+    curved.addListener(tick);
+    await t.forward();
+    curved.removeListener(tick);
+    t.dispose();
+    if (!mounted) return;
+    setState(() {
+      _top = nextTop;
+      _dragDeg = 0;
+      _busy = false;
+    });
+  }
+
+  void _onDragUpdate(DragUpdateDetails d) {
+    if (_busy || _n <= 1) return;
+    setState(() {
+      _dragDeg += d.delta.dx * 0.22;
+      _dragDeg = _dragDeg.clamp(-48.0, 48.0);
+    });
+  }
+
+  void _onDragEnd(DragEndDetails d) {
+    if (_busy || _n <= 1) return;
+    final v = d.primaryVelocity ?? 0;
+    if (_dragDeg.abs() > 16 || v.abs() > 500) {
+      // 右往左滑（负向）→ 下一张 2/7；左往右 → 上一张
+      final forward = _dragDeg < 0 || v < 0;
+      unawaited(_flipToNext(forward: forward));
+    } else {
+      setState(() => _dragDeg = 0);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_n <= 0) return const SizedBox.shrink();
+    // 右侧留足空间给半开露边，左侧几乎贴齐
+    final padL = widget.cardWidth * 0.02;
+    final padR = widget.cardWidth * 0.32;
+    final boxW = widget.cardWidth + padL + padR;
+    final boxH = widget.cardHeight + 6;
+    final behind = (_n - 1).clamp(0, _maxBehind);
+
+    return GestureDetector(
+      onTap: () => widget.onOpenAt(_top),
+      onLongPress: widget.onLongPress,
+      onHorizontalDragUpdate: _onDragUpdate,
+      onHorizontalDragEnd: _onDragEnd,
+      child: SizedBox(
+        width: boxW,
+        height: boxH,
+        child: Stack(
+          alignment: Alignment.bottomLeft,
+          clipBehavior: Clip.none,
+          children: [
+            Positioned(
+              left: padL,
+              bottom: 0,
+              width: widget.cardWidth,
+              height: widget.cardHeight,
+              child: Stack(
+                alignment: Alignment.bottomCenter,
+                clipBehavior: Clip.none,
+                children: [
+                  for (var depth = behind; depth >= 0; depth--)
+                    _buildLayer(depth),
+                ],
+              ),
+            ),
+            if (_n > 1)
+              Positioned(
+                left: padL + 4,
+                bottom: 4,
+                child: IgnorePointer(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: const Color(0x99000000),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      '${_top + 1}/$_n',
+                      style: const TextStyle(color: Colors.white, fontSize: 11, height: 1.1),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLayer(int depth) {
+    final idx = _indexAtDepth(depth);
+    final rest = _depthRest(depth);
+    double deg = rest;
+    if (depth == 0) {
+      deg = rest + _dragDeg;
+    } else if (depth == 1) {
+      // 拖动时下一张往竖直靠拢，切换后就是它
+      final t = (_dragDeg.abs() / 52.0).clamp(0.0, 1.0);
+      deg = rest * (1.0 - t);
+    }
+    final rad = deg * math.pi / 180;
+    final opacity = depth == 0 && _dragDeg.abs() > 28
+        ? (1 - ((_dragDeg.abs() - 28) / 24).clamp(0.0, 0.6))
+        : 1.0;
+    // 后层明显缩小，只露一点边，不会顶出前卡
+    final scale = switch (depth) {
+      0 => 1.0,
+      1 => 0.86,
+      _ => 0.74,
+    };
+
+    return Transform.rotate(
+      angle: rad,
+      alignment: Alignment.bottomCenter,
+      child: Transform.scale(
+        scale: scale,
+        alignment: Alignment.bottomCenter,
+        child: Opacity(
+          opacity: opacity,
+          child: _FanCardShell(
+            width: widget.cardWidth,
+            height: widget.cardHeight,
+            child: widget.children[idx],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -2566,6 +2841,207 @@ class _VoiceAsrBelow extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _StickerPackStackCard extends StatefulWidget {
+  const _StickerPackStackCard({required this.msg, required this.meta, this.store});
+  final Msg msg;
+  final Map<String, dynamic> meta;
+  final AppStore? store;
+
+  @override
+  State<_StickerPackStackCard> createState() => _StickerPackStackCardState();
+}
+
+class _StickerPackStackCardState extends State<_StickerPackStackCard> {
+  late bool _subscribed;
+
+  @override
+  void initState() {
+    super.initState();
+    _subscribed = widget.meta['subscribed'] == true;
+  }
+
+  Future<List<ImageSlide>> _packSlides() async {
+    final api = widget.store?.api;
+    final packId = widget.meta['pack_id']?.toString() ?? '';
+    final covers = (widget.meta['cover_file_ids'] is List)
+        ? [for (final c in widget.meta['cover_file_ids'] as List) c.toString()]
+        : const <String>[];
+    if (api == null) {
+      return [for (final f in covers.where((e) => e.isNotEmpty).take(9)) ImageSlide(fileId: f)];
+    }
+    if (packId.isEmpty) {
+      return [for (final f in covers.where((e) => e.isNotEmpty).take(9)) ImageSlide(fileId: f)];
+    }
+    try {
+      final row = await api.getStickerPack(packId);
+      final items = (row['items'] as List?) ?? const [];
+      final slides = <ImageSlide>[];
+      for (final e in items) {
+        if (e is! Map) continue;
+        final fid = e['file_id']?.toString() ?? '';
+        if (fid.isEmpty) continue;
+        slides.add(ImageSlide(fileId: fid, label: e['label']?.toString() ?? ''));
+        if (slides.length >= 9) break;
+      }
+      if (slides.isNotEmpty) return slides;
+    } catch (_) {}
+    return [for (final f in covers.where((e) => e.isNotEmpty).take(9)) ImageSlide(fileId: f)];
+  }
+
+  Future<void> _previewPack({int initial = 0}) async {
+    final slides = await _packSlides();
+    if (!mounted || slides.isEmpty) return;
+    await openFullscreenImages(
+      context,
+      slides: slides,
+      initialIndex: initial.clamp(0, slides.length - 1),
+      api: widget.store?.api,
+    );
+  }
+
+  Future<void> _confirmFork() async {
+    final s = widget.store;
+    final api = s?.api;
+    final packId = widget.meta['pack_id']?.toString() ?? '';
+    if (s == null || api == null || packId.isEmpty) return;
+    if (_subscribed) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已在「全」里')));
+      return;
+    }
+    final ok = await showWxConfirmDialog(
+      context,
+      title: '加到表情？',
+      message: '将「${widget.meta['title'] ?? '表情组'}」加入面板「全」分组，不会复制到「我的组」。',
+      confirmText: '添加',
+      busyText: '添加中…',
+      runOnConfirm: () async {
+        // 只订阅，不 fork 复制——避免一堆表情自动塞进「我的组」
+        await api.subscribeStickerPack(packId);
+        if (!mounted) return;
+        setState(() => _subscribed = true);
+        unawaited(s.refreshStickersFromApi());
+      },
+    );
+    if (ok == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已加到「全」')));
+    }
+  }
+
+  void _showPackMenu(Rect anchor) {
+    HapticFeedback.mediumImpact();
+    final items = <_WxMenuItem>[
+      _WxMenuItem(Icons.visibility_outlined, '预览', () => unawaited(_previewPack())),
+      _WxMenuItem(
+        _subscribed ? Icons.check_circle_outline : Icons.star_outline,
+        _subscribed ? '已添加' : '收藏',
+        _subscribed ? () {} : _confirmFork,
+      ),
+    ];
+    final overlay = Overlay.of(context);
+    late OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (ctx) => _WxMsgMenuOverlay(
+        bubble: anchor,
+        mine: false,
+        items: items,
+        onDismiss: () => entry.remove(),
+      ),
+    );
+    overlay.insert(entry);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final meta = widget.meta;
+    final packTitle = meta['title']?.toString() ?? '表情包';
+    final n = (meta['item_count'] is num) ? (meta['item_count'] as num).toInt() : 0;
+    final covers = (meta['cover_file_ids'] is List)
+        ? [for (final c in meta['cover_file_ids'] as List) c.toString()]
+        : const <String>[];
+    final api = widget.store?.api;
+    final stackCovers = covers.where((e) => e.isNotEmpty).take(9).toList();
+    final count = (n > 0 ? n : stackCovers.length).clamp(0, 9);
+
+    Widget coverChild(String fid) {
+      if (api == null) {
+        return const ColoredBox(color: Colors.black, child: Icon(Icons.collections, color: Color(0xFF888888)));
+      }
+      return AuthFileImage(
+        api: api,
+        fileId: fid,
+        placeholder: const ColoredBox(color: Colors.black),
+      );
+    }
+
+    // 只用真实封面图，禁止用首张垫重复——否则露边图和滑到的下一张会对不上
+    final fanChildren = <Widget>[
+      for (final fid in stackCovers) coverChild(fid),
+    ];
+
+    void openMenu(BuildContext cellCtx) {
+      final box = cellCtx.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) return;
+      _showPackMenu(box.localToGlobal(Offset.zero) & box.size);
+    }
+
+    final totalRaw = n > 0 ? n : stackCovers.length;
+    final moreHint = totalRaw > 9 ? ' · 点开看更多' : '';
+
+    return Builder(
+      builder: (cellCtx) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (fanChildren.isEmpty)
+              GestureDetector(
+                onTap: () => unawaited(_previewPack()),
+                onLongPress: () => openMenu(cellCtx),
+                child: const _FanCardShell(
+                  child: ColoredBox(
+                    color: Colors.black,
+                    child: Icon(Icons.collections, color: Color(0xFF888888), size: 40),
+                  ),
+                ),
+              )
+            else if (fanChildren.length == 1)
+              GestureDetector(
+                onTap: () => unawaited(_previewPack()),
+                onLongPress: () => openMenu(cellCtx),
+                child: _FanCardShell(child: fanChildren.first),
+              )
+            else
+              _FanStackCards(
+                onOpenAt: (i) => unawaited(_previewPack(initial: i)),
+                onLongPress: () => openMenu(cellCtx),
+                children: fanChildren,
+              ),
+            const SizedBox(height: 6),
+            SizedBox(
+              width: 200,
+              child: Text(
+                packTitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF111111)),
+              ),
+            ),
+            SizedBox(
+              width: 200,
+              child: Text(
+                count > 0
+                    ? (_subscribed ? '$count 张 · 已添加$moreHint' : '$count 张 · 长按收藏$moreHint')
+                    : (_subscribed ? '已添加' : '长按收藏'),
+                style: const TextStyle(fontSize: 11, color: Color(0xFF888888)),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -2715,102 +3191,7 @@ class _LinkCardBody extends StatelessWidget {
     }
 
     if (isPack) {
-      final packTitle = meta['title']?.toString() ?? '表情包';
-      final tags = meta['tags']?.toString() ?? '';
-      final n = meta['item_count'];
-      final packId = meta['pack_id']?.toString() ?? '';
-      final covers = (meta['cover_file_ids'] is List)
-          ? [for (final c in meta['cover_file_ids'] as List) c.toString()]
-          : const <String>[];
-      final subscribed = meta['subscribed'] == true;
-      return SizedBox(
-        width: 248,
-        child: InkWell(
-          onTap: () async {
-            final s = store;
-            final api = s?.api;
-            if (s == null || api == null || packId.isEmpty) return;
-            try {
-              // fork 成账号组，聊天「我」Tab 立即可见
-              await api.forkStickerPack(packId);
-              if (context.mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text(subscribed ? '已复制到「我的组」' : '已加为我的一组')),
-                );
-              }
-              unawaited(s.refreshStickersFromApi());
-            } catch (e) {
-              if (context.mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
-              }
-            }
-          },
-          child: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: const Color(0xFF2C2C2E),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFF3A3A3C)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  subscribed ? '表情组（点按复制到我的）' : '表情组 · 点按加为我的',
-                  style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 6),
-                Text(packTitle, style: const TextStyle(color: Color(0xFFF2F2F7), fontSize: 14)),
-                if (tags.isNotEmpty)
-                  Text(tags, style: const TextStyle(color: Color(0xFFAEAEB2), fontSize: 11)),
-                if (covers.isNotEmpty && store?.api != null) ...[
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 4,
-                    runSpacing: 4,
-                    children: [
-                      for (final fid in covers.take(9))
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: SizedBox(
-                            width: 40,
-                            height: 40,
-                            child: AuthFileImage(
-                              api: store!.api,
-                              fileId: fid,
-                              placeholder: const ColoredBox(color: Color(0xFF3A3A3C)),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                ],
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Text(
-                      n == null ? '' : '$n 张',
-                      style: const TextStyle(color: Color(0xFFAEAEB2), fontSize: 12),
-                    ),
-                    const Spacer(),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: subscribed ? const Color(0xFF3A3A3C) : const Color(0xFF07C160),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        subscribed ? '再复制' : '加为我的',
-                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
+      return _StickerPackStackCard(msg: msg, store: store, meta: meta);
     }
 
     if (isLoc) {

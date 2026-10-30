@@ -97,7 +97,7 @@ class RedBadge extends StatelessWidget {
 }
 
 class Section extends StatelessWidget {
-  const Section({super.key, required this.children, this.margin = const EdgeInsets.only(top: 8)});
+  const Section({super.key, required this.children, this.margin = const EdgeInsets.only(top: 4)});
   final List<Widget> children;
   final EdgeInsetsGeometry margin;
 
@@ -106,7 +106,10 @@ class Section extends StatelessWidget {
     return Container(
       margin: margin,
       color: AppColors.card,
-      child: Material(color: AppColors.card, child: Column(children: children)),
+      child: Material(
+        color: AppColors.card,
+        child: Column(mainAxisSize: MainAxisSize.min, children: children),
+      ),
     );
   }
 }
@@ -132,24 +135,31 @@ class ArrowTile extends StatelessWidget {
 }
 
 /// 微信风格确认弹窗：圆角白底、标题/说明居中、底栏左右分栏按钮。
+///
+/// [runOnConfirm] 非空时：点确认先在按钮上转圈执行，成功再关闭；失败留在弹窗内。
 Future<bool?> showWxConfirmDialog(
   BuildContext context, {
   required String title,
   String? message,
   String cancelText = '取消',
   String confirmText = '确定',
+  String busyText = '处理中…',
   Color confirmColor = const Color(0xFF576B95),
   bool destructive = false,
   /// 可选勾选项；返回时通过 [checkboxValue] 读出最终值（用 List 传引用）
   String? checkboxLabel,
   List<bool>? checkboxValue,
+  Future<void> Function()? runOnConfirm,
 }) {
   final check = checkboxValue ?? <bool>[];
   var checked = check.isNotEmpty ? check.first : true;
   final actionColor = destructive ? AppColors.badge : confirmColor;
+  var busy = false;
+  String? err;
 
   return showDialog<bool>(
     context: context,
+    barrierDismissible: runOnConfirm == null,
     barrierColor: const Color(0x66000000),
     builder: (ctx) {
       return Center(
@@ -157,6 +167,37 @@ Future<bool?> showWxConfirmDialog(
           color: Colors.transparent,
           child: StatefulBuilder(
             builder: (ctx, setLocal) {
+              Future<void> confirm() async {
+                if (busy) return;
+                if (checkboxLabel != null) {
+                  if (check.isEmpty) {
+                    check.add(checked);
+                  } else {
+                    check[0] = checked;
+                  }
+                }
+                final run = runOnConfirm;
+                if (run == null) {
+                  Navigator.pop(ctx, true);
+                  return;
+                }
+                setLocal(() {
+                  busy = true;
+                  err = null;
+                });
+                try {
+                  await run();
+                  if (ctx.mounted) Navigator.pop(ctx, true);
+                } catch (e) {
+                  if (ctx.mounted) {
+                    setLocal(() {
+                      busy = false;
+                      err = '$e';
+                    });
+                  }
+                }
+              }
+
               return Container(
                 width: 270,
                 decoration: BoxDecoration(
@@ -193,18 +234,28 @@ Future<bool?> showWxConfirmDialog(
                               ),
                             ),
                           ],
+                          if (err != null && err!.isNotEmpty) ...[
+                            const SizedBox(height: 10),
+                            Text(
+                              err!,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(fontSize: 13, color: AppColors.badge, height: 1.35),
+                            ),
+                          ],
                           if (checkboxLabel != null) ...[
                             const SizedBox(height: 14),
                             GestureDetector(
                               behavior: HitTestBehavior.opaque,
-                              onTap: () => setLocal(() {
-                                checked = !checked;
-                                if (check.isEmpty) {
-                                  check.add(checked);
-                                } else {
-                                  check[0] = checked;
-                                }
-                              }),
+                              onTap: busy
+                                  ? null
+                                  : () => setLocal(() {
+                                        checked = !checked;
+                                        if (check.isEmpty) {
+                                          check.add(checked);
+                                        } else {
+                                          check[0] = checked;
+                                        }
+                                      }),
                               child: Row(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
@@ -242,11 +293,14 @@ Future<bool?> showWxConfirmDialog(
                         children: [
                           Expanded(
                             child: InkWell(
-                              onTap: () => Navigator.pop(ctx, false),
+                              onTap: busy ? null : () => Navigator.pop(ctx, false),
                               child: Center(
                                 child: Text(
                                   cancelText,
-                                  style: const TextStyle(fontSize: 17, color: Color(0xFF111111)),
+                                  style: TextStyle(
+                                    fontSize: 17,
+                                    color: busy ? const Color(0xFFBDBDBD) : const Color(0xFF111111),
+                                  ),
                                 ),
                               ),
                             ),
@@ -254,21 +308,39 @@ Future<bool?> showWxConfirmDialog(
                           const VerticalDivider(width: 0.5, thickness: 0.5, color: Color(0xFFE5E5E5)),
                           Expanded(
                             child: InkWell(
-                              onTap: () {
-                                if (checkboxLabel != null) {
-                                  if (check.isEmpty) {
-                                    check.add(checked);
-                                  } else {
-                                    check[0] = checked;
-                                  }
-                                }
-                                Navigator.pop(ctx, true);
-                              },
+                              onTap: busy ? null : confirm,
                               child: Center(
-                                child: Text(
-                                  confirmText,
-                                  style: TextStyle(fontSize: 17, color: actionColor, fontWeight: FontWeight.w500),
-                                ),
+                                child: busy
+                                    ? Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          SizedBox(
+                                            width: 14,
+                                            height: 14,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: actionColor,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            busyText,
+                                            style: TextStyle(
+                                              fontSize: 15,
+                                              color: actionColor,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                        ],
+                                      )
+                                    : Text(
+                                        confirmText,
+                                        style: TextStyle(
+                                          fontSize: 17,
+                                          color: actionColor,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
                               ),
                             ),
                           ),
@@ -284,6 +356,126 @@ Future<bool?> showWxConfirmDialog(
       );
     },
   );
+}
+
+/// 微信风格单行输入弹窗（新建组名等）。
+Future<String?> showWxInputDialog(
+  BuildContext context, {
+  required String title,
+  String? message,
+  String initial = '',
+  String hint = '',
+  String cancelText = '取消',
+  String confirmText = '确定',
+  Color confirmColor = const Color(0xFF576B95),
+  int maxLength = 32,
+}) {
+  final ctrl = TextEditingController(text: initial);
+  return showDialog<String>(
+    context: context,
+    barrierColor: const Color(0x66000000),
+    builder: (ctx) {
+      return Center(
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            width: 290,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 22, 20, 16),
+                  child: Column(
+                    children: [
+                      Text(
+                        title,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF111111),
+                        ),
+                      ),
+                      if (message != null && message.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          message,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(fontSize: 13, color: Color(0xFF888888), height: 1.35),
+                        ),
+                      ],
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: ctrl,
+                        autofocus: true,
+                        maxLength: maxLength,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontSize: 16, color: Color(0xFF111111)),
+                        decoration: InputDecoration(
+                          hintText: hint,
+                          hintStyle: const TextStyle(color: Color(0xFFB2B2B2), fontSize: 15),
+                          counterText: '',
+                          filled: true,
+                          fillColor: const Color(0xFFF5F5F5),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                        onSubmitted: (v) {
+                          final t = v.trim();
+                          if (t.isEmpty) return;
+                          Navigator.pop(ctx, t);
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1, thickness: 0.5, color: Color(0xFFE5E5E5)),
+                SizedBox(
+                  height: 48,
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: InkWell(
+                          onTap: () => Navigator.pop(ctx),
+                          child: Center(
+                            child: Text(cancelText, style: const TextStyle(fontSize: 17, color: Color(0xFF111111))),
+                          ),
+                        ),
+                      ),
+                      const VerticalDivider(width: 0.5, thickness: 0.5, color: Color(0xFFE5E5E5)),
+                      Expanded(
+                        child: InkWell(
+                          onTap: () {
+                            final t = ctrl.text.trim();
+                            if (t.isEmpty) return;
+                            Navigator.pop(ctx, t);
+                          },
+                          child: Center(
+                            child: Text(
+                              confirmText,
+                              style: TextStyle(fontSize: 17, color: confirmColor, fontWeight: FontWeight.w500),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    },
+  ).whenComplete(ctrl.dispose);
 }
 
 Future<List<String>?> showFieldsDialog(

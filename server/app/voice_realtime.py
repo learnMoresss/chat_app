@@ -782,6 +782,17 @@ async def hangup_call(
     except Exception:
         pass
 
+    # 通话结束：按需卸 TTS（不常驻占 GPU）；短延迟便于马上再拨
+    if release_asr:
+        try:
+            from . import tts_ondemand
+            from .tts_gen import resolve_tts_engine
+
+            eng = resolve_tts_engine(for_realtime=True)
+            tts_ondemand.release_engine(eng, unload_now=True, idle_seconds=90.0)
+        except Exception:
+            pass
+
     # 顶替场景不放 ASR，留给最新一路继续用
     if release_asr:
         try:

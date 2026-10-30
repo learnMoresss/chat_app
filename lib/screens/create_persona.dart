@@ -6,8 +6,8 @@ import '../media/media_pick.dart';
 import '../store.dart';
 import '../theme.dart';
 import '../widgets.dart';
-import 'chat.dart';
-import 'persona.dart';
+import 'fullscreen_images.dart';
+import 'requests.dart';
 
 /// 新建人设：名字、头像色、说明、渠道——一次配齐再开聊。
 class CreatePersonaPage extends StatefulWidget {
@@ -28,9 +28,13 @@ class _CreatePersonaPageState extends State<CreatePersonaPage> {
   late bool greet;
   late bool momentsOn;
   bool saving = false;
+  bool generatingAvatar = false;
   Uint8List? avatarBytes;
   String avatarName = 'avatar.jpg';
   String avatarFileId = '';
+  String signature = '';
+  /// 头像生成时可能已先建 pending，提交时复用避免重复创建。
+  String? _pendingPersonaId;
 
   static const _palette = <Color>[
     Color(0xFF2F6BFF),
@@ -80,6 +84,94 @@ class _CreatePersonaPageState extends State<CreatePersonaPage> {
       avatarName = shot.first.name;
       avatarFileId = '';
     });
+  }
+
+  Future<void> _genAvatarByPrompt() async {
+    final store = widget.store;
+    final api = store.api;
+    if (store.demo || api == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('需登录后才能生成头像')));
+      return;
+    }
+    if (generatingAvatar) return;
+    final ctrl = TextEditingController(text: '二次元头像，清爽，正面半身');
+    final prompt = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        title: const Text('提示词生成头像', textAlign: TextAlign.center),
+        content: TextField(
+          controller: ctrl,
+          maxLines: 3,
+          decoration: InputDecoration(
+            hintText: '描述长相/画风…（正方形，Z-Image）',
+            filled: true,
+            fillColor: const Color(0xFFF5F5F5),
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('生成', style: TextStyle(color: AppColors.name, fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    if (prompt == null || prompt.isEmpty || !mounted) return;
+    setState(() => generatingAvatar = true);
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('正在生成头像…')));
+    try {
+      String pid = _pendingPersonaId ?? '';
+      if (pid.isEmpty) {
+        final temp = await store.createPersona(
+          name: name.text.trim().isEmpty ? '临时' : name.text.trim(),
+          bio: bio.text,
+          color: color,
+          channelId: channelId,
+          greet: greet,
+          momentsOn: momentsOn,
+          signature: signature,
+        );
+        pid = temp.id;
+        _pendingPersonaId = pid;
+      }
+      final items = await api
+          .drawPersonaImage(
+            pid,
+            prompt: '正方形头像 1:1，$prompt',
+            count: 1,
+            refPersona: false,
+            purpose: 'avatar',
+          )
+          .timeout(const Duration(seconds: 120));
+      if (items.isEmpty) throw Exception('未返回图片');
+      final fid = (items.first as Map)['file_id']?.toString() ?? '';
+      if (fid.isEmpty) throw Exception('无 file_id');
+      await api.patchPersona(pid, {
+        'avatar_file_id': fid,
+        if (name.text.trim().isNotEmpty) 'name': name.text.trim(),
+        'bio': bio.text,
+        if (signature.isNotEmpty) 'signature': signature,
+      });
+      await store.pullSync();
+      if (!mounted) return;
+      setState(() {
+        avatarFileId = fid;
+        avatarBytes = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('头像已生成，点完成发到「新的朋友」')),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('生成失败：$e')));
+      }
+    } finally {
+      if (mounted) setState(() => generatingAvatar = false);
+    }
   }
 
   Future<void> _pickChannel() async {
@@ -155,29 +247,39 @@ class _CreatePersonaPageState extends State<CreatePersonaPage> {
         );
         avId = up['file_id']?.toString() ?? '';
       }
-      final p = await widget.store.createPersona(
-        name: n,
-        bio: bio.text,
-        color: color,
-        channelId: channelId,
-        greet: greet,
-        momentsOn: momentsOn,
-        avatarFileId: avId,
-      );
-      if (!mounted) return;
-      final c = widget.store.conversations.where((e) => e.personaId == p.id).firstOrNull;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已创建「${p.display}」')));
-      if (c != null) {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => ChatPage(store: widget.store, conv: c)),
-        );
+      final existingId = _pendingPersonaId;
+      if (existingId != null && existingId.isNotEmpty && widget.store.api != null) {
+        await widget.store.api!.patchPersona(existingId, {
+          'name': n,
+          'bio': bio.text,
+          'color': color.toARGB32(),
+          'channel_id': channelId,
+          'greet': greet,
+          'moments_on': momentsOn,
+          if (avId.isNotEmpty) 'avatar_file_id': avId,
+          if (signature.isNotEmpty) 'signature': signature,
+        });
+        await widget.store.pullSync();
       } else {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => PersonaPage(store: widget.store, persona: p)),
+        await widget.store.createPersona(
+          name: n,
+          bio: bio.text,
+          color: color,
+          channelId: channelId,
+          greet: greet,
+          momentsOn: momentsOn,
+          avatarFileId: avId,
+          signature: signature,
         );
       }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('「$n」已进入新的朋友，通过后才会出现在通讯录')),
+      );
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => RequestsPage(store: widget.store)),
+      );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
@@ -206,14 +308,24 @@ class _CreatePersonaPageState extends State<CreatePersonaPage> {
       body: ListView(
         padding: EdgeInsets.only(bottom: 24 + MediaQuery.paddingOf(context).bottom),
         children: [
-          Section(children: [
+          Section(
+            margin: EdgeInsets.zero,
+            children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                   GestureDetector(
-                    onTap: _pickAvatar,
+                    onTap: () {
+                      openAvatarPreview(
+                        context,
+                        api: store.api,
+                        fileId: avatarFileId.isEmpty ? null : avatarFileId,
+                        bytes: avatarBytes,
+                        label: previewName,
+                      );
+                    },
                     child: Avatar(
                       previewName,
                       color,
@@ -235,9 +347,24 @@ class _CreatePersonaPageState extends State<CreatePersonaPage> {
                           onChanged: (_) => setState(() {}),
                           textInputAction: TextInputAction.next,
                         ),
-                        GestureDetector(
-                          onTap: _pickAvatar,
-                          child: const Text('从相册选头像', style: TextStyle(color: AppColors.name, fontSize: 14)),
+                        Wrap(
+                          spacing: 12,
+                          children: [
+                            GestureDetector(
+                              onTap: _pickAvatar,
+                              child: const Text('从相册选', style: TextStyle(color: AppColors.name, fontSize: 14)),
+                            ),
+                            GestureDetector(
+                              onTap: generatingAvatar ? null : _genAvatarByPrompt,
+                              child: Text(
+                                generatingAvatar ? '生成中…' : '提示词生成',
+                                style: TextStyle(
+                                  color: generatingAvatar ? AppColors.muted : AppColors.name,
+                                  fontSize: 14,
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
@@ -350,7 +477,7 @@ class _CreatePersonaPageState extends State<CreatePersonaPage> {
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Text(
-              '创建后会自动开会话。可在资料页 →「人设与模型」继续改说明、记忆和渠道。',
+              '完成后会出现在「通讯录 → 新的朋友」。通过申请后才会进通讯录并开会话。',
               style: TextStyle(color: AppColors.muted, fontSize: 13),
             ),
           ),

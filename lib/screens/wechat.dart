@@ -9,6 +9,7 @@ import '../theme.dart';
 import '../widgets.dart';
 import 'chat.dart';
 import 'create_persona.dart';
+import 'fullscreen_images.dart';
 import 'search.dart';
 
 class WechatPage extends StatelessWidget {
@@ -194,22 +195,32 @@ class _ConvTile extends StatelessWidget {
         padding: const EdgeInsets.only(left: 16),
         child: Row(
           children: [
-            RedBadge(
-              count: conv.unread,
-              dot: conv.muted,
-              child: Avatar(
-                title,
-                color,
-                size: 50,
-                group: conv.isGroup,
-                api: store.api,
-                avatarFileId: () {
-                  if (conv.isGroup) return null;
-                  final pid = conv.personaId;
-                  if (pid == null || pid.isEmpty) return null;
-                  final id = store.persona(pid)?.avatarFileId ?? '';
-                  return id.isEmpty ? null : id;
-                }(),
+            GestureDetector(
+              onTap: () {
+                if (conv.isGroup) return;
+                final pid = conv.personaId;
+                if (pid == null || pid.isEmpty) return;
+                final fid = store.persona(pid)?.avatarFileId ?? '';
+                if (fid.isEmpty) return;
+                openAvatarPreview(context, api: store.api, fileId: fid, label: title);
+              },
+              child: RedBadge(
+                count: conv.unread,
+                dot: conv.muted,
+                child: Avatar(
+                  title,
+                  color,
+                  size: 50,
+                  group: conv.isGroup,
+                  api: store.api,
+                  avatarFileId: () {
+                    if (conv.isGroup) return null;
+                    final pid = conv.personaId;
+                    if (pid == null || pid.isEmpty) return null;
+                    final id = store.persona(pid)?.avatarFileId ?? '';
+                    return id.isEmpty ? null : id;
+                  }(),
+                ),
               ),
             ),
             const SizedBox(width: 12),

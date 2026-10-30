@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/http.dart' show MultipartFile, MultipartRequest;
 import 'package:http/io_client.dart';
@@ -467,7 +468,7 @@ class ApiClient {
 
   /// 聊天媒体上传，返回 file_id / auth_url。
   ///
-  /// 经公网反代直传 /chat-upload；隧道偶发拥堵时自动重试（同内容服务端会去重）。
+  /// 先算 sha256 调 check-hash；命中则跳过传字节。否则经公网反代直传 /chat-upload。
   Future<Map<String, dynamic>> uploadChatMedia({
     required Uint8List bytes,
     required String filename,
@@ -478,6 +479,37 @@ class ApiClient {
   }) async {
     if (accessToken == null || accessToken!.isEmpty) {
       throw ApiException('未登录', statusCode: 401, authNoise: true);
+    }
+    if (bytes.isEmpty) {
+      throw ApiException('空文件');
+    }
+    try {
+      final digest = sha256.convert(bytes).toString();
+      final hit = await _json(
+        'POST',
+        '/api/v1/media/check-hash',
+        auth: true,
+        body: {
+          'sha256': digest,
+          'size': bytes.length,
+          if (contentType.isNotEmpty) 'content_type': contentType,
+        },
+        timeout: const Duration(seconds: 12),
+        allowAuthRetry: allowAuthRetry,
+      );
+      if (hit['exists'] == true && (hit['file_id']?.toString() ?? '').isNotEmpty) {
+        return {
+          'file_id': hit['file_id'],
+          'size': hit['size'] ?? bytes.length,
+          'content_type': hit['content_type'] ?? contentType,
+          'name': filename,
+          'deduped': true,
+          'url': hit['url'],
+          'auth_url': hit['auth_url'] ?? '/api/v1/media/files/${hit['file_id']}',
+        };
+      }
+    } catch (_) {
+      // 预检失败不阻断上传
     }
     Object? last;
     for (var attempt = 0; attempt < 3; attempt++) {
@@ -760,6 +792,8 @@ class ApiClient {
     bool greet = true,
     bool momentsOn = true,
     String avatarFileId = '',
+    String signature = '',
+    String verify = '',
   }) {
     return _json('POST', '/api/v1/personas', auth: true, body: {
       'name': name,
@@ -770,7 +804,46 @@ class ApiClient {
       'greet': greet,
       'moments_on': momentsOn,
       'avatar_file_id': avatarFileId,
+      if (signature.isNotEmpty) 'signature': signature,
+      if (verify.isNotEmpty) 'verify': verify,
     });
+  }
+
+  Future<Map<String, dynamic>> acceptPersona(String id) {
+    return _json('POST', '/api/v1/personas/$id/accept', auth: true);
+  }
+
+  Future<Map<String, dynamic>> ignorePersona(String id) {
+    return _json('POST', '/api/v1/personas/$id/ignore', auth: true);
+  }
+
+  Future<Map<String, dynamic>> extractPersonaPrompts({
+    String personaId = '',
+    String name = '',
+    String bio = '',
+  }) {
+    if (personaId.isNotEmpty) {
+      return _json(
+        'POST',
+        '/api/v1/personas/$personaId/extract-prompts',
+        auth: true,
+        body: {
+          if (name.isNotEmpty) 'name': name,
+          if (bio.isNotEmpty) 'bio': bio,
+        },
+        timeout: const Duration(seconds: 30),
+      );
+    }
+    return _json(
+      'POST',
+      '/api/v1/personas/extract-prompts',
+      auth: true,
+      body: {
+        if (name.isNotEmpty) 'name': name,
+        if (bio.isNotEmpty) 'bio': bio,
+      },
+      timeout: const Duration(seconds: 30),
+    );
   }
 
   Future<Map<String, dynamic>> probeChannel(String id) {
@@ -829,6 +902,75 @@ class ApiClient {
   }
 
   Future<List<dynamic>> listMemories(String personaId) => getJsonList('/api/v1/personas/$personaId/memories');
+
+  /// 提醒/定时按人设隔离；必须带 [personaId]，禁止拉全局列表。
+  Future<List<dynamic>> listSchedules({required String personaId}) async {
+    final pid = personaId.trim();
+    if (pid.isEmpty) {
+      throw ApiException('定时任务必须指定人设');
+    }
+    final j = await _json(
+      'GET',
+      '/api/v1/schedules',
+      auth: true,
+      query: {'persona_id': pid},
+    );
+    final list = j['schedules'];
+    return list is List ? list : [];
+  }
+
+  Future<Map<String, dynamic>> createSchedule({
+    required String personaId,
+    required String kind,
+    required String title,
+    required int hour,
+    required int minute,
+    required String prompt,
+    int jitterMinutes = 0,
+    int dailyLimit = 1,
+    bool requireChattedToday = false,
+    int minIntervalMinutes = 0,
+    bool enabled = true,
+  }) {
+    return _json('POST', '/api/v1/schedules', auth: true, body: {
+      'persona_id': personaId,
+      'kind': kind,
+      'title': title,
+      'hour': hour,
+      'minute': minute,
+      'prompt': prompt,
+      'jitter_minutes': jitterMinutes,
+      'daily_limit': dailyLimit,
+      'require_chatted_today': requireChattedToday,
+      'min_interval_minutes': minIntervalMinutes,
+      'enabled': enabled,
+    });
+  }
+
+  Future<Map<String, dynamic>> patchSchedule(
+    String scheduleId, {
+    bool? enabled,
+    bool? paused,
+    String? title,
+    int? hour,
+    int? minute,
+    String? prompt,
+    bool? reschedule,
+  }) {
+    return _json('PATCH', '/api/v1/schedules/$scheduleId', auth: true, body: {
+      if (enabled != null) 'enabled': enabled,
+      if (paused != null) 'paused': paused,
+      if (title != null) 'title': title,
+      if (hour != null) 'hour': hour,
+      if (minute != null) 'minute': minute,
+      if (prompt != null) 'prompt': prompt,
+      if (reschedule != null) 'reschedule': reschedule,
+    });
+  }
+
+  Future<void> deleteSchedule(String scheduleId) async {
+    await _json('DELETE', '/api/v1/schedules/$scheduleId', auth: true);
+  }
 
   Future<List<dynamic>> listCapabilities() async {
     final j = await _json('GET', '/api/v1/capabilities', auth: true);
@@ -1090,6 +1232,23 @@ class ApiClient {
     });
   }
 
+  Future<void> deleteStickerPack(String packId) async {
+    await _json('DELETE', '/api/v1/stickers/packs/$packId', auth: true);
+  }
+
+  Future<void> deleteSticker(String stickerId) async {
+    await _json('DELETE', '/api/v1/stickers/$stickerId', auth: true);
+  }
+
+  Future<Map<String, dynamic>> warmPersonaVoice(String personaId) {
+    return _json(
+      'POST',
+      '/api/v1/personas/$personaId/assets/warm-voice',
+      auth: true,
+      timeout: const Duration(minutes: 3),
+    );
+  }
+
   Future<List<dynamic>> suggestStickers({required String q, int limit = 12}) async {
     final j = await _json('GET', '/api/v1/stickers/suggest', auth: true, query: {
       'q': q,
@@ -1158,7 +1317,9 @@ class ApiClient {
     int count = 3,
     String batchId = '',
     int slotIndex = 0,
-    bool refPersona = true,
+    bool refPersona = false,
+    /// look=形象抽卡；avatar=只生成头像，不进形象列表
+    String purpose = 'look',
   }) async {
     final j = await _json(
       'POST',
@@ -1171,9 +1332,30 @@ class ApiClient {
         if (batchId.isNotEmpty) 'batch_id': batchId,
         'slot_index': slotIndex,
         'ref_persona': refPersona,
+        'purpose': purpose,
       },
     );
     return j['items'] as List? ?? const [];
+  }
+
+  Future<Map<String, dynamic>> personaAssetFromMedia(
+    String personaId, {
+    required String kind,
+    required String fileId,
+    String prompt = '',
+    String sampleText = '',
+  }) {
+    return _json(
+      'POST',
+      '/api/v1/personas/$personaId/assets/from-media',
+      auth: true,
+      body: {
+        'kind': kind,
+        'file_id': fileId,
+        'prompt': prompt,
+        'sample_text': sampleText,
+      },
+    );
   }
 
   Future<Map<String, dynamic>> fixPersonaAsset(String personaId, String assetId) {

@@ -1,9 +1,14 @@
-"""人设抽卡：语音（TTS）/ 形象（QwenImage 2.1）；支持多抽与固定。"""
+"""人设抽卡：语音（TTS）/ 形象（Z-Image / Qwen）；支持多抽与固定。
+
+直连本机 TTS / Comfy，不经 DSH。
+"""
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,8 +20,11 @@ from ..config import get_settings
 from ..draw_diversity import image_variant, voice_variant
 from ..image_gen import generate_image_bytes
 from ..media_cards import save_image_bytes
+from ..media_store import put_bytes
 from ..security import current_user, iso, new_id
-from ..tts_gen import synthesize_voice_wav
+from ..tts_gen import resolve_tts_engine, synthesize_voice_wav, warm_tts_engine
+
+logger = logging.getLogger("chat.persona_assets")
 
 router = APIRouter(prefix="/api/v1/personas", tags=["persona-assets"])
 
@@ -28,8 +36,19 @@ class DrawBody(BaseModel):
     # 客户端多抽逐条请求时传入，保证同批走不同变体轴
     batch_id: str = ""
     slot_index: int = Field(default=0, ge=0, le=32)
-    # 默认参考人设（名字/简介/性别），形象抽「长什么样」
-    ref_persona: bool = True
+    # 形象抽卡默认只用提示词；true 才附加人设短锚点
+    ref_persona: bool = False
+    # look=形象抽卡入库；avatar=只出图做头像，不进形象资产列表
+    purpose: str = Field(default="look", max_length=16)
+
+
+class FromMediaBody(BaseModel):
+    """把已上传的 media file 登记为音色/形象候选。"""
+
+    kind: str = Field(min_length=1, max_length=16)
+    file_id: str = Field(min_length=1, max_length=64)
+    prompt: str = Field(default="", max_length=2000)
+    sample_text: str = Field(default="", max_length=500)
 
 
 def _batch_salt(batch_id: str) -> int:
@@ -203,7 +222,7 @@ def list_assets(
     kind: str = "",
     user: Dict[str, Any] = Depends(current_user),
 ) -> List[AssetOut]:
-    _owned_persona(user["id"], persona_id)
+    persona = _persona_row(user["id"], persona_id)
     sql = """
       SELECT * FROM persona_assets
       WHERE user_id = ? AND persona_id = ?
@@ -215,7 +234,23 @@ def list_assets(
         params.append(k)
     sql += " ORDER BY fixed DESC, created_at DESC LIMIT 80"
     rows = db.fetchall(sql, params)
-    return [_row_out(r) for r in rows]
+    avatar_fid = ""
+    try:
+        avatar_fid = (persona["avatar_file_id"] or "").strip()
+    except Exception:
+        avatar_fid = ""
+    out: List[AssetOut] = []
+    for r in rows:
+        item = _row_out(r)
+        # 头像用途 / 当前头像文件：不进形象列表
+        role = str((item.meta or {}).get("role") or "").lower()
+        purpose = str((item.meta or {}).get("purpose") or "").lower()
+        if role == "avatar" or purpose == "avatar":
+            continue
+        if item.kind == "image" and avatar_fid and item.file_id == avatar_fid:
+            continue
+        out.append(item)
+    return out
 
 
 @router.post("/{persona_id}/assets/draw/voice", response_model=List[AssetOut])
@@ -238,10 +273,28 @@ def draw_voice(
         instructions, meta = voice_variant(
             prompt, vi, salt=batch_salt, name=pname, bio=pbio
         )
-        wav = synthesize_voice_wav(
-            text=sample,
-            instructions=instructions,
-            seed=int(meta.get("seed") or 0) or None,
+        eng = resolve_tts_engine(for_draw=True)
+        t0 = time.perf_counter()
+        try:
+            # 抽卡走已常驻 CosyVoice（热态约数秒）；keep_loaded 避免条间卸载
+            wav = synthesize_voice_wav(
+                text=sample,
+                instructions=instructions,
+                seed=int(meta.get("seed") or 0) or None,
+                timeout=min(90.0, float(settings.tts_timeout_seconds or 90)),
+                keep_loaded=True,
+                engine=eng,
+            )
+        except Exception:
+            wav = None
+        synth_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "draw_voice persona=%s slot=%s engine=%s synth_ms=%s ok=%s",
+            persona_id,
+            vi,
+            eng,
+            synth_ms,
+            bool(wav),
         )
         if not wav:
             continue
@@ -252,9 +305,14 @@ def draw_voice(
         now = iso()
         meta = {
             **meta,
-            "engine": (get_settings().tts_engine or "breeze"),
-            "label": "breeze-tts-2" if (get_settings().tts_engine or "breeze") == "breeze" else "qwen3-voicedesign",
+            "engine": eng,
+            "label": {
+                "cosyvoice": "cosyvoice-hot",
+                "breeze": "breeze-tts-2",
+                "voicedesign": "qwen3-voicedesign",
+            }.get(eng, eng),
             "base_prompt": prompt,
+            "synth_ms": synth_ms,
         }
         db.execute(
             """
@@ -287,12 +345,20 @@ def draw_image(
     body: DrawBody,
     user: Dict[str, Any] = Depends(current_user),
 ) -> List[AssetOut]:
-    persona = _persona_row(user["id"], persona_id)
+    _persona_row(user["id"], persona_id)  # 鉴权：必须是自己的人设
     prompt = body.prompt.strip()
-    ref_persona = bool(body.ref_persona)
-    pname = (persona["remark"] or persona["name"] or "").strip()
-    pbio = (persona["bio"] or "").strip()
-    # 形象抽卡：文生图抽长相方案；参考人设=锁性别/简介，不用头像 edit（否则脸被锁死抽不出新长相）
+    purpose = (body.purpose or "look").strip().lower()
+    if purpose not in ("look", "avatar"):
+        purpose = "look"
+    for_avatar = purpose == "avatar"
+    # 形象抽卡：默认严格按提示词文生图，不注入人设 bio（避免群像/跑题）
+    ref_persona = bool(body.ref_persona) and not for_avatar
+    pname = ""
+    pbio = ""
+    if ref_persona:
+        persona = _persona_row(user["id"], persona_id)
+        pname = (persona["remark"] or persona["name"] or "").strip()
+        pbio = (persona["bio"] or "").strip()
     out: List[AssetOut] = []
     batch_salt = _batch_salt(body.batch_id)
     for i in range(int(body.count)):
@@ -305,33 +371,72 @@ def draw_image(
             bio=pbio,
             ref_persona=ref_persona,
         )
-        # 头像场景：提示含「正方形/头像」时强制 1:1
-        want_square = any(k in prompt for k in ("正方形", "头像", "1:1", "square"))
+        # 头像 / 提示含「正方形/头像」时强制 1:1
+        want_square = for_avatar or any(k in prompt for k in ("正方形", "头像", "1:1", "square"))
         w, h = (768, 768) if want_square else (768, 1024)
         use_ratio = "1:1" if want_square else ratio
+        # 抽长相默认文生图 → Z-Image（BF16）；失败再 Qwen t2i
+        neg = str(meta.get("negative") or "")
         png = generate_image_bytes(
             final_prompt,
-            backend="qwen",
+            backend="zimage",
             width=w,
             height=h,
             ratio=use_ratio,
             seed=int(meta.get("seed") or 0) or None,
             ref_image=None,
+            negative=neg,
+            timeout=float(get_settings().image_gen_timeout_seconds or 120),
         )
         if not png:
+            # zimage 失败再试 qwen t2i
+            png = generate_image_bytes(
+                final_prompt,
+                backend="qwen",
+                width=w,
+                height=h,
+                ratio=use_ratio,
+                seed=int(meta.get("seed") or 0) or None,
+                ref_image=None,
+                negative=neg,
+                timeout=float(get_settings().image_gen_timeout_seconds or 120),
+            )
+        if not png:
             continue
-        fid = save_image_bytes(user_id=user["id"], data=png, source="persona_look", suffix="png")
+        fid = save_image_bytes(
+            user_id=user["id"],
+            data=png,
+            source="persona_avatar" if for_avatar else "persona_look",
+            suffix="png",
+        )
         if not fid:
             continue
-        aid = new_id("pa_")
         now = iso()
         meta = {
             **meta,
-            "engine": "qwen-image-2.1",
-            "role": "look_base",
+            "engine": "zimage-bf16",
+            "role": "avatar" if for_avatar else "look_base",
+            "purpose": purpose,
             "base_prompt": prompt,
             "mode": "t2i",
         }
+        if for_avatar:
+            # 只出文件给头像用，不入库形象资产
+            out.append(
+                AssetOut(
+                    id=new_id("av_"),
+                    persona_id=persona_id,
+                    kind="avatar",
+                    file_id=fid,
+                    prompt=prompt,
+                    sample_text="",
+                    fixed=False,
+                    created_at=now,
+                    meta=meta,
+                )
+            )
+            continue
+        aid = new_id("pa_")
         db.execute(
             """
             INSERT INTO persona_assets(
@@ -352,8 +457,189 @@ def draw_image(
         if row:
             out.append(_row_out(row))
     if not out:
-        raise HTTPException(status_code=503, detail="形象生成失败，请确认 QwenImage 服务可用")
+        raise HTTPException(
+            status_code=503,
+            detail=("头像" if for_avatar else "形象") + "生成失败，请确认 Comfy Z-Image / QwenImage 可用",
+        )
     return out
+
+
+def _audio_to_wav_bytes(data: bytes, filename: str) -> Optional[bytes]:
+    """尽量转成 16k 单声道 wav（CosyVoice 克隆更稳）；失败返回 None。"""
+    import subprocess
+    import tempfile
+
+    if not data:
+        return None
+    suffix = Path(filename or "").suffix.lower() or ".bin"
+    if suffix == ".wav" and data[:4] == b"RIFF":
+        return data
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / f"in{suffix}"
+        dst = Path(td) / "out.wav"
+        src.write_bytes(data)
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(src),
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-sample_fmt",
+                    "s16",
+                    str(dst),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=90,
+            )
+        except Exception:
+            logger.exception("ffmpeg voice normalize failed name=%s", filename)
+            return None
+        if dst.is_file():
+            out = dst.read_bytes()
+            return out if out and out[:4] == b"RIFF" else None
+    return None
+
+
+@router.post("/{persona_id}/assets/from-media", response_model=AssetOut)
+def asset_from_media(
+    persona_id: str,
+    body: FromMediaBody,
+    user: Dict[str, Any] = Depends(current_user),
+) -> AssetOut:
+    """上传登记：音色参考音频 / 形象参考图。"""
+    _owned_persona(user["id"], persona_id)
+    kind = (body.kind or "").strip().lower()
+    if kind not in ("voice", "image"):
+        raise HTTPException(status_code=400, detail="kind 仅支持 voice / image")
+    fid = (body.file_id or "").strip()
+    media = db.fetchone(
+        "SELECT * FROM media_files WHERE id = ? AND user_id = ?",
+        (fid, user["id"]),
+    )
+    if not media:
+        raise HTTPException(status_code=404, detail="媒体不存在")
+    path = Path(str(media["path"] or ""))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="媒体文件缺失")
+    prompt = (body.prompt or "").strip()
+    sample = (body.sample_text or "").strip()
+    meta: Dict[str, Any] = {
+        "source": "upload",
+        "diversity": "none",
+        "base_prompt": prompt,
+        "original_file_id": fid,
+        "original_name": path.name,
+    }
+    store_fid = fid
+    if kind == "voice":
+        raw = path.read_bytes()
+        name = path.name or "voice.bin"
+        wav = _audio_to_wav_bytes(raw, name)
+        if wav and wav != raw:
+            store_fid, _ = put_bytes(
+                user_id=user["id"],
+                data=wav,
+                content_type="audio/wav",
+                source="persona_voice_upload",
+                filename="ref.wav",
+            )
+        elif not wav and raw[:4] != b"RIFF":
+            raise HTTPException(
+                status_code=400,
+                detail="音频需为 wav/mp3/m4a，且可被转成 wav；请换一段清晰人声再试",
+            )
+        if not prompt:
+            prompt = "上传参考音色"
+        meta.update(
+            {
+                "role": "voice_ref",
+                "engine": "upload",
+                "label": "上传",
+            }
+        )
+    else:
+        ctype = (media["content_type"] or "").lower()
+        if not ctype.startswith("image/") and path.suffix.lower() not in (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+        ):
+            raise HTTPException(status_code=400, detail="请上传图片文件")
+        if not prompt:
+            prompt = "上传形象"
+        meta.update(
+            {
+                "role": "look_base",
+                "purpose": "look",
+                "engine": "upload",
+                "mode": "upload",
+            }
+        )
+    aid = new_id("pa_")
+    now = iso()
+    db.execute(
+        """
+        INSERT INTO persona_assets(
+          id, user_id, persona_id, kind, file_id, path, prompt, sample_text, fixed, meta_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, '', ?, ?, 0, ?, ?)
+        """,
+        (
+            aid,
+            user["id"],
+            persona_id,
+            kind,
+            store_fid,
+            prompt,
+            sample,
+            json.dumps(meta, ensure_ascii=False),
+            now,
+        ),
+    )
+    row = db.fetchone("SELECT * FROM persona_assets WHERE id = ?", (aid,))
+    if not row:
+        raise HTTPException(status_code=500, detail="入库失败")
+    return _row_out(row)
+
+
+@router.post("/{persona_id}/assets/warm-voice")
+def warm_voice(
+    persona_id: str,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    """抽卡前进页预热 TTS：走 CosyVoice（常驻热态），不拉 Breeze 冷启。"""
+    _owned_persona(user["id"], persona_id)
+    t0 = time.perf_counter()
+    info = warm_tts_engine(for_realtime=False, for_draw=True)
+    info["warm_ms"] = int((time.perf_counter() - t0) * 1000)
+    # 预热成功后显式 keep：拉长闲置窗口，进页后立刻抽不至于再冷启
+    try:
+        from .. import tts_ondemand
+
+        eng = resolve_tts_engine(for_draw=True)
+        if info.get("ok"):
+            tts_ondemand.release_engine(
+                eng,
+                unload_now=False,
+                idle_seconds=float(getattr(tts_ondemand, "DRAW_IDLE_SECONDS", 600.0)),
+            )
+    except Exception:
+        pass
+    logger.info(
+        "warm_voice persona=%s ok=%s engine=%s warm_ms=%s",
+        persona_id,
+        info.get("ok"),
+        info.get("engine"),
+        info.get("warm_ms"),
+    )
+    return info
 
 
 @router.post("/{persona_id}/assets/{asset_id}/fix", response_model=AssetOut)
@@ -385,12 +671,8 @@ def fix_asset(
         "UPDATE persona_assets SET fixed = 1 WHERE id = ?",
         (asset_id,),
     )
-    # 形象固定 → 同步为人设头像，供聊天显示与后续图生图
-    if kind == "image" and (row["file_id"] or ""):
-        db.execute(
-            "UPDATE personas SET avatar_file_id = ? WHERE id = ? AND user_id = ?",
-            (row["file_id"], persona_id, user["id"]),
-        )
+    # 形象固定 ≠ 头像：只写入 persona_assets.fixed，不改 personas.avatar_file_id
+    # 自拍/出镜图走 fixed look；聊天列表头像仍用单独上传/生成的头像
     # 语音固定 → 写入 voice_profiles 指针（便于通话/唱歌复用）
     if kind == "voice" and (row["file_id"] or ""):
         media = db.fetchone(
@@ -431,12 +713,28 @@ def delete_asset(
     _owned_persona(user["id"], persona_id)
     row = db.fetchone(
         """
-        SELECT id FROM persona_assets
+        SELECT * FROM persona_assets
         WHERE id = ? AND user_id = ? AND persona_id = ?
         """,
         (asset_id, user["id"], persona_id),
     )
     if not row:
         raise HTTPException(status_code=404, detail="资产不存在")
+    kind = (row["kind"] or "").strip().lower()
+    was_fixed = bool(row["fixed"])
+    note = f"persona_asset:{asset_id}"
     db.execute("DELETE FROM persona_assets WHERE id = ?", (asset_id,))
-    return {"ok": True, "id": asset_id}
+    # 删掉固定项 = 真正取消固定：清掉关联音色指针
+    if kind == "voice" and was_fixed:
+        try:
+            db.execute(
+                """
+                DELETE FROM voice_profiles
+                WHERE user_id = ? AND persona_id = ?
+                  AND (embed_note = ? OR embed_note LIKE ?)
+                """,
+                (user["id"], persona_id, note, f"%{asset_id}%"),
+            )
+        except Exception:
+            logger.exception("clear voice_profiles after delete failed")
+    return {"ok": True, "id": asset_id, "cleared_fixed": was_fixed}

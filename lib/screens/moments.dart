@@ -1259,23 +1259,26 @@ class _MomentsAlbumPageState extends State<MomentsAlbumPage> with SingleTickerPr
     super.dispose();
   }
 
-  /// 按年月分组的媒体条目（新→旧）。
+  /// 按年月分组的朋友圈条目（新→旧）；多图一条保留为一组，用于堆叠卡片。
   List<_AlbumMonthGroup> _monthGroups(AppStore store) {
-    final items = <({DateTime time, String fileId})>[];
-    for (final m in store.moments.where((m) => m.authorId == store.meId)) {
-      for (final id in m.mediaIds) {
-        items.add((time: m.time, fileId: id));
-      }
-    }
-    items.sort((a, b) => b.time.compareTo(a.time));
+    final posts = store.moments
+        .where((m) => m.authorId == store.meId && (m.mediaIds.isNotEmpty || m.images > 0))
+        .toList()
+      ..sort((a, b) => b.time.compareTo(a.time));
     final groups = <_AlbumMonthGroup>[];
-    for (final it in items) {
-      final y = it.time.year;
-      final mo = it.time.month;
+    for (final m in posts) {
+      final y = m.time.year;
+      final mo = m.time.month;
+      final entry = _AlbumPost(
+        momentId: m.id,
+        time: m.time,
+        text: m.text,
+        fileIds: List<String>.from(m.mediaIds),
+      );
       if (groups.isEmpty || groups.last.year != y || groups.last.month != mo) {
-        groups.add(_AlbumMonthGroup(year: y, month: mo, fileIds: [it.fileId]));
+        groups.add(_AlbumMonthGroup(year: y, month: mo, posts: [entry]));
       } else {
-        groups.last.fileIds.add(it.fileId);
+        groups.last.posts.add(entry);
       }
     }
     return groups;
@@ -1367,11 +1370,24 @@ class _MomentsAlbumPageState extends State<MomentsAlbumPage> with SingleTickerPr
   }
 }
 
+class _AlbumPost {
+  _AlbumPost({
+    required this.momentId,
+    required this.time,
+    required this.text,
+    required this.fileIds,
+  });
+  final String momentId;
+  final DateTime time;
+  final String text;
+  final List<String> fileIds;
+}
+
 class _AlbumMonthGroup {
-  _AlbumMonthGroup({required this.year, required this.month, required this.fileIds});
+  _AlbumMonthGroup({required this.year, required this.month, required this.posts});
   final int year;
   final int month;
-  final List<String> fileIds;
+  final List<_AlbumPost> posts;
 }
 
 class _AlbumMonthBlock extends StatelessWidget {
@@ -1409,19 +1425,39 @@ class _AlbumMonthBlock extends StatelessWidget {
               Expanded(
                 child: LayoutBuilder(
                   builder: (context, c) {
-                    const gap = 2.0;
+                    const gap = 4.0;
                     final cell = (c.maxWidth - gap * 2) / 3;
                     return Wrap(
                       spacing: gap,
-                      runSpacing: gap,
+                      runSpacing: gap + 4,
                       children: [
-                        for (final id in group.fileIds)
+                        for (final post in group.posts)
                           SizedBox(
                             width: cell,
-                            height: cell,
-                            child: store.api == null
-                                ? const ColoredBox(color: Color(0xFFE8E8E8))
-                                : AuthFileImage(api: store.api, fileId: id, fit: BoxFit.cover),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                SizedBox(
+                                  width: cell,
+                                  height: cell,
+                                  child: _AlbumStackedPhotos(
+                                    store: store,
+                                    fileIds: post.fileIds,
+                                    size: cell,
+                                  ),
+                                ),
+                                if (post.text.trim().isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 4),
+                                    child: Text(
+                                      post.text.trim(),
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(fontSize: 11, color: Color(0xFF666666), height: 1.25),
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
                       ],
                     );
@@ -1431,6 +1467,62 @@ class _AlbumMonthBlock extends StatelessWidget {
             ],
           ),
         ),
+      ],
+    );
+  }
+}
+
+/// 微信相册式：多图堆叠卡片（后层微偏、露边），单图铺满。
+class _AlbumStackedPhotos extends StatelessWidget {
+  const _AlbumStackedPhotos({
+    required this.store,
+    required this.fileIds,
+    required this.size,
+  });
+  final AppStore store;
+  final List<String> fileIds;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final ids = fileIds.where((e) => e.isNotEmpty).take(3).toList();
+    if (ids.isEmpty) {
+      return const ColoredBox(color: Color(0xFFE8E8E8));
+    }
+    if (ids.length == 1 || store.api == null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(2),
+        child: store.api == null
+            ? const ColoredBox(color: Color(0xFFE8E8E8))
+            : AuthFileImage(api: store.api, fileId: ids.first, fit: BoxFit.cover),
+      );
+    }
+    // 堆叠：底层最大，上层依次缩小并右下偏移，露出下层边缘
+    final layers = ids.reversed.toList();
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        for (var i = 0; i < layers.length; i++)
+          Positioned(
+            left: i * (size * 0.06),
+            top: i * (size * 0.05),
+            child: Transform.rotate(
+              angle: (i - (layers.length - 1) / 2) * 0.04,
+              child: Container(
+                width: size * (1 - (layers.length - 1 - i) * 0.08),
+                height: size * (1 - (layers.length - 1 - i) * 0.08),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(2),
+                  border: Border.all(color: Colors.white, width: 1.5),
+                  boxShadow: const [
+                    BoxShadow(color: Color(0x33000000), blurRadius: 3, offset: Offset(0, 1)),
+                  ],
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: AuthFileImage(api: store.api, fileId: layers[i], fit: BoxFit.cover),
+              ),
+            ),
+          ),
       ],
     );
   }
@@ -1506,7 +1598,10 @@ class _UserMomentsPageState extends State<UserMomentsPage> {
         final color = _isMe ? const Color(0xFF4C8DFF) : (store.persona(widget.authorId)?.color ?? Colors.grey);
         final avatarId = _isMe ? store.meAvatarFileId : (store.persona(widget.authorId)?.avatarFileId ?? '');
         final coverId = _isMe ? store.meCoverFileId : '';
-        final signature = _isMe ? store.meSignature : (store.persona(widget.authorId)?.bio ?? '');
+        // AI 人设用短签名，禁止把整段人设提示词当朋友圈签名
+        final signature = _isMe
+            ? store.meSignature
+            : (store.persona(widget.authorId)?.signature ?? '');
         final list = store.moments.where((m) => m.authorId == widget.authorId).toList()
           ..sort((a, b) => b.time.compareTo(a.time));
 

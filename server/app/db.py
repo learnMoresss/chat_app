@@ -1462,6 +1462,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
             )
         conn.execute("UPDATE meta SET value = '35' WHERE key = 'schema_version'")
         conn.commit()
+        version = 35
+
+    if version < 36:
+        pcols = {r[1] for r in conn.execute("PRAGMA table_info(personas)").fetchall()}
+        if "signature" not in pcols:
+            conn.execute(
+                "ALTER TABLE personas ADD COLUMN signature TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute("UPDATE meta SET value = '36' WHERE key = 'schema_version'")
+        conn.commit()
 
 
 def reset_connection() -> None:

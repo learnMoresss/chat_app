@@ -273,7 +273,8 @@ def maybe_augment_sticker_intents(
         return out
     if random.random() > probability:
         return out
-    out.append({"kind": "sticker", "prompt": q})
+    # 推荐发一组（堆叠气泡），不发单张
+    out.append({"kind": "sticker_pack", "prompt": q})
     return out
 
 
@@ -422,9 +423,18 @@ def list_stickers(
 
 
 def delete_sticker(*, user_id: str, sticker_id: str) -> bool:
+    """删表情：自己收藏的，或落在自己账号组里的条目。"""
     row = db.fetchone(
-        "SELECT id FROM stickers WHERE id = ? AND user_id = ?",
-        (sticker_id, user_id),
+        """
+        SELECT s.id FROM stickers s
+        LEFT JOIN sticker_packs p ON p.id = s.pack_id
+        WHERE s.id = ?
+          AND (
+            s.user_id = ?
+            OR (p.scope = 'account' AND p.owner_user_id = ?)
+          )
+        """,
+        (sticker_id, user_id, user_id),
     )
     if row is None:
         return False
@@ -759,15 +769,25 @@ def list_packs(
     scope: str = "",
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
+    """列出表情组。
+
+    - account：仅自己的账号组
+    - global：仅已订阅的全局组（AI 刚生成的不会自动塞进「全」）
+    - 空：账号组 + 已订阅全局组
+    """
     limit = max(1, min(int(limit), 100))
     sc = (scope or "").strip().lower()
     if sc == "global":
         rows = db.fetchall(
             """
-            SELECT * FROM sticker_packs WHERE scope = 'global'
-            ORDER BY created_at DESC LIMIT ?
+            SELECT p.* FROM sticker_packs p
+            INNER JOIN user_pack_subscriptions s
+              ON s.pack_id = p.id AND s.user_id = ?
+            WHERE p.scope = 'global'
+            ORDER BY s.pinned DESC, p.created_at DESC
+            LIMIT ?
             """,
-            (limit,),
+            (user_id, limit),
         )
     elif sc == "account":
         rows = db.fetchall(
@@ -781,12 +801,19 @@ def list_packs(
     else:
         rows = db.fetchall(
             """
-            SELECT * FROM sticker_packs
-            WHERE scope = 'global'
-               OR (scope = 'account' AND owner_user_id = ?)
-            ORDER BY created_at DESC LIMIT ?
+            SELECT p.* FROM sticker_packs p
+            WHERE (p.scope = 'account' AND p.owner_user_id = ?)
+               OR (
+                    p.scope = 'global'
+                    AND EXISTS (
+                      SELECT 1 FROM user_pack_subscriptions s
+                      WHERE s.pack_id = p.id AND s.user_id = ?
+                    )
+                  )
+            ORDER BY p.created_at DESC
+            LIMIT ?
             """,
-            (user_id, limit),
+            (user_id, user_id, limit),
         )
     return [_enrich_pack(r) for r in rows]
 
@@ -812,12 +839,11 @@ def can_access_pack(*, pack: Dict[str, Any], user_id: str, is_service: bool = Fa
 
 
 def can_append_pack(*, pack: Dict[str, Any], user_id: str, is_service: bool = False) -> bool:
-    """全局组：全员可追加图；账号组：仅主人；服务令牌可写全局。"""
+    """账号组仅主人；全局组仅创建者或服务令牌（避免别人/AI 乱塞进未订阅组）。"""
     if is_service:
         return True
-    if pack.get("scope") == "global":
-        return True
-    return (pack.get("owner_user_id") or "") == user_id
+    owner = (pack.get("owner_user_id") or "").strip()
+    return bool(owner) and owner == user_id
 
 
 def ensure_account_default_pack(*, user_id: str) -> Dict[str, Any]:
@@ -932,6 +958,24 @@ def subscribe_pack(*, user_id: str, pack_id: str, pinned: bool = False) -> Dict[
         (user_id, pack_id, 1 if pinned else 0, now),
     )
     return {"ok": True, "pack_id": pack_id, "pinned": bool(pinned)}
+
+
+def delete_pack(*, user_id: str, pack_id: str) -> Dict[str, Any]:
+    """删除账号下自己的表情组（不删媒体文件，避免误伤共用）。"""
+    pack = get_pack(pack_id)
+    if pack is None:
+        raise ValueError("组不存在")
+    if (pack.get("scope") or "") != "account":
+        raise ValueError("只能删除「我的」表情组")
+    if (pack.get("owner_user_id") or "") != user_id:
+        raise ValueError("无权删除该组")
+    db.execute("DELETE FROM stickers WHERE pack_id = ?", (pack_id,))
+    db.execute("DELETE FROM user_pack_subscriptions WHERE pack_id = ?", (pack_id,))
+    db.execute(
+        "DELETE FROM sticker_packs WHERE id = ? AND scope = 'account' AND owner_user_id = ?",
+        (pack_id, user_id),
+    )
+    return {"ok": True, "pack_id": pack_id}
 
 
 def is_subscribed(*, user_id: str, pack_id: str) -> bool:

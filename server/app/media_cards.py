@@ -120,8 +120,12 @@ def generate_or_mood(
     width: int = 768,
     height: int = 768,
     ref_file_id: str = "",
+    allow_mood_fallback: bool = True,
 ) -> Optional[str]:
-    """真生图 → 氛围卡。返回 media file_id。有 ref_file_id 时走图生图。"""
+    """真生图 →（可选）氛围卡。返回 media file_id。有 ref_file_id 时走图生图。
+
+    自拍/出镜请 allow_mood_fallback=False：失败不要发缺字紫卡。
+    """
     caption = (caption or "").strip()
     if not caption:
         return None
@@ -130,9 +134,13 @@ def generate_or_mood(
 
         settings = get_settings()
         ref = _load_media_bytes(user_id, ref_file_id)
+        # 有参考图时强制 Qwen（唯一支持编辑/图生图）
+        use_backend = backend
+        if ref and not (use_backend or "").strip():
+            use_backend = "qwen"
         raw = generate_image_bytes(
             caption,
-            backend=backend,
+            backend=use_backend,
             width=width,
             height=height,
             timeout=float(settings.image_gen_timeout_seconds or 180),
@@ -150,6 +158,8 @@ def generate_or_mood(
             )
     except Exception:
         pass
+    if not allow_mood_fallback:
+        return None
     return make_mood_card(user_id=user_id, caption=caption, persona_name=persona_name)
 
 
@@ -165,9 +175,10 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
         return ""
 
     def _sticker(m: re.Match) -> str:
+        # 单张暗号也升级为表情组推荐（堆叠气泡）
         tag = (m.group(1) or m.group(2) or "").strip()
         if tag:
-            intents.append({"kind": "sticker", "prompt": tag[:40]})
+            intents.append({"kind": "sticker_pack", "prompt": tag[:40]})
         return ""
 
     def _sticker_pack(m: re.Match) -> str:
@@ -286,11 +297,104 @@ def save_audio_bytes(
     return fid
 
 
-def fixed_voice_prompt(*, user_id: str, persona_id: str) -> Optional[str]:
-    """人设已固定音色的提示词（抽卡 prompt）；无则 None。"""
+def fixed_look_file_id(
+    *,
+    user_id: str,
+    persona_id: str,
+    allow_avatar_fallback: bool = False,
+) -> Optional[str]:
+    """已固定形象 file_id。
+
+    默认不退头像：头像 ≠ 形象，出镜/自拍闸门必须真正固定 look。
+    仅生成兜底时可 allow_avatar_fallback=True。
+    """
     row = db.fetchone(
         """
-        SELECT prompt FROM persona_assets
+        SELECT file_id FROM persona_assets
+        WHERE user_id = ? AND persona_id = ? AND kind = 'image' AND fixed = 1
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (user_id, persona_id),
+    )
+    if row and (row["file_id"] or "").strip():
+        return str(row["file_id"]).strip()
+    if not allow_avatar_fallback:
+        return None
+    prow = db.fetchone(
+        "SELECT avatar_file_id FROM personas WHERE id = ? AND user_id = ?",
+        (persona_id, user_id),
+    )
+    if prow and (prow["avatar_file_id"] or "").strip():
+        return str(prow["avatar_file_id"]).strip()
+    return None
+
+
+def image_needs_persona_look(prompt: str) -> bool:
+    """是否「发自己/人设出镜」类图（需固定形象）；纯风景不强制。"""
+    p = (prompt or "").strip()
+    landscape = any(
+        k in p for k in ("风景", "城市", "天空", "海边", "山景", "夜景", "街景", "空镜", "房间空")
+    )
+    person = any(k in p for k in ("人", "她", "他", "我", "自拍", "半身", "肖像", "形象", "脸"))
+    if landscape and not person:
+        return False
+    return True
+
+
+def user_asks_persona_look(text: str) -> bool:
+    """用户是否在要「你的照片/自拍/看看你」——无固定形象时应引导去抽卡。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    keys = (
+        "你的照片",
+        "你的自拍",
+        "你自拍",
+        "发一张你",
+        "发张你",
+        "发个你",
+        "发你自拍",
+        "发自拍",
+        "来张自拍",
+        "来个自拍",
+        "看看你",
+        "看下你",
+        "你长啥样",
+        "你长什么样",
+        "你的形象",
+        "自拍一张",
+        "自拍给我",
+        "照片给我",
+        "发张照片",
+        "发一张照片",
+        "发个照片",
+        "露个脸",
+        "露脸",
+        "看看长相",
+        "你在干啥",
+        "你在干嘛",
+        "现在在干啥",
+        "现在在干嘛",
+    )
+    if any(k in t for k in keys):
+        return True
+    # 「能给我发个你自拍吗」「发张你照片」等宽松口吻
+    return bool(
+        re.search(
+            r"(你.{0,6}(自拍|照片|长相|样子|形象)|(自拍|照片).{0,6}(你|我)|看看你|看下你)",
+            t,
+        )
+    )
+
+
+def fixed_voice_prompt(*, user_id: str, persona_id: str) -> Optional[str]:
+    """人设已固定音色的提示词（抽卡/上传）；无则 None。
+
+    上传音色可能无长描述：只要已固定且有文件，仍视为可用（克隆走 wav）。
+    """
+    row = db.fetchone(
+        """
+        SELECT prompt, file_id FROM persona_assets
         WHERE user_id = ? AND persona_id = ? AND kind = 'voice' AND fixed = 1
         ORDER BY created_at DESC LIMIT 1
         """,
@@ -299,7 +403,11 @@ def fixed_voice_prompt(*, user_id: str, persona_id: str) -> Optional[str]:
     if row is None:
         return None
     p = (row["prompt"] or "").strip()
-    return p or None
+    if p:
+        return p
+    if (row["file_id"] or "").strip():
+        return "自然说话"
+    return None
 
 
 def fixed_voice_wav_path(*, user_id: str, persona_id: str) -> Optional[str]:

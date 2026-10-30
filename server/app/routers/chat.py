@@ -85,12 +85,37 @@ def _pending_user_texts(user_id: str, conv_id: str) -> str:
 
 def _system_warn_text(body: str = _FRIENDLY_CHAT_FAIL) -> str:
     return json.dumps({"v": 1, "level": "warn", "body": body}, ensure_ascii=False)
+
+
+def _system_setup_text(
+    *,
+    body: str,
+    setup: str,
+    link: str,
+    persona_id: str = "",
+) -> str:
+    """可点系统提示：去抽卡固定音色/形象。"""
+    return json.dumps(
+        {
+            "v": 1,
+            "level": "info",
+            "body": body,
+            "action": "open_persona_draw",
+            "setup": setup,
+            "link": link,
+            "persona_id": persona_id,
+        },
+        ensure_ascii=False,
+    )
 from ..llm import build_messages, pick_max_tokens
 from .. import stickers as stk
 from ..media_cards import (
     extract_media_intents,
+    fixed_look_file_id,
     fixed_voice_prompt,
+    image_needs_persona_look,
     recent_persona_voice_secs,
+    user_asks_persona_look,
 )
 from ..model_route import resolve_dsh_route, usage_model_label
 from ..routers.channels import list_visible, resolve_channel_for_persona
@@ -807,12 +832,32 @@ async def _generate_reply(
                 evidence_block = "相关记忆：\n- " + "\n- ".join(mems[:6])
         except Exception:
             mems = []
+    rem_notes: List[str] = []
+    try:
+        from ..reminders import apply_reminder_intents, parse_user_reminder_intents
+
+        if not internal:
+            rem_notes = apply_reminder_intents(
+                user_id=user_id,
+                persona_id=persona_id,
+                intents=parse_user_reminder_intents(user_text or ""),
+            )
+    except Exception:
+        rem_notes = []
+        logger.exception("user reminder parse failed")
     try:
         from ..schedules import upcoming_for_persona
 
         sched_hints = upcoming_for_persona(user_id, persona_id)
     except Exception:
         sched_hints = []
+    if rem_notes:
+        # 让模型知道提醒已落库/查询/取消，口语转告即可，勿再写暗号
+        sched_hints = list(sched_hints) + [
+            "关于提醒/定时任务的系统结果（请口语转告对方，勿提系统或暗号）："
+            + "；".join(rem_notes),
+            "口语确认一下就好，不要再写 ⟦提醒…⟧ 暗号。",
+        ]
     # 成长锁定时用 baseline bio
     bio_for_turn = persona["bio"] or ""
     try:
@@ -827,6 +872,7 @@ async def _generate_reply(
         pass
     _caps_enabled = set()
     _has_fixed_voice = False
+    _has_fixed_look = False
     try:
         from ..product_capabilities import enabled_ids_for_user
 
@@ -835,9 +881,15 @@ async def _generate_reply(
             user_id, is_admin=bool(_urow and _urow["is_admin"])
         )
         _has_fixed_voice = bool(fixed_voice_prompt(user_id=user_id, persona_id=persona_id))
+        _has_fixed_look = bool(
+            fixed_look_file_id(
+                user_id=user_id, persona_id=persona_id, allow_avatar_fallback=False
+            )
+        )
     except Exception:
         _caps_enabled = set()
         _has_fixed_voice = False
+        _has_fixed_look = False
     messages = build_messages(
         persona_bio=bio_for_turn,
         persona_name=persona["name"],
@@ -849,6 +901,7 @@ async def _generate_reply(
         growth_hint=growth_hint,
         enabled_caps=_caps_enabled,
         has_fixed_voice=_has_fixed_voice,
+        has_fixed_look=_has_fixed_look,
     )
     # 主动问候：内部指令只喂本轮，不当用户气泡
     if internal and user_text.strip():
@@ -898,10 +951,14 @@ async def _generate_reply(
 
             _urow2 = db.fetchone("SELECT is_admin FROM users WHERE id = ?", (user_id,))
             vp = fixed_voice_prompt(user_id=user_id, persona_id=persona_id)
+            lp = fixed_look_file_id(
+                user_id=user_id, persona_id=persona_id, allow_avatar_fallback=False
+            )
             cap_block = _cap_hints(
                 user_id,
                 is_admin=bool(_urow2 and _urow2["is_admin"]),
                 has_fixed_voice=bool(vp),
+                has_fixed_look=bool(lp),
             )
             if cap_block:
                 mem_patch = ((mem_patch + "\n") if mem_patch else "") + cap_block
@@ -1131,6 +1188,17 @@ async def _generate_reply(
             pass
 
         text, media_intents = extract_media_intents(text)
+        try:
+            from ..reminders import apply_reminder_intents, extract_reminder_tags
+
+            text, rem_tags = extract_reminder_tags(text)
+            tag_notes = apply_reminder_intents(
+                user_id=user_id, persona_id=persona_id, intents=rem_tags
+            )
+            if tag_notes and not rem_notes:
+                rem_notes.extend(tag_notes)
+        except Exception:
+            logger.exception("ai reminder tags failed")
         sticker_cooled = False
         voice_cooled = False
         try:
@@ -1203,6 +1271,7 @@ async def _generate_reply(
             sing_enabled = False
             sing_cooled = False
         # 产品能力门禁：未注册的暗号 → 去掉并准备人设口吻告知
+        setup_notices: list = []  # (setup, body, link, ai_line)
         try:
             from ..product_capabilities import filter_media_intents
 
@@ -1217,12 +1286,115 @@ async def _generate_reply(
                 text = (text + "\n" + line).strip() if text.strip() else line
         except Exception:
             _cap_denies = []
+
+        look_fixed = None
+        try:
+            # 不退头像：没固定形象就必须引导去抽卡
+            look_fixed = fixed_look_file_id(
+                user_id=user_id, persona_id=persona_id, allow_avatar_fallback=False
+            )
+        except Exception:
+            look_fixed = None
+
+        # 语音：无固定音色 → 系统链 + AI 口吻，不合成
+        if any(i.get("kind") == "voice" for i in media_intents) and not voice_prompt_fixed:
+            kept_v: list = []
+            for intent in media_intents:
+                if intent.get("kind") == "voice":
+                    continue
+                kept_v.append(intent)
+            media_intents = kept_v
+            setup_notices.append(
+                (
+                    "voice",
+                    "还没固定音色，",
+                    "去抽卡固定",
+                    "想发语音得先固定一条声线，你去抽卡页选一下嘛。",
+                )
+            )
+
+        # 唱歌：硬要求固定音色（与语音一致）
+        if any(i.get("kind") == "sing" for i in media_intents):
+            if not voice_prompt_fixed:
+                media_intents = [i for i in media_intents if i.get("kind") != "sing"]
+                setup_notices.append(
+                    (
+                        "voice",
+                        "唱歌需要先固定音色，",
+                        "去抽卡固定",
+                        "想唱给你听，但还没固定声线，先去抽卡固定一下再叫我唱。",
+                    )
+                )
+
+        # 自己出镜类图 / 用户点名要照片：需固定形象（头像不算）
+        asks_look = user_asks_persona_look(user_text or "")
+        want_look = (not look_fixed) and (
+            asks_look
+            or any(
+                i.get("kind") == "image"
+                and image_needs_persona_look(str(i.get("prompt") or ""))
+                for i in media_intents
+            )
+        )
+        if want_look:
+            kept_i: list = []
+            for intent in media_intents:
+                if intent.get("kind") == "image" and image_needs_persona_look(
+                    str(intent.get("prompt") or "")
+                ):
+                    continue
+                kept_i.append(intent)
+            media_intents = kept_i
+            setup_notices.append(
+                (
+                    "image",
+                    "还没固定形象，",
+                    "去抽卡固定",
+                    "想给你看我的样子，得先固定一张形象～点下面去抽卡页选一张吧。",
+                )
+            )
+        elif look_fixed and asks_look:
+            # 已固定形象：用固定形象做参考图生图出「当前场景」，绝不直接甩原图
+            person_imgs = [
+                i
+                for i in media_intents
+                if i.get("kind") == "image"
+                and image_needs_persona_look(str(i.get("prompt") or ""))
+            ]
+            # 先留/补一句「正在拍」，再生图，避免长时间没动静
+            t_ack = (text or "").strip()
+            if not t_ack or t_ack in ("……", "...", "…", "。"):
+                text = "等下，我拍一张。"
+            if not person_imgs:
+                # DSH 漏写 ⟦图⟧：用用户诉求做场景，走参考生图（口吻已单独发出）
+                u = (user_text or "").strip().replace("\n", " ")[:60]
+                prompt = (
+                    f"自拍，{u}，同一人设长相，单人半身，当前场景随手拍"
+                    if u
+                    else "当前场景随手自拍，同一人设长相，单人半身，自然日常"
+                )
+                media_intents = list(media_intents) + [
+                    {"kind": "image", "prompt": prompt, "use_look_ref": True}
+                ]
+            else:
+                patched = []
+                for intent in media_intents:
+                    if intent.get("kind") == "image" and image_needs_persona_look(
+                        str(intent.get("prompt") or "")
+                    ):
+                        patched.append({**intent, "use_look_ref": True})
+                    else:
+                        patched.append(intent)
+                media_intents = patched
+
         if voice_pref == "never" or not voice_prompt_fixed or voice_cooled:
             kept: list = []
             for intent in media_intents:
                 if intent.get("kind") == "voice":
                     line = str(intent.get("prompt") or "").strip()
-                    if line:
+                    if line and voice_prompt_fixed:
+                        text = (text + "\n" + line).strip() if text.strip() else line
+                    elif line and voice_pref == "never":
                         text = (text + "\n" + line).strip() if text.strip() else line
                 else:
                     kept.append(intent)
@@ -1236,9 +1408,45 @@ async def _generate_reply(
                 else:
                     kept_s.append(intent)
             media_intents = kept_s
+
+        # 去重 setup 通知，并入 AI 口吻
+        seen_setup: set = set()
+        for setup, body, link, ai_line in setup_notices:
+            if setup in seen_setup:
+                continue
+            seen_setup.add(setup)
+            text = (text + "\n" + ai_line).strip() if text.strip() else ai_line
+
         parts = split_reply_parts(text) if split_on else ([text] if text.strip() else [])
-        if not parts and not media_intents:
+        if not parts and not media_intents and not setup_notices:
             parts = ["……"]
+
+        # 先发可点系统提示（能力/素材未就绪）
+        if setup_notices:
+            seen2: set = set()
+            for setup, body, link, _ai in setup_notices:
+                if setup in seen2:
+                    continue
+                seen2.add(setup)
+                try:
+                    sys_msg = _insert_message(
+                        user_id=user_id,
+                        conv_id=conv_id,
+                        client_id=new_id("sys_"),
+                        sender_id="system",
+                        mine=False,
+                        kind="system",
+                        text=_system_setup_text(
+                            body=f"{body}{link}",
+                            setup=setup,
+                            link=link,
+                            persona_id=persona_id,
+                        ),
+                        state="sent",
+                    )
+                    await hub.send_user(user_id, "message", sys_msg.model_dump())
+                except Exception:
+                    logger.exception("emit setup system failed")
 
         # 第一条：复用流式气泡或新建
         if parts:
@@ -1278,10 +1486,23 @@ async def _generate_reply(
                 await _set_typing(user_id, conv_id, False, display)
                 await hub.send_user(user_id, "message", more.model_dump())
         elif bot_msg_id is not None:
-            # 只有媒体意图：把空流式气泡改成省略或删不掉则写成「……」
-            final = _update_message_text(bot_msg_id, "……", state="sent")
-            if final:
-                await hub.send_user(user_id, "message", final.model_dump())
+            # 只有媒体（如纯自拍）：撤掉流式文字气泡，不要留下「……」/配文
+            try:
+                db.execute("DELETE FROM messages WHERE id = ?", (bot_msg_id,))
+                await hub.send_user(
+                    user_id,
+                    "message_remove",
+                    {"id": bot_msg_id, "conv_id": conv_id},
+                )
+            except Exception:
+                logger.exception("remove empty media-only bubble failed")
+                try:
+                    final = _update_message_text(bot_msg_id, "", state="sent")
+                    if final:
+                        await hub.send_user(user_id, "message", final.model_dump())
+                except Exception:
+                    pass
+            bot_msg_id = None
 
         # 媒体意图：统一调度（检索 topK → flash 选片 → 发送），不把目录塞进主 prompt
         try:

@@ -309,7 +309,17 @@ class AppStore extends ChangeNotifier {
     return c;
   }
 
-  void accept(Persona p) {
+  Future<void> accept(Persona p) async {
+    if (!demo && api != null) {
+      try {
+        await api!.acceptPersona(p.id);
+        await pullSync();
+        ping();
+        return;
+      } catch (e) {
+        rethrow;
+      }
+    }
     p.state = FriendState.friend;
     final c = ensureConv(p);
     final m = Msg(id: _nid('sys'), convId: c.id, mine: false, senderId: 'system', kind: MsgKind.system, text: '我通过了你的朋友验证请求，现在我们可以开始聊天了', time: DateTime.now());
@@ -323,7 +333,16 @@ class AppStore extends ChangeNotifier {
     ping();
   }
 
-  void ignore(Persona p) {
+  Future<void> ignore(Persona p) async {
+    if (!demo && api != null) {
+      try {
+        await api!.ignorePersona(p.id);
+      } catch (_) {}
+      await pullSync();
+      personas.removeWhere((e) => e.id == p.id);
+      ping();
+      return;
+    }
     personas.remove(p);
     ping();
   }
@@ -342,7 +361,7 @@ class AppStore extends ChangeNotifier {
     ping();
   }
 
-  /// 新建人设（直接成为好友并开会话）。远端走 POST /personas，再 sync。
+  /// 新建人设：进入「新的朋友」申请（pendingIn），通过后才进通讯录/会话。
   Future<Persona> createPersona({
     required String name,
     String bio = '',
@@ -351,6 +370,8 @@ class AppStore extends ChangeNotifier {
     bool greet = true,
     bool momentsOn = true,
     String avatarFileId = '',
+    String signature = '',
+    String verify = '',
   }) async {
     final trimmed = name.trim();
     if (trimmed.isEmpty) throw StateError('名字不能为空');
@@ -368,11 +389,12 @@ class AppStore extends ChangeNotifier {
         greet: greet,
         momentsOn: momentsOn,
         avatarFileId: avatarFileId,
+        signature: signature,
+        verify: verify,
       );
       await pullSync();
       final created = persona(raw['id'] as String? ?? '');
       if (created != null) return created;
-      // sync 失败时仍用返回体拼一份
       final p = _personaFromJson(Map<String, dynamic>.from(raw));
       if (!personas.any((e) => e.id == p.id)) personas.add(p);
       ping();
@@ -385,16 +407,15 @@ class AppStore extends ChangeNotifier {
       color: col,
       bio: bio.trim().isEmpty ? '（还没写人设说明）' : bio.trim(),
       channelId: chId.isEmpty ? channels.first.id : chId,
-      state: FriendState.friend,
+      state: FriendState.pendingIn,
       isBot: true,
       greet: greet,
       momentsOn: momentsOn,
       avatarFileId: avatarFileId,
+      signature: signature,
+      verify: verify.isEmpty ? '想加你为朋友' : verify,
     );
     personas.add(p);
-    final c = Conv(id: 'c-${p.id}', personaId: p.id, preview: '', time: DateTime.now());
-    conversations.insert(0, c);
-    messages[c.id] = [];
     ping();
     return p;
   }
@@ -1051,6 +1072,13 @@ class AppStore extends ChangeNotifier {
           if (convId != null) typingConvIds.remove(convId);
           _upsertRemoteMessage(payload);
           ping();
+        } else if (event == 'message_remove') {
+          final id = payload['id'] as String?;
+          final convId = payload['conv_id'] as String?;
+          if (id == null || convId == null) return;
+          typingConvIds.remove(convId);
+          msgs(convId).removeWhere((m) => m.id == id);
+          ping();
         } else if (event == 'message_delta') {
           final id = payload['id'] as String?;
           final convId = payload['conv_id'] as String?;
@@ -1130,8 +1158,10 @@ class AppStore extends ChangeNotifier {
 
   void _upsertRemoteMessage(Map<String, dynamic> raw, {String? replaceClientId}) {
     final m = _msgFromJson(raw);
-    // 跳过空气泡（旧版服务端曾预插过）
-    if (!m.mine && m.kind == MsgKind.text && m.text.isEmpty && m.state == SendState.sending) {
+    // 跳过空气泡（纯发图时会撤掉配文）
+    if (!m.mine && m.kind == MsgKind.text && m.text.isEmpty) {
+      final list = msgs(m.convId);
+      list.removeWhere((e) => e.id == m.id);
       return;
     }
     final list = msgs(m.convId);
@@ -1346,6 +1376,7 @@ class AppStore extends ChangeNotifier {
       greet: j['greet'] as bool? ?? false,
       momentsOn: j['moments_on'] as bool? ?? false,
       avatarFileId: j['avatar_file_id'] as String? ?? '',
+      signature: j['signature'] as String? ?? '',
       voiceReplyPref: () {
         final v = (j['voice_reply_pref'] as String?)?.trim() ?? 'sometimes';
         return (v == 'never' || v == 'always' || v == 'sometimes') ? v : 'sometimes';
@@ -1428,7 +1459,13 @@ class AppStore extends ChangeNotifier {
       try {
         final decoded = jsonDecode(text);
         if (decoded is Map && decoded['body'] != null) {
-          meta = {'level': decoded['level']?.toString() ?? 'info'};
+          meta = {
+            'level': decoded['level']?.toString() ?? 'info',
+            if (decoded['action'] != null) 'action': decoded['action'].toString(),
+            if (decoded['setup'] != null) 'setup': decoded['setup'].toString(),
+            if (decoded['link'] != null) 'link': decoded['link'].toString(),
+            if (decoded['persona_id'] != null) 'persona_id': decoded['persona_id'].toString(),
+          };
           text = decoded['body'].toString();
         }
       } catch (_) {}

@@ -1,4 +1,4 @@
-import { App, Alert, Button, Card, Space, Switch, Table, Tag, Typography } from 'antd'
+import { App, Alert, Button, Card, Form, Input, InputNumber, Space, Switch, Table, Tag, Typography } from 'antd'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
 import { useCore } from '../hooks/useCore'
@@ -12,7 +12,8 @@ type Schedule = {
   paused: boolean
   hour: number
   minute: number
-  next_run_at?: string
+  next_run_at?: string | null
+  prompt?: string
 }
 
 type Run = {
@@ -25,7 +26,21 @@ type Run = {
 
 type Props = { embeddedPersonaId?: string }
 
-/** 固定钟点问候已退役；本页只保留全局开关、清理旧配方、查看最近执行。 */
+function isUserReminder(kind: string) {
+  return kind === 'user_once' || kind === 'user_daily'
+}
+
+function isLegacy(kind: string) {
+  return /^(greet_|moment_)/.test(kind) || kind === 'moment_daily'
+}
+
+function fmtNext(v?: string | null) {
+  if (!v) return '—'
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? v : d.toLocaleString()
+}
+
+/** 人设维度：聊天提醒 / 每日任务；另保留全局主动开关与旧配方清理。 */
 export default function SchedulesPage({ embeddedPersonaId }: Props = {}) {
   const { message } = App.useApp()
   const { personas, loading, prefs, setPrefs } = useCore()
@@ -33,18 +48,27 @@ export default function SchedulesPage({ embeddedPersonaId }: Props = {}) {
   const [runs, setRuns] = useState<Run[]>([])
   const [personaId, setPersonaId] = useState<string>()
   const [cleaning, setCleaning] = useState(false)
+  const [adding, setAdding] = useState(false)
+  const [form] = Form.useForm<{ title: string; hour: number; minute: number }>()
   const proactiveOn = !prefs.pause_proactive
   const embedded = !!embeddedPersonaId
 
   const reload = useCallback(async () => {
+    if (!personaId) {
+      setList([])
+      setRuns([])
+      return
+    }
     try {
-      const q = personaId ? `?persona_id=${encodeURIComponent(personaId)}` : ''
+      const q = `?persona_id=${encodeURIComponent(personaId)}`
       const [s, r] = await Promise.all([
         api<{ schedules: Schedule[] }>(`/api/v1/schedules${q}`),
-        api<{ runs: Run[] }>('/api/v1/schedules/runs?limit=40'),
+        api<{ runs: Run[] }>(`/api/v1/schedules/runs?limit=40`),
       ])
       setList(s.schedules || [])
-      setRuns(r.runs || [])
+      // 执行记录接口无 persona 过滤：只留当前人设任务相关
+      const ids = new Set((s.schedules || []).map((x) => x.id))
+      setRuns((r.runs || []).filter((row) => ids.has(row.schedule_id)))
     } catch (e) {
       message.error(e instanceof Error ? e.message : String(e))
     }
@@ -62,57 +86,211 @@ export default function SchedulesPage({ embeddedPersonaId }: Props = {}) {
     if (!personaId && personas[0]) setPersonaId(personas[0].id)
   }, [personas, personaId, embeddedPersonaId])
 
-  const legacy = useMemo(
-    () => list.filter((s) => /^(greet_|moment_)/.test(s.kind) || s.kind === 'moment_daily'),
-    [list],
-  )
+  const reminders = useMemo(() => list.filter((s) => isUserReminder(s.kind)), [list])
+  const legacy = useMemo(() => list.filter((s) => isLegacy(s.kind)), [list])
+  const personaName = personas.find((p) => p.id === personaId)?.name || personaId?.slice(0, 8) || '—'
 
   if (loading) return null
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
-      <Card title="主动推送">
+      <Card
+        title={`聊天提醒（人设：${personaName}）`}
+        extra={
+          !embedded ? (
+            <Space>
+              <Typography.Text type="secondary">切换人设</Typography.Text>
+              <select
+                value={personaId || ''}
+                onChange={(e) => setPersonaId(e.target.value || undefined)}
+                style={{ minWidth: 140 }}
+              >
+                {personas.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </Space>
+          ) : null
+        }
+      >
         <Alert
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
-          message="固定钟点问候已退役"
-          description="叫起床 / 催睡觉 / 定点朋友圈不再按表走。改由世界线、心情、作息窗口、久未联系等机会驱动；请到「陪伴」「世界线」看候选与门禁。这里只保留全局开关。"
+          message="提醒按人设隔离，不是全局任务"
+          description="在该人设聊天里说「每天8点提醒我」「一小时后和我说」「现在有什么任务」会写入此人设；全局「主动推送」暂停不会关掉这些提醒。"
         />
-        <Space wrap align="center" style={{ marginBottom: 8 }}>
-          <Typography.Text strong>全局主动任务</Typography.Text>
-          <Switch
-            checked={proactiveOn}
-            checkedChildren="运行中"
-            unCheckedChildren="已暂停"
-            onChange={async (running) => {
+        <Table
+          rowKey="id"
+          size="small"
+          dataSource={reminders}
+          pagination={false}
+          locale={{ emptyText: '此人设暂无聊天提醒' }}
+          columns={[
+            {
+              title: '标题',
+              dataIndex: 'title',
+              render: (t: string, row: Schedule) => (
+                <Space>
+                  <span>{t || '提醒'}</span>
+                  <Tag color={row.kind === 'user_daily' ? 'blue' : 'purple'}>
+                    {row.kind === 'user_daily' ? '每天' : '一次'}
+                  </Tag>
+                </Space>
+              ),
+            },
+            {
+              title: '时间',
+              render: (_: unknown, row: Schedule) =>
+                row.kind === 'user_daily'
+                  ? `每天 ${String(row.hour).padStart(2, '0')}:${String(row.minute).padStart(2, '0')}`
+                  : fmtNext(row.next_run_at),
+            },
+            {
+              title: '下次',
+              dataIndex: 'next_run_at',
+              render: (v: string | null) => fmtNext(v),
+            },
+            {
+              title: '状态',
+              render: (_: unknown, row: Schedule) =>
+                row.enabled && !row.paused ? <Tag color="green">运行</Tag> : <Tag>停用</Tag>,
+            },
+            {
+              title: '',
+              width: 160,
+              render: (_: unknown, row: Schedule) => (
+                <Space>
+                  <Button
+                    size="small"
+                    onClick={async () => {
+                      const on = row.enabled && !row.paused
+                      try {
+                        await api(`/api/v1/schedules/${row.id}`, {
+                          method: 'PATCH',
+                          body: JSON.stringify({ enabled: !on, paused: on, reschedule: !on }),
+                        })
+                        await reload()
+                      } catch (e) {
+                        message.error(e instanceof Error ? e.message : String(e))
+                      }
+                    }}
+                  >
+                    {row.enabled && !row.paused ? '停用' : '启用'}
+                  </Button>
+                  <Button
+                    size="small"
+                    danger
+                    onClick={async () => {
+                      try {
+                        await api(`/api/v1/schedules/${row.id}`, { method: 'DELETE' })
+                        message.success('已删除')
+                        await reload()
+                      } catch (e) {
+                        message.error(e instanceof Error ? e.message : String(e))
+                      }
+                    }}
+                  >
+                    删
+                  </Button>
+                </Space>
+              ),
+            },
+          ]}
+        />
+
+        <Card type="inner" title="给此人设添加每日提醒" style={{ marginTop: 16 }}>
+          <Form
+            form={form}
+            layout="inline"
+            initialValues={{ hour: 8, minute: 0, title: '' }}
+            onFinish={async (vals) => {
+              if (!personaId) return
+              setAdding(true)
               try {
-                const next = await api<typeof prefs>('/api/v1/prefs', {
-                  method: 'PUT',
-                  body: JSON.stringify({ pause_proactive: !running }),
+                const title = (vals.title || '').trim() || '提醒一下'
+                await api('/api/v1/schedules', {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    persona_id: personaId,
+                    kind: 'user_daily',
+                    title,
+                    hour: vals.hour,
+                    minute: vals.minute,
+                    prompt: `到点了，用平常聊天语气提醒对方：${title}。一两句话就好，不要说这是定时任务。`,
+                    jitter_minutes: 0,
+                    daily_limit: 1,
+                    require_chatted_today: false,
+                    min_interval_minutes: 0,
+                    enabled: true,
+                  }),
                 })
-                setPrefs(next)
-                message.success(running ? '已开启：机会驱动可推送' : '已暂停：不会主动发消息')
+                form.resetFields(['title'])
+                message.success('已写入此人设')
                 await reload()
               } catch (e) {
                 message.error(e instanceof Error ? e.message : String(e))
+              } finally {
+                setAdding(false)
               }
             }}
-          />
-          <Typography.Text type="secondary">
-            {proactiveOn ? '规划器可按世界线/心情推送' : '全部停住，可随时再开'}
-          </Typography.Text>
-        </Space>
-        {!embedded && personaId ? (
-          <Typography.Text type="secondary">
-            当前筛选：{personas.find((p) => p.id === personaId)?.name || personaId.slice(0, 8)}
-          </Typography.Text>
-        ) : null}
+          >
+            <Form.Item name="title" rules={[{ required: true, message: '填内容' }]}>
+              <Input placeholder="提醒内容" style={{ width: 180 }} />
+            </Form.Item>
+            <Form.Item name="hour" rules={[{ required: true }]}>
+              <InputNumber min={0} max={23} addonAfter="时" />
+            </Form.Item>
+            <Form.Item name="minute" rules={[{ required: true }]}>
+              <InputNumber min={0} max={59} addonAfter="分" />
+            </Form.Item>
+            <Form.Item>
+              <Button type="primary" htmlType="submit" loading={adding}>
+                添加
+              </Button>
+            </Form.Item>
+          </Form>
+        </Card>
       </Card>
+
+      {!embedded ? (
+        <Card title="全局主动推送（不含聊天提醒）">
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="这是账号级主动开关"
+            description="只影响机会驱动/旧主动类任务。人设聊天提醒（user_once / user_daily）不受此开关影响。"
+          />
+          <Space wrap align="center">
+            <Typography.Text strong>全局主动任务</Typography.Text>
+            <Switch
+              checked={proactiveOn}
+              checkedChildren="运行中"
+              unCheckedChildren="已暂停"
+              onChange={async (running) => {
+                try {
+                  const next = await api<typeof prefs>('/api/v1/prefs', {
+                    method: 'PUT',
+                    body: JSON.stringify({ pause_proactive: !running }),
+                  })
+                  setPrefs(next)
+                  message.success(running ? '已开启主动推送' : '已暂停主动推送（聊天提醒仍会响）')
+                  await reload()
+                } catch (e) {
+                  message.error(e instanceof Error ? e.message : String(e))
+                }
+              }}
+            />
+          </Space>
+        </Card>
+      ) : null}
 
       {legacy.length > 0 ? (
         <Card
-          title="旧定时配方（可删）"
+          title={`旧定时配方（此人设可删，${legacy.length}）`}
           extra={
             <Button
               danger
@@ -136,9 +314,6 @@ export default function SchedulesPage({ embeddedPersonaId }: Props = {}) {
             </Button>
           }
         >
-          <Typography.Paragraph type="secondary" style={{ marginBottom: 12 }}>
-            这些是退役前留下的钟点任务，即使启用也不会再按旧逻辑轰炸；建议直接删掉。
-          </Typography.Paragraph>
           <Table
             rowKey="id"
             size="small"
@@ -185,7 +360,7 @@ export default function SchedulesPage({ embeddedPersonaId }: Props = {}) {
         </Card>
       ) : null}
 
-      <Card title="最近执行（遗留记录）">
+      <Card title={`此人设最近执行（${runs.length}）`}>
         <Table
           rowKey="id"
           size="small"

@@ -123,4 +123,53 @@ class MediaPick {
       bytes: bytes,
     );
   }
+
+  /// 音色参考：wav / mp3 / m4a / aac / flac。
+  static Future<StagedMedia?> pickAudio() async {
+    final list = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['wav', 'mp3', 'm4a', 'aac', 'flac'],
+    );
+    if (list.isEmpty) return null;
+    final f = list.first;
+    final bytes = await f.readAsBytes();
+    if (bytes.isEmpty) return null;
+    if (bytes.length > 30 * 1024 * 1024) {
+      throw StateError('音频不能超过 30MB');
+    }
+    final name = f.name.toLowerCase();
+    var ctype = 'application/octet-stream';
+    if (name.endsWith('.wav')) {
+      ctype = 'audio/wav';
+    } else if (name.endsWith('.mp3')) {
+      ctype = 'audio/mpeg';
+    } else if (name.endsWith('.m4a') || name.endsWith('.aac')) {
+      ctype = 'audio/mp4';
+    } else if (name.endsWith('.flac')) {
+      ctype = 'audio/flac';
+    }
+    return StagedMedia(
+      path: f.path ?? f.name,
+      name: f.name,
+      kind: 'audio',
+      bytes: bytes,
+      contentType: ctype,
+    );
+  }
+
+  /// 形象参考：单张相册图。
+  static Future<StagedMedia?> pickSingleImage() async {
+    final x = await _picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 85,
+      maxWidth: 1536,
+      maxHeight: 2048,
+    );
+    if (x == null) return null;
+    try {
+      return await _stageImage(x);
+    } catch (_) {
+      return null;
+    }
+  }
 }

@@ -12,6 +12,7 @@ import 'chat.dart';
 import 'chat_info.dart';
 import 'moments.dart';
 import 'companion_board.dart';
+import 'fullscreen_images.dart';
 import 'persona_draw.dart';
 
 /// 微信风格好友资料页（非编辑表单）。
@@ -72,7 +73,24 @@ class PersonaPage extends StatelessWidget {
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Avatar(wxName, p.color, size: 64, api: store.api, avatarFileId: p.avatarFileId.isEmpty ? null : p.avatarFileId),
+                        GestureDetector(
+                          onTap: () {
+                            if (p.avatarFileId.isEmpty) return;
+                            openAvatarPreview(
+                              context,
+                              api: store.api,
+                              fileId: p.avatarFileId,
+                              label: displayName,
+                            );
+                          },
+                          child: Avatar(
+                            wxName,
+                            p.color,
+                            size: 64,
+                            api: store.api,
+                            avatarFileId: p.avatarFileId.isEmpty ? null : p.avatarFileId,
+                          ),
+                        ),
                         const SizedBox(width: 16),
                         Expanded(
                           child: Column(
@@ -152,9 +170,23 @@ class PersonaPage extends StatelessWidget {
                   ),
                   const Divider(height: 1, indent: 16),
                   ArrowTile(
+                    title: '定时任务',
+                    subtitle: '仅此人设的聊天提醒 / 每日任务',
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (_) => PersonaSchedulesPage(store: store, persona: p)),
+                    ),
+                  ),
+                  const Divider(height: 1, indent: 16),
+                  ArrowTile(
                     title: '音色 / 形象抽卡',
-                    subtitle: 'Breeze TTS 2 · QwenImage 2.1',
-                    onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PersonaDrawPage(store: store, persona: p))),
+                    subtitle: '自拍出镜前请先固定形象（头像不算）',
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => PersonaDrawPage(store: store, persona: p, initialTab: 1),
+                      ),
+                    ),
                   ),
                 ]),
               const SizedBox(height: 12),
@@ -320,6 +352,7 @@ class PersonaConfigPage extends StatefulWidget {
 class _PersonaConfigPageState extends State<PersonaConfigPage> {
   late final name = TextEditingController(text: widget.persona.name);
   late final bio = TextEditingController(text: widget.persona.bio);
+  late final signature = TextEditingController(text: widget.persona.signature);
   late final model = TextEditingController(text: widget.store.channel(widget.persona.channelId)?.model ?? '');
   late final url = TextEditingController(text: widget.store.channel(widget.persona.channelId)?.baseUrl ?? '');
   late final quietStart = TextEditingController(text: widget.persona.quietStart);
@@ -328,6 +361,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
   Uint8List? avatarBytes;
   String avatarName = 'avatar.jpg';
   late String avatarFileId = widget.persona.avatarFileId;
+  bool generatingAvatar = false;
 
   @override
   void initState() {
@@ -363,6 +397,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
   void dispose() {
     name.dispose();
     bio.dispose();
+    signature.dispose();
     model.dispose();
     url.dispose();
     quietStart.dispose();
@@ -379,6 +414,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
     }
     final nextName = n;
     final nextBio = bio.text.trim();
+    final nextSignature = signature.text.trim();
     final nextQuietStart = quietStart.text.trim();
     final nextQuietEnd = quietEnd.text.trim();
     var nextAvatarId = avatarFileId;
@@ -412,6 +448,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
     // 本地先写入，界面立刻一致
     p.name = nextName;
     p.bio = nextBio;
+    p.signature = nextSignature;
     p.color = color;
     p.quietStart = nextQuietStart;
     p.quietEnd = nextQuietEnd;
@@ -428,6 +465,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
         final raw = await widget.store.api!.patchPersona(p.id, {
           'name': nextName,
           'bio': nextBio,
+          'signature': nextSignature,
           'color': color.toARGB32(),
           'channel_id': p.channelId,
           'greet': p.greet,
@@ -443,6 +481,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
           avatarFileId = synced.avatarFileId;
           name.text = synced.name;
           bio.text = synced.bio;
+          signature.text = synced.signature;
         }
       } catch (e) {
         if (mounted) {
@@ -555,6 +594,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
   }
 
   Future<void> _genAvatarByPrompt() async {
+    if (generatingAvatar) return;
     final store = widget.store;
     final api = store.api;
     if (store.demo || api == null) {
@@ -569,7 +609,7 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
         content: TextField(
           controller: ctrl,
           maxLines: 3,
-          decoration: const InputDecoration(hintText: '描述长相/画风…（生成正方形）'),
+          decoration: const InputDecoration(hintText: '描述长相/画风…（生成正方形，文生图走 Z-Image）'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
@@ -582,25 +622,28 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
     );
     ctrl.dispose();
     if (prompt == null || prompt.isEmpty || !mounted) return;
+    setState(() => generatingAvatar = true);
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('正在生成头像…')));
     try {
       final items = await api.drawPersonaImage(
         widget.persona.id,
         prompt: '正方形头像 1:1，$prompt',
         count: 1,
-        refPersona: true,
-      );
+        refPersona: false,
+        purpose: 'avatar',
+      ).timeout(const Duration(seconds: 120));
       if (items.isEmpty) throw Exception('未返回图片');
       final fid = (items.first as Map)['file_id']?.toString() ?? '';
       if (fid.isEmpty) throw Exception('无 file_id');
+      if (!mounted) return;
       setState(() => avatarFileId = fid);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('头像已生成，点完成保存')));
-      }
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('头像已生成，点完成保存')));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('生成失败：$e')));
       }
+    } finally {
+      if (mounted) setState(() => generatingAvatar = false);
     }
   }
 
@@ -625,18 +668,9 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
       body: ListView(
         padding: EdgeInsets.only(bottom: 24 + MediaQuery.paddingOf(context).bottom),
         children: [
-          Section(children: [
-            ListTile(
-              title: const Text('音色 / 形象抽卡'),
-              subtitle: const Text('多抽候选，固定后用于通话与自拍'),
-              trailing: const Icon(Icons.chevron_right, color: Color(0xFFC8C8C8)),
-              onTap: () => Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => PersonaDrawPage(store: store, persona: p)),
-              ),
-            ),
-          ]),
-          Section(children: [
+          Section(
+            margin: EdgeInsets.zero,
+            children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
               child: Row(
@@ -645,7 +679,15 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
                   Align(
                     alignment: Alignment.centerLeft,
                     child: GestureDetector(
-                      onTap: _pickAvatar,
+                      onTap: () {
+                        openAvatarPreview(
+                          context,
+                          api: store.api,
+                          fileId: avatarFileId.isEmpty ? null : avatarFileId,
+                          bytes: avatarBytes,
+                          label: name.text.trim().isEmpty ? p.name : name.text.trim(),
+                        );
+                      },
                       child: Avatar(
                         name.text.trim().isEmpty ? p.name : name.text.trim(),
                         color,
@@ -675,8 +717,14 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
                               child: const Text('上传头像', style: TextStyle(color: AppColors.name, fontSize: 14)),
                             ),
                             GestureDetector(
-                              onTap: _genAvatarByPrompt,
-                              child: const Text('提示词生成', style: TextStyle(color: AppColors.name, fontSize: 14)),
+                              onTap: generatingAvatar ? null : _genAvatarByPrompt,
+                              child: Text(
+                                generatingAvatar ? '生成中…' : '提示词生成',
+                                style: TextStyle(
+                                  color: generatingAvatar ? AppColors.muted : AppColors.name,
+                                  fontSize: 14,
+                                ),
+                              ),
                             ),
                           ],
                         ),
@@ -706,6 +754,29 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
                   fillColor: const Color(0xFFF7F7F7),
                   border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
                   contentPadding: const EdgeInsets.all(12),
+                ),
+              ),
+            ),
+          ]),
+          Section(children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: Text('朋友圈签名', style: TextStyle(fontSize: 13, color: AppColors.sub)),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+              child: TextField(
+                controller: signature,
+                maxLength: 40,
+                style: const TextStyle(fontSize: 16),
+                decoration: InputDecoration(
+                  hintText: '短签名，展示在朋友圈封面',
+                  hintStyle: const TextStyle(color: AppColors.muted),
+                  filled: true,
+                  fillColor: const Color(0xFFF7F7F7),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+                  contentPadding: const EdgeInsets.all(12),
+                  counterText: '',
                 ),
               ),
             ),
@@ -810,6 +881,19 @@ class _PersonaConfigPageState extends State<PersonaConfigPage> {
             ),
           ]),
           Section(children: [
+            ListTile(
+              title: const Text('定时任务'),
+              subtitle: const Text('仅此人设的聊天提醒 / 每日任务', style: TextStyle(fontSize: 12, color: AppColors.sub)),
+              trailing: const Icon(Icons.chevron_right, color: AppColors.muted),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => PersonaSchedulesPage(store: store, persona: p),
+                  ),
+                );
+              },
+            ),
+            const Divider(height: 1, indent: 16),
             ListTile(
               title: const Text('陪伴看板'),
               subtitle: const Text('情绪 / 成长 / 记忆（只读）', style: TextStyle(fontSize: 12, color: AppColors.sub)),
