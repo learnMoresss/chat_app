@@ -287,12 +287,17 @@ def synthesize_sing(
 
     song_path: Optional[Path] = None
     track_id = ""
+    track_title = ""
+    track_artist = ""
     try:
         from . import music_library as mlib
 
-        hit = mlib.resolve_track_by_prompt(user_id=user_id, prompt=body)
+        # 唱歌一律走账号翻唱曲库（匹配提示 → 否则随机一首）；不再默认 ACE 作曲
+        hit = mlib.pick_cover_track(user_id=user_id, prompt=body)
         if hit and (hit.get("path") or "").strip():
             track_id = str(hit.get("id") or "")
+            track_title = str(hit.get("title") or "").strip()
+            track_artist = str(hit.get("artist") or "").strip()
             path_s = str(hit["path"])
             p = Path(path_s)
             if p.is_file():
@@ -332,7 +337,12 @@ def synthesize_sing(
     except Exception as exc:
         log.debug("music resolve skip: %s", exc)
 
-    if song_path is not None and arrangement == "a_cappella" and not _ARR_RE.match((prompt or "").strip()):
+    if song_path is None:
+        log.warning("sing: no cover track in library user=%s prompt=%s", user_id, body[:80])
+        return None
+
+    # 曲库翻唱默认带伴奏（除非暗号显式写了清唱）
+    if not _ARR_RE.match((prompt or "").strip()):
         arrangement = "with_backing"
 
     try:
@@ -358,6 +368,10 @@ def synthesize_sing(
         if len(data) < 1000:
             return None
         secs = int(round(float(report.get("duration_sec") or 0)))
+        if secs <= 0:
+            # ~128kbps mp3 粗估
+            secs = max(1, int(round(len(data) * 8 / 128000.0)))
+        title = track_title or body[:40] or "翻唱"
         return {
             "bytes": data,
             "content_type": "audio/mpeg",
@@ -365,14 +379,21 @@ def synthesize_sing(
             "seconds": secs,
             "meta": {
                 "kind_extra": "sing",
+                "card": "sing_track",
+                "title": title,
+                "artist": track_artist,
+                "track_id": track_id,
                 "sing": {
                     "arrangement": arrangement,
-                    "mode": report.get("mode"),
+                    "mode": report.get("mode") or "cover",
                     "prompt": body[:120],
                     "job": job,
                     "ref_source": ref_source,
                     "track_id": track_id,
+                    "title": title,
+                    "artist": track_artist,
                     "runner": "local",
+                    "source": "cover_library",
                 },
             },
         }

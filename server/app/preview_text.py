@@ -26,8 +26,10 @@ def conversation_preview(*, kind: str, text: str, seconds: int = 0) -> str:
                 return f"[文件] {cap}".strip()[:200] if cap else "[文件]"
             if kind == "voice":
                 sec = int(data.get("seconds") or seconds or 0)
-                if str(data.get("kind_extra") or "") == "sing":
-                    return f"[唱歌] {sec}\"" if sec > 0 else "[唱歌]"
+                if str(data.get("kind_extra") or "") == "sing" or str(data.get("card") or "") == "sing_track":
+                    title = (data.get("title") or data.get("caption") or "").strip()
+                    base = f"[音乐] {title}".strip() if title else "[音乐]"
+                    return f"{base} {sec}\"".strip() if sec > 0 else base
                 return f"[语音] {sec}\"" if sec > 0 else "[语音]"
             if kind == "link":
                 if str(data.get("card") or "") == "voice_call":
@@ -74,4 +76,12 @@ def sanitize_stored_preview(preview: Optional[str]) -> str:
         return raw[:200]
     if not isinstance(data, dict) or "files" not in data:
         return raw[:200]
-    return conversation_preview(kind="image", text=raw)
+    # 语音/唱歌 JSON 也有 files，不能默认当成图片
+    kind = "image"
+    if str(data.get("kind_extra") or "").lower() == "sing":
+        kind = "voice"
+    elif data.get("asr") is not None or data.get("seconds") is not None:
+        kind = "voice"
+    return conversation_preview(
+        kind=kind, text=raw, seconds=int(data.get("seconds") or 0)
+    )

@@ -284,6 +284,7 @@ def filter_media_intents(
         "video": "video",
         "voice": "voice",
         "sing": "sing",
+        "sing_replay": "sing",
         "listen": "listen",
         "nearby": "place",
     }

@@ -97,9 +97,12 @@ class _ListenPipOverlayState extends State<_ListenPipOverlay>
 
   void _armIdle() {
     _idle?.cancel();
+    // 翻唱单曲没有全屏页，保持 panel 控件可见，不收到纯唱片
+    if (widget.mini.sessionId.startsWith('sing_')) return;
     _idle = Timer(_idleCollapse, () {
       if (!mounted) return;
       if (_ctl.mini == null) return;
+      if (_ctl.mini!.sessionId.startsWith('sing_')) return;
       if (_ctl.mini!.mode != ListenPipMode.disc) {
         _ctl.setPipMode(ListenPipMode.disc);
       }
@@ -151,6 +154,11 @@ class _ListenPipOverlayState extends State<_ListenPipOverlay>
     _bumpIdle();
     final mini = widget.mini;
     final store = widget.store;
+    // 翻唱单曲：没有一起听会话，放大成带控件的 panel 即可
+    if (mini.sessionId.startsWith('sing_')) {
+      _ctl.setPipMode(ListenPipMode.panel);
+      return;
+    }
     // 浮窗在 MaterialApp.builder 里，context 没有 Navigator 祖先；用根 navigatorKey
     final nav = _ctl.navigatorKey.currentState;
     if (nav == null) return;
@@ -172,7 +180,7 @@ class _ListenPipOverlayState extends State<_ListenPipOverlay>
 
   Future<void> _close() async {
     final mini = widget.mini;
-    if (mini.sessionId != 'preview') {
+    if (mini.sessionId != 'preview' && !mini.sessionId.startsWith('sing_')) {
       try {
         await widget.store.api?.patchListenSession(mini.sessionId, status: 'ended');
       } catch (_) {}
@@ -501,13 +509,15 @@ class _PanelBubble extends StatelessWidget {
                   ),
                 ),
                 // 浮窗在 MaterialApp.builder 外侧，无 Overlay；勿加 tooltip（会 RawTooltip 报错）
-                IconButton(
-                  visualDensity: VisualDensity.compact,
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                  onPressed: onExpand,
-                  icon: const Icon(Icons.open_in_full_rounded, color: Colors.white70, size: 16),
-                ),
+                // 翻唱无一起听全屏页，隐藏放大按钮，只留播放/关闭
+                if (!mini.sessionId.startsWith('sing_'))
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                    onPressed: onExpand,
+                    icon: const Icon(Icons.open_in_full_rounded, color: Colors.white70, size: 16),
+                  ),
                 IconButton(
                   visualDensity: VisualDensity.compact,
                   padding: EdgeInsets.zero,

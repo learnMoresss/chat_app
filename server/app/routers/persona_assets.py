@@ -276,12 +276,12 @@ def draw_voice(
         eng = resolve_tts_engine(for_draw=True)
         t0 = time.perf_counter()
         try:
-            # 抽卡走已常驻 CosyVoice（热态约数秒）；keep_loaded 避免条间卸载
+            # 按需 ensure→合成；冷启可能 >60s，timeout 要盖住启动+推理
             wav = synthesize_voice_wav(
                 text=sample,
                 instructions=instructions,
                 seed=int(meta.get("seed") or 0) or None,
-                timeout=min(90.0, float(settings.tts_timeout_seconds or 90)),
+                timeout=max(180.0, float(settings.tts_timeout_seconds or 300)),
                 keep_loaded=True,
                 engine=eng,
             )
@@ -614,7 +614,7 @@ def warm_voice(
     persona_id: str,
     user: Dict[str, Any] = Depends(current_user),
 ) -> Dict[str, Any]:
-    """抽卡前进页预热 TTS：走 CosyVoice（常驻热态），不拉 Breeze 冷启。"""
+    """抽卡前进页预热：按需拉起 Breeze（约 1 分钟冷启），热态后抽卡只付合成时间。"""
     _owned_persona(user["id"], persona_id)
     t0 = time.perf_counter()
     info = warm_tts_engine(for_realtime=False, for_draw=True)

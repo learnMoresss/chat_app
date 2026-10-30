@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ui' show Offset;
 
+import 'package:audio_service/audio_service.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
@@ -127,6 +128,66 @@ class ListenSessionController extends ChangeNotifier {
       mode: mode,
     );
     notifyListeners();
+  }
+
+  /// 翻唱 / 单曲：直接走一起听悬浮窗（带播放控件），不建听歌会话。
+  Future<void> playCoverInPip({
+    required String sessionId,
+    required String audioUrl,
+    Map<String, String> headers = const {},
+    String? convId,
+    String? personaName,
+    String title = '',
+    String artist = '',
+    Duration? duration,
+  }) async {
+    pageOpen = false;
+    _boundSessionId = sessionId;
+    mini = ListenMiniState(
+      sessionId: sessionId,
+      convId: convId,
+      personaName: personaName,
+      title: title,
+      artist: artist.isEmpty ? '翻唱' : artist,
+      playing: true,
+      mode: ListenPipMode.panel,
+    );
+    notifyListeners();
+
+    await _itemSub?.cancel();
+    await _playSub?.cancel();
+    final h = await ensureListenHandler();
+    _itemSub = h.mediaItem.listen((m) {
+      if (_boundSessionId != sessionId) return;
+      final cur = mini;
+      if (cur == null) return;
+      mini = cur.copyWith(
+        title: m?.title ?? cur.title,
+        artist: m?.artist ?? cur.artist,
+        artUri: m?.artUri,
+        clearArtUri: m != null && m.artUri == null,
+      );
+      notifyListeners();
+    });
+    _playSub = h.playbackState.listen((s) {
+      if (_boundSessionId != sessionId) return;
+      final cur = mini;
+      if (cur == null) return;
+      mini = cur.copyWith(playing: s.playing);
+      notifyListeners();
+    });
+
+    final item = MediaItem(
+      id: sessionId,
+      title: title.isEmpty ? '翻唱' : title,
+      artist: artist.isEmpty ? (personaName ?? '翻唱') : artist,
+      duration: duration,
+    );
+    await h.loadPlaylist(
+      items: [item],
+      headers: headers,
+      urlFor: (_) => audioUrl,
+    );
   }
 
   void setPipMode(ListenPipMode mode) {

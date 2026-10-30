@@ -508,6 +508,22 @@ def register_cache_file(*, user_id: str, path: Path, title: str = "") -> str:
     return tid
 
 
+def pick_cover_track(*, user_id: str, prompt: str = "") -> Optional[Dict[str, Any]]:
+    """翻唱曲库选曲：先按提示匹配，否则从账号曲库随机抽一首。"""
+    hit = resolve_track_by_prompt(user_id=user_id, prompt=prompt)
+    if hit and (hit.get("path") or hit.get("id")):
+        return hit
+    row = db.fetchone(
+        """
+        SELECT * FROM music_tracks
+        WHERE user_id = ? AND COALESCE(path, '') != ''
+        ORDER BY RANDOM() LIMIT 1
+        """,
+        (user_id,),
+    )
+    return dict(row) if row else None
+
+
 def resolve_track_by_prompt(*, user_id: str, prompt: str) -> Optional[Dict[str, Any]]:
     """歌单名精确 → 曲目标题包含 → None。"""
     q = re.sub(r"\s+", "", (prompt or "").strip())

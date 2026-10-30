@@ -10,6 +10,7 @@ import '../widgets.dart';
 import 'chat_history.dart';
 import 'fullscreen_images.dart';
 import 'persona.dart';
+import 'persona_sung.dart';
 
 Color conversationBgColor(String name) {
   switch (name) {
@@ -198,6 +199,14 @@ class _SingleInfoBody extends StatelessWidget {
             ArrowTile(
               title: '查找聊天记录',
               onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatHistoryPage(store: store, conv: conv))),
+            ),
+            ArrowTile(
+              title: '唱过的歌',
+              subtitle: '查看${persona.display}翻唱过的曲目',
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => PersonaSungPage(store: store, persona: persona)),
+              ),
             ),
           ]),
           Section(children: [

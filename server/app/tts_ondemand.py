@@ -60,10 +60,16 @@ def _port_up(base: str, paths: Optional[list] = None, timeout: float = 1.5) -> b
                                 return False
                         except Exception:
                             return False
-                    # Breeze：/v1/model 必须像真 Breeze（避免误认其它 /health）
-                    if ":8890" in base or p == "/v1/model":
+                    # Breeze：只认 /v1/model（含 model_digest/frame_rate）；禁止拿 /health 冒充
+                    if ":8890" in base:
+                        if p != "/v1/model":
+                            continue
                         body = (r.text or "").lower()
-                        if p == "/v1/model" and "breeze" not in body and "model" not in body:
+                        if (
+                            "model_digest" not in body
+                            and "frame_rate" not in body
+                            and "breeze" not in body
+                        ):
                             continue
                     return True
                 except Exception:
@@ -94,7 +100,24 @@ def _run(
     cmd: list[str],
     timeout: float = 120.0,
     env: Optional[dict] = None,
+    *,
+    detach_stdio: bool = False,
 ) -> subprocess.CompletedProcess:
+    """跑 shell。启动常驻服务时必须 detach_stdio=True：
+    capture_output 会让 nohup 子进程继承管道，父进程等到 timeout 后杀进程组，
+    刚拉起的 Breeze 会被一起杀掉，表现为「没启动就直接合成失败」。
+    """
+    if detach_stdio:
+        return subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+            env=env,
+            start_new_session=True,
+        )
     return subprocess.run(
         cmd,
         capture_output=True,
@@ -125,15 +148,18 @@ export QWEN_TTS_DEVICE=cuda:1 QWEN_TTS_DTYPE=float16 QWEN_TTS_ATTN=sdpa PYTHONUN
 if curl -sf -m 2 http://127.0.0.1:8881/health >/dev/null; then exit 0; fi
 systemctl --user reset-failed qwen3-tts-api.service 2>/dev/null || true
 if ! systemctl --user start qwen3-tts-api.service; then
-  pkill -f '/data/ai/apps/qwen3-audio-api/main.py' 2>/dev/null || true
+  ps -ef | awk '/qwen3-audio-api\/main.py/ && !/awk/ {print $2}' | xargs -r kill 2>/dev/null || true
   sleep 1
   cd /data/ai/apps/qwen3-audio-api
-  setsid nohup /data/ai/envs/qwen3-tts/bin/python /data/ai/apps/qwen3-audio-api/main.py \
+  nohup /data/ai/envs/qwen3-tts/bin/python /data/ai/apps/qwen3-audio-api/main.py \
     >>/data/ai/logs/audio/qwen3-tts-api-ondemand.log 2>&1 < /dev/null &
+  disown 2>/dev/null || true
 fi
+exit 0
 """,
         ],
         timeout=90.0,
+        detach_stdio=True,
     )
 
 
@@ -151,6 +177,7 @@ def _stop_customvoice() -> None:
 
 def _start_breeze() -> None:
     unload_others("breeze")
+    # detach_stdio：避免 capture 管道拖死 nohup，timeout 杀进程组时带走刚启动的 Breeze
     _run(
         [
             "bash",
@@ -162,21 +189,30 @@ PY=/data/ai/envs/breeze-tts/bin/python
 CKPT=/data/ai/models/audio/breeze-tts-2
 LOG=/data/ai/logs/audio/breeze-tts-api.log
 if [ ! -x "$PY" ] || [ ! -d "$ROOT" ] || [ ! -d "$CKPT" ]; then
-  echo "breeze not installed" >&2
+  echo "breeze not installed" >>"$LOG" 2>/dev/null
   exit 1
 fi
 PORT="${BREEZE_PORT:-8890}"
 if curl -sf -m 2 "http://127.0.0.1:${PORT}/v1/model" >/dev/null; then exit 0; fi
-pkill -f 'breeze_infer.api' 2>/dev/null || true
+# 只杀占用目标端口的旧进程，避免误伤
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
+fi
+ps -ef | awk '/breeze_infer\.api/ && !/awk/ {print $2}' | xargs -r kill 2>/dev/null || true
 sleep 1
-cd "$ROOT"
+cd "$ROOT" || exit 1
 export CUDA_VISIBLE_DEVICES="${BREEZE_GPU:-1}"
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
-setsid nohup "$PY" -m breeze_infer.api "$CKPT" --host 0.0.0.0 --port "$PORT" \
+export PYTHONUNBUFFERED=1
+nohup "$PY" -m breeze_infer.api "$CKPT" --host 127.0.0.1 --port "$PORT" \
   >>"$LOG" 2>&1 < /dev/null &
+echo "started pid=$! port=$PORT $(date -Is)" >>"$LOG"
+disown 2>/dev/null || true
+exit 0
 """,
         ],
-        timeout=30.0,
+        timeout=20.0,
+        detach_stdio=True,
     )
 
 
@@ -194,17 +230,20 @@ def _start_voicedesign() -> None:
             "-lc",
             r"""
 set +e
-cd /data/ai/services/dramaclaw-voicedesign
+cd /data/ai/services/dramaclaw-voicedesign || exit 1
 export VOICE_DESIGN_IDLE_UNLOAD_SECONDS=120
 if curl -sf -m 2 http://127.0.0.1:8882/health >/dev/null; then exit 0; fi
-pkill -f 'voicedesign_service:app' 2>/dev/null || true
+ps -ef | awk '/voicedesign_service:app/ && !/awk/ {print $2}' | xargs -r kill 2>/dev/null || true
 sleep 1
-setsid nohup /data/ai/envs/qwen3-tts-voicedesign/bin/uvicorn voicedesign_service:app \
-  --host 0.0.0.0 --port 8882 --workers 1 \
+nohup /data/ai/envs/qwen3-tts-voicedesign/bin/uvicorn voicedesign_service:app \
+  --host 127.0.0.1 --port 8882 --workers 1 \
   >>/data/ai/logs/audio/voicedesign-ondemand.log 2>&1 < /dev/null &
+disown 2>/dev/null || true
+exit 0
 """,
         ],
         timeout=30.0,
+        detach_stdio=True,
     )
 
 
@@ -344,24 +383,35 @@ def ensure_engine(engine: str) -> None:
         return
     t0 = time.time()
     cold = False
+    # 启动脚本在锁内跑完即返回；就绪轮询放锁外，避免冷启 1 分钟卡住其它 TTS
     with _lock:
         t = _stop_timers.pop(engine, None)
         if t:
             t.cancel()
         base = _urls()[engine]
         already = _port_up(base)
-        # 已热时不要再 unload_others：避免抽卡条条把刚预热的引擎连带折腾
-        if not already:
-            unload_others(engine)
-            cold = True
-            starter = _STARTERS.get(engine)
-            if not starter:
-                raise RuntimeError(f"{engine} 无启动器")
+        if already:
+            _last_used[engine] = time.time()
+            log.info(
+                "ensure_engine engine=%s cold=False ensure_ms=%s",
+                engine,
+                int((time.time() - t0) * 1000),
+            )
+            return
+        unload_others(engine)
+        cold = True
+        starter = _STARTERS.get(engine)
+        if not starter:
+            raise RuntimeError(f"{engine} 无启动器")
+        try:
             starter()
-            # Breeze 冷启动加载权重很慢
-            wait = 420.0 if engine == "breeze" else ENSURE_TIMEOUT
-            if not _wait_ready(engine, timeout=wait):
-                raise RuntimeError(f"{engine} 启动超时，请稍后重试")
+        except Exception as e:
+            log.warning("start %s failed: %s", engine, e)
+            raise RuntimeError(f"{engine} 启动失败: {e}") from e
+    wait = 420.0 if engine == "breeze" else ENSURE_TIMEOUT
+    if not _wait_ready(engine, timeout=wait):
+        raise RuntimeError(f"{engine} 启动超时，请稍后重试")
+    with _lock:
         _last_used[engine] = time.time()
     ensure_ms = int((time.time() - t0) * 1000)
     log.info(

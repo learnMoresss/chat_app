@@ -14,6 +14,7 @@ import 'moments.dart';
 import 'companion_board.dart';
 import 'fullscreen_images.dart';
 import 'persona_draw.dart';
+import 'persona_sung.dart';
 
 /// 微信风格好友资料页（非编辑表单）。
 class PersonaPage extends StatelessWidget {
@@ -185,6 +186,17 @@ class PersonaPage extends StatelessWidget {
                       context,
                       MaterialPageRoute(
                         builder: (_) => PersonaDrawPage(store: store, persona: p, initialTab: 1),
+                      ),
+                    ),
+                  ),
+                  const Divider(height: 1, indent: 16),
+                  ArrowTile(
+                    title: '唱过的歌',
+                    subtitle: '翻唱曲库记录，点开可播放',
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => PersonaSungPage(store: store, persona: p),
                       ),
                     ),
                   ),

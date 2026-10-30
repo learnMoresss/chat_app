@@ -12,13 +12,23 @@ String readableConvPreview(String raw) {
     final files = m['files'];
     final cap = (m['caption']?.toString() ?? '').trim();
     final n = files is List ? files.length : 0;
+    final kindExtra = (m['kind_extra']?.toString() ?? '').toLowerCase();
+    final hasAsr = (m['asr']?.toString() ?? '').trim().isNotEmpty;
+    final sec = int.tryParse('${m['seconds'] ?? ''}') ?? 0;
+    // 语音 / 唱歌 JSON 也带 files，不能一律当成图片
+    final card = (m['card']?.toString() ?? '').toLowerCase();
+    final looksVoice = kindExtra == 'sing' || card == 'sing_track' || hasAsr || m.containsKey('seconds');
+    if (looksVoice && (n > 0 || m.containsKey('seconds'))) {
+      if (kindExtra == 'sing' || card == 'sing_track') {
+        final title = (m['title']?.toString() ?? m['caption']?.toString() ?? '').trim();
+        final base = title.isNotEmpty ? '[音乐] $title' : '[音乐]';
+        return sec > 0 ? '$base $sec"' : base;
+      }
+      return sec > 0 ? '[语音] $sec"' : '[语音]';
+    }
     if (n > 0) {
       final base = n > 1 ? '[图片×$n]' : '[图片]';
       return cap.isEmpty ? base : '$base $cap';
-    }
-    if (m['seconds'] != null) {
-      final sec = int.tryParse('${m['seconds']}') ?? 0;
-      return sec > 0 ? '[语音] $sec"' : '[语音]';
     }
     if (m['job_id'] != null || m['url'] != null) {
       final p = (m['preview']?.toString() ?? '').trim();

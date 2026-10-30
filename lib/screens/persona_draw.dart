@@ -190,8 +190,8 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
     });
 
     try {
-      final items = await api
-          .drawPersonaVoice(
+      // 冷启 Breeze ≈1 分钟 + 合成 ≈20s；勿用短 timeout 把按需启动掐死
+      final items = await api.drawPersonaVoice(
             widget.persona.id,
             prompt: prompt,
             count: 1,
@@ -199,8 +199,7 @@ class _PersonaDrawPageState extends State<PersonaDrawPage> with SingleTickerProv
             batchId: batchId,
             slotIndex: 0,
             refPersona: false,
-          )
-          .timeout(const Duration(seconds: 90));
+          );
       if (!mounted) return;
       final slotId = slot['id'] as String;
       final idx = _voices.indexWhere((a) => a['id'] == slotId);

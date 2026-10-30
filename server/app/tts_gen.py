@@ -117,12 +117,18 @@ def _breeze_wav(
         with httpx.Client(timeout=timeout) as client:
             r = client.post(url, data=data)
             if r.status_code >= 400 or not r.content or len(r.content) < 200:
+                log.warning(
+                    "breeze speech fail status=%s bytes=%s",
+                    r.status_code,
+                    len(r.content or b""),
+                )
                 return None
             ctype = (r.headers.get("content-type") or "").lower()
             if "wav" in ctype or r.content[:4] == b"RIFF":
                 return r.content
             return _pcm16_mono_to_wav(r.content, 24000)
-    except Exception:
+    except Exception as e:
+        log.warning("breeze speech exception: %s", e)
         return None
 
 
@@ -330,16 +336,23 @@ def synthesize_voice_wav(
 
     def _with_engine(name: str, fn):
         try:
+            # 按需：先 ensure 拉起进程/权重，再合成；失败返回 None 好走回退
             tts_ondemand.ensure_engine(name)
             return fn()
+        except Exception as e:
+            log.warning("tts engine=%s ensure/synth failed: %s", name, e)
+            return None
         finally:
             # 抽卡 keep_loaded：拉长闲置，减少「预热完又被卸」
             idle = getattr(tts_ondemand, "DRAW_IDLE_SECONDS", 600.0) if keep_loaded else None
-            tts_ondemand.release_engine(
-                name,
-                unload_now=not keep_loaded,
-                idle_seconds=idle,
-            )
+            try:
+                tts_ondemand.release_engine(
+                    name,
+                    unload_now=not keep_loaded,
+                    idle_seconds=idle,
+                )
+            except Exception:
+                pass
 
     if eng == "cosyvoice":
         wav = _with_engine(

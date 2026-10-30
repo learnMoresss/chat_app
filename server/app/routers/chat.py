@@ -111,11 +111,17 @@ from ..llm import build_messages, pick_max_tokens
 from .. import stickers as stk
 from ..media_cards import (
     extract_media_intents,
+    find_sung_match,
     fixed_look_file_id,
     fixed_voice_prompt,
     image_needs_persona_look,
+    maybe_augment_voice_intents,
     recent_persona_voice_secs,
+    sung_memory_hints,
     user_asks_persona_look,
+    user_asks_sing,
+    user_asks_sung_replay,
+    user_asks_sung_resing,
 )
 from ..model_route import resolve_dsh_route, usage_model_label
 from ..routers.channels import list_visible, resolve_channel_for_persona
@@ -890,12 +896,21 @@ async def _generate_reply(
         _caps_enabled = set()
         _has_fixed_voice = False
         _has_fixed_look = False
+    _sung_hints: list = []
+    try:
+        if "sing" in _caps_enabled:
+            _sung_hints = sung_memory_hints(
+                user_id=user_id, persona_id=persona_id, limit=8
+            )
+    except Exception:
+        _sung_hints = []
     messages = build_messages(
         persona_bio=bio_for_turn,
         persona_name=persona["name"],
         history=history[-6:],
         memories=mems,
         schedule_hints=sched_hints,
+        sung_hints=_sung_hints,
         include_memory_in_system=False,
         affect_hint=affect_hint,
         growth_hint=growth_hint,
@@ -1210,10 +1225,12 @@ async def _generate_reply(
         try:
             from ..config import get_settings as _gs
 
+            # 普通语音冷却：唱歌条不占用（唱完立刻「说句话」仍可发）
             voice_cooled = recent_persona_voice_secs(
                 user_id=user_id,
                 conv_id=conv_id,
                 within_seconds=float(_gs().voice_reply_cooldown_seconds or 45),
+                exclude_sing=True,
             )
         except Exception:
             voice_cooled = False
@@ -1255,6 +1272,7 @@ async def _generate_reply(
             voice_cooled = False  # 仍受固定音色与字数闸
         sing_enabled = False
         sing_cooled = False
+        voice_cap_on = False
         try:
             from ..config import get_settings as _gs2
             from ..product_capabilities import is_enabled_for_user as _cap_on
@@ -1262,14 +1280,17 @@ async def _generate_reply(
             _urow3 = db.fetchone("SELECT is_admin FROM users WHERE id = ?", (user_id,))
             _is_adm = bool(_urow3 and _urow3["is_admin"])
             sing_enabled = _cap_on(user_id, "sing", is_admin=_is_adm)
+            voice_cap_on = _cap_on(user_id, "voice", is_admin=_is_adm)
             sing_cooled = recent_persona_voice_secs(
                 user_id=user_id,
                 conv_id=conv_id,
                 within_seconds=float(_gs2().sing_cooldown_seconds or 120),
+                only_sing=True,
             )
         except Exception:
             sing_enabled = False
             sing_cooled = False
+            voice_cap_on = False
         # 产品能力门禁：未注册的暗号 → 去掉并准备人设口吻告知
         setup_notices: list = []  # (setup, body, link, ai_line)
         try:
@@ -1286,6 +1307,78 @@ async def _generate_reply(
                 text = (text + "\n" + line).strip() if text.strip() else line
         except Exception:
             _cap_denies = []
+
+        # 语音策略：主动要 → 直发；sometimes 不定时补；先查能力/固定音色
+        try:
+            media_intents, voice_setup = maybe_augment_voice_intents(
+                text,
+                media_intents,
+                user_text=user_text or "",
+                cooled=voice_cooled,
+                has_fixed_voice=bool(voice_prompt_fixed),
+                voice_pref=voice_pref,
+                voice_cap_on=bool(voice_cap_on),
+            )
+            if voice_setup == "need_fix":
+                setup_notices.append(
+                    (
+                        "voice",
+                        "还没固定音色，",
+                        "去抽卡固定",
+                        "想发语音得先固定一条声线，你去抽卡页选一下嘛。",
+                    )
+                )
+            elif voice_setup == "need_cap":
+                text = (
+                    (text + "\n想发语音，可是语音这边还没开好。").strip()
+                    if text.strip()
+                    else "想发语音，可是语音这边还没开好。"
+                )
+            # 点名要语音：本轮忽略冷却
+            if any(i.get("kind") == "voice" and i.get("explicit") for i in media_intents):
+                voice_cooled = False
+        except Exception:
+            logger.exception("voice strategy augment failed")
+
+        # 点名要唱但模型没写暗号：补 ⟦唱⟧（有曲名更好；否则随心情）
+        try:
+            if (
+                user_asks_sing(user_text or "")
+                and sing_enabled
+                and voice_prompt_fixed
+                and not sing_cooled
+                and not any(i.get("kind") in ("sing", "sing_replay") for i in media_intents)
+            ):
+                media_intents = list(media_intents) + [
+                    {"kind": "sing", "prompt": "随心情唱一句", "explicit": True}
+                ]
+        except Exception:
+            pass
+
+        # 仅「再发旧录音」强确认命中才补 ⟦再唱⟧；想听歌/提之前那首绝不自动复用
+        try:
+            if (
+                sing_enabled
+                and voice_prompt_fixed
+                and user_asks_sung_replay(user_text or "")
+                and not user_asks_sung_resing(user_text or "")
+                and not any(i.get("kind") in ("sing", "sing_replay") for i in media_intents)
+            ):
+                hit = find_sung_match(
+                    user_id=user_id, persona_id=persona_id, query=user_text or ""
+                )
+                if hit and hit.get("file_id"):
+                    media_intents = list(media_intents) + [
+                        {
+                            "kind": "sing_replay",
+                            "prompt": str(hit.get("title") or "之前那首"),
+                            "explicit": True,
+                            "file_id": hit.get("file_id"),
+                            "sung": hit,
+                        }
+                    ]
+        except Exception:
+            logger.exception("sung replay augment failed")
 
         look_fixed = None
         try:
@@ -1391,10 +1484,12 @@ async def _generate_reply(
             kept: list = []
             for intent in media_intents:
                 if intent.get("kind") == "voice":
+                    # 用户点名要语音：有固定音色时保留，不降级成文字
+                    if intent.get("explicit") and voice_prompt_fixed and voice_pref != "never":
+                        kept.append(intent)
+                        continue
                     line = str(intent.get("prompt") or "").strip()
-                    if line and voice_prompt_fixed:
-                        text = (text + "\n" + line).strip() if text.strip() else line
-                    elif line and voice_pref == "never":
+                    if line and (voice_prompt_fixed or voice_pref == "never"):
                         text = (text + "\n" + line).strip() if text.strip() else line
                 else:
                     kept.append(intent)

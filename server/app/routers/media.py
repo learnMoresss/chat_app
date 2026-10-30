@@ -7,13 +7,16 @@ from typing import Any, Dict, Optional
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .. import db
 from ..config import get_settings
 from ..gateway.signed_urls import make_download_url, verify_download, verify_upload
 from ..media_store import files_root, find_by_hash, put_bytes
-from ..security import current_user, iso, new_id
+from ..security import current_user, decode_access_token, iso, new_id
+
+_optional_bearer = HTTPBearer(auto_error=False)
 
 log = logging.getLogger("media")
 router = APIRouter(prefix="/api/v1/media", tags=["media"])
@@ -295,8 +298,44 @@ def _resolve_media_path(raw: str) -> Path:
     return path
 
 
+def _user_from_media_auth(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    access_token: str = Query("", alias="access_token"),
+    token: str = Query("", alias="token"),
+) -> Dict[str, Any]:
+    """播放器可用 Header Bearer，或 URL ?access_token=（与 music tracks 一致）。"""
+    raw = (creds.credentials if creds else "") or (access_token or token or "").strip()
+    if not raw:
+        raise HTTPException(status_code=401, detail="需要登录")
+    payload = decode_access_token(raw)
+    user = db.fetchone("SELECT * FROM users WHERE id = ?", (payload["sub"],))
+    if user is None or user["is_disabled"]:
+        raise HTTPException(status_code=401, detail="账号不可用")
+    return {"id": user["id"], "username": user["username"]}
+
+
+def _audio_media_type(path: Path, fallback: str = "") -> str:
+    ext = path.suffix.lower().lstrip(".")
+    mapped = {
+        "mp3": "audio/mpeg",
+        "mpeg": "audio/mpeg",
+        "mpga": "audio/mpeg",
+        "m4a": "audio/mp4",
+        "mp4": "audio/mp4",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+        "ogg": "audio/ogg",
+        "opus": "audio/ogg",
+    }.get(ext)
+    if mapped:
+        return mapped
+    fb = (fallback or "").strip()
+    return fb or "application/octet-stream"
+
+
 @router.get("/files/{file_id}")
-def get_own_file(file_id: str, user=Depends(current_user)) -> FileResponse:
+def get_own_file(file_id: str, user=Depends(_user_from_media_auth)) -> FileResponse:
     from .. import stickers as stk
 
     row = stk.resolve_media_row(file_id=file_id, user_id=user["id"])
@@ -305,8 +344,9 @@ def get_own_file(file_id: str, user=Depends(current_user)) -> FileResponse:
     path = _resolve_media_path(row["path"])
     if not path.is_file():
         raise HTTPException(status_code=404, detail="file missing")
+    ctype = _audio_media_type(path, row["content_type"] or "")
     return FileResponse(
         path,
-        media_type=row["content_type"] or "application/octet-stream",
+        media_type=ctype,
         filename=path.name,
     )

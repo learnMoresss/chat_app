@@ -41,6 +41,7 @@ def build_messages(
     history: List[Dict[str, str]],
     memories: Optional[List[str]] = None,
     schedule_hints: Optional[List[str]] = None,
+    sung_hints: Optional[List[str]] = None,
     include_memory_in_system: bool = False,
     affect_hint: str = "",
     growth_hint: str = "",
@@ -55,6 +56,12 @@ def build_messages(
     sched_block = ""
     if schedule_hints:
         sched_block = "\n你记得自己接下来的安排：\n- " + "\n- ".join(schedule_hints[:5])
+    sung_block = ""
+    if sung_hints:
+        sung_block = (
+            "\n你记得自己给对方唱过这些歌（可提曲名）：\n- "
+            + "\n- ".join(sung_hints[:8])
+        )
     affect_block = f"\n{affect_hint}" if affect_hint else ""
     growth_block = f"\n{growth_hint}" if growth_hint else ""
     caps = enabled_caps if enabled_caps is not None else set()
@@ -85,11 +92,21 @@ def build_messages(
         media_bits.append("想发短视频可写：⟦视频：画面一句话⟧。")
     if "voice" in caps and has_fixed_voice:
         media_bits.append(
-            "已固定音色：短回应可偶尔写 ⟦语音：短句⟧；不要句句语音。"
+            "已固定音色：平时短回应可偶尔写 ⟦语音：短句⟧，不要句句语音；"
+            "对方明确要语音/说句话/听你说话时，必须写一行 ⟦语音：要念的短句⟧（内容口语、完整），系统会发语音条。"
+        )
+    elif "voice" in caps and not has_fixed_voice:
+        media_bits.append(
+            "还没固定音色：对方要语音时不要假装已发，口语提醒去抽卡固定声线。"
         )
     if "sing" in caps:
         media_bits.append(
-            "对方点名要听唱时可写 ⟦唱：曲名⟧；不要句句唱；未开通时不要写唱标记。"
+            "对方普通点名要听歌/唱一首时写 ⟦唱：曲名或歌词主题⟧（新翻唱）；不要句句唱；未开通时不要写唱标记。"
+            "严禁：对方只说想听歌/唱首歌，就写 ⟦再唱⟧ 或假装发旧录音。"
+            "仅当对方明确指向「之前唱过的/那首」时，先口语问要不要直接再发一遍，还是重新唱；"
+            "在对方明确说「再发/直接发旧的/不用重唱」之前，不要写 ⟦再唱⟧ 也不要写 ⟦唱⟧。"
+            "对方确认再发才写 ⟦再唱：曲名⟧；确认重新唱才写 ⟦唱：曲名⟧。"
+            "有唱过清单时可提曲名，但没有确认前只问不发。"
         )
     if "listen" in caps:
         media_bits.append(
@@ -114,7 +131,7 @@ def build_messages(
 
     system = (
         f"你是{persona_name}。{persona_bio or '自然地聊天。'}"
-        f"{mem_block}{sched_block}{affect_block}{growth_block}\n"
+        f"{mem_block}{sched_block}{sung_block}{affect_block}{growth_block}\n"
         "这是微信式私聊，不是问答机器人，也不是客服。"
         "按人设带着情绪说话：开心就轻快，委屈就闷一点，关心就软一点。"
         "多数时候 1～3 句口语，气氛到了可以稍长；不要机械地永远只回一句。"

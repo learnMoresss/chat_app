@@ -1,9 +1,10 @@
 """角色发图：真生图（Z-Image / Qwen-Image 2.1）优先，失败再画氛围卡。"""
 from __future__ import annotations
 
+import random
 import re
 import textwrap
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import db
 from .config import get_settings
@@ -199,6 +200,11 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
             intents.append({"kind": "sing", "prompt": line[:200]})
         return ""
 
+    def _sing_replay(m: re.Match) -> str:
+        line = (m.group(1) or m.group(2) or "").strip()
+        intents.append({"kind": "sing_replay", "prompt": (line or "之前那首")[:200]})
+        return ""
+
     def _listen(m: re.Match) -> str:
         line = (m.group(1) or m.group(2) or (m.lastindex and m.group(m.lastindex)) or "").strip()
         # groups: 一起听 x2, 共听 x1
@@ -247,6 +253,8 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
         flags=re.S,
     )
     out = re.sub(r"⟦表情[:：]\s*(.+?)⟧|\[\[表情[:：]\s*(.+?)\]\]", _sticker, out, flags=re.S)
+    # 再唱须先于唱：⟦再唱：…⟧ 复用旧录音；⟦唱：…⟧ 新翻唱
+    out = re.sub(r"⟦再唱[:：]\s*(.*?)⟧|\[\[再唱[:：]\s*(.*?)\]\]", _sing_replay, out, flags=re.S)
     out = re.sub(r"⟦唱[:：]\s*(.+?)⟧|\[\[唱[:：]\s*(.+?)\]\]", _sing, out, flags=re.S)
     out = re.sub(
         r"⟦一起听[:：]\s*(.*?)⟧|\[\[一起听[:：]\s*(.*?)\]\]|⟦共听[:：]\s*(.*?)⟧",
@@ -339,6 +347,335 @@ def image_needs_persona_look(prompt: str) -> bool:
     if landscape and not person:
         return False
     return True
+
+
+def user_asks_voice(text: str) -> bool:
+    """用户是否点名要听语音（主动要 → 应直接发，不靠模型偶尔写暗号）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    keys = (
+        "发个语音",
+        "发语音",
+        "来段语音",
+        "来条语音",
+        "语音给我",
+        "语音听听",
+        "听听语音",
+        "说句话",
+        "说一句",
+        "说两句",
+        "说声",
+        "发声给我",
+        "听你说话",
+        "听听你说话",
+        "用语音回",
+        "语音回我",
+        "发条语音",
+        "来句语音",
+        "语音条",
+        "voice message",
+        "send a voice",
+    )
+    if any(k in t for k in keys):
+        return True
+    if re.search(r"(发|来|听).{0,4}语音", t):
+        return True
+    if re.search(r"说.{0,2}(句|声|话).{0,4}(听|来)", t):
+        return True
+    return False
+
+
+def user_mentions_past_sung(text: str) -> bool:
+    """仅提及「之前唱过/那首」，尚未确认再发或重唱。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    keys = (
+        "之前那首",
+        "以前那首",
+        "之前唱的",
+        "以前唱的",
+        "唱过的",
+        "听过的歌",
+        "唱过的歌",
+        "上次唱的",
+        "刚才那首",
+        "那首再听",
+        "想听之前",
+        "听之前那",
+    )
+    if any(k in t for k in keys):
+        return True
+    if re.search(r"(之前|以前|上次|刚才).{0,6}(唱|歌|那首)", t):
+        return True
+    return False
+
+
+def user_asks_sing(text: str) -> bool:
+    """用户是否点名要听唱（新唱）。
+
+    注意：只提「之前那首」不自动新唱；明确「再发旧录音」也不走这里。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if user_asks_sung_replay(t):
+        return False
+    # 提到旧歌但未说重唱 → 交给模型先问，不要系统硬补 ⟦唱⟧
+    if user_mentions_past_sung(t) and not user_asks_sung_resing(t):
+        return False
+    keys = (
+        "唱首歌",
+        "唱一首",
+        "唱个歌",
+        "唱一下",
+        "唱给我",
+        "唱歌给我",
+        "给我唱",
+        "来首歌",
+        "听你唱",
+        "唱首",
+        "唱个",
+        "想听歌",
+        "听首歌",
+    )
+    if any(k in t for k in keys):
+        return True
+    if re.search(r"唱.{0,6}(歌|听|首)", t):
+        return True
+    return False
+
+
+def user_asks_sung_replay(text: str) -> bool:
+    """用户是否明确确认「再发旧录音」（命中才复用；普通想听歌绝不命中）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    # 必须是确认再发/用旧的；「之前那首」「想听歌」本身不算
+    keys = (
+        "再发一下",
+        "再发一遍",
+        "再发一次",
+        "再发那首",
+        "再发之前",
+        "再发旧",
+        "直接再发",
+        "直接发那首",
+        "直接发之前",
+        "发旧的",
+        "发之前那首",
+        "把之前那首发",
+        "就发之前",
+        "用之前那首",
+        "那首再发",
+        "不要重唱",
+        "不用重唱",
+        "别重唱",
+        "不用重新唱",
+        "不要重新唱",
+        "别重新唱",
+    )
+    if any(k in t for k in keys):
+        return True
+    if re.search(r"再发.{0,6}(一遍|一下|一次|那首|之前|旧)", t):
+        return True
+    if re.search(r"(直接|就).{0,4}(发|用).{0,8}(之前|那首|旧)", t):
+        return True
+    return False
+
+
+def user_asks_sung_resing(text: str) -> bool:
+    """用户明确要重新唱（新合成）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    keys = ("重新唱", "再唱一遍", "重唱", "新唱", "再唱一次", "重新来一首", "再翻唱")
+    return any(k in t for k in keys)
+
+
+def list_persona_sung(
+    *,
+    user_id: str,
+    persona_id: str,
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    """此人设最近翻唱过的曲目（去重 file_id），供记忆注入与再发匹配。"""
+    import json as _json
+
+    lim = max(1, min(int(limit or 12), 40))
+    rows = db.fetchall(
+        """
+        SELECT m.id, m.conv_id, m.text, m.seconds, m.created_at
+        FROM messages m
+        JOIN conversations c ON c.id = m.conv_id AND c.user_id = m.user_id
+        WHERE m.user_id = ? AND c.persona_id = ? AND m.mine = 0 AND m.kind = 'voice'
+        ORDER BY m.seq DESC
+        LIMIT ?
+        """,
+        (user_id, persona_id, lim * 4),
+    )
+    items: List[Dict[str, Any]] = []
+    seen_fid: set = set()
+    for r in rows:
+        try:
+            data = _json.loads(r["text"] or "")
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if str(data.get("kind_extra") or "") != "sing" and str(data.get("card") or "") != "sing_track":
+            continue
+        files = data.get("files") or []
+        fid = str(files[0]) if isinstance(files, list) and files else ""
+        if fid and fid in seen_fid:
+            continue
+        if fid:
+            seen_fid.add(fid)
+        title = (data.get("title") or data.get("caption") or "翻唱").strip()[:80]
+        items.append(
+            {
+                "message_id": r["id"],
+                "conv_id": r["conv_id"],
+                "file_id": fid,
+                "title": title or "翻唱",
+                "artist": (data.get("artist") or "").strip()[:80],
+                "track_id": (data.get("track_id") or "").strip(),
+                "seconds": int(data.get("seconds") or r["seconds"] or 0),
+                "created_at": r["created_at"],
+                "sing": data.get("sing") if isinstance(data.get("sing"), dict) else {},
+                "payload": data,
+            }
+        )
+        if len(items) >= lim:
+            break
+    return items
+
+
+def find_sung_match(
+    *,
+    user_id: str,
+    persona_id: str,
+    query: str,
+) -> Optional[Dict[str, Any]]:
+    """按曲名匹配最近翻唱。
+
+    - 文案里出现曲名 → 命中该曲
+    - 仅「再发一下」类确认、无曲名 → 取最新一首
+    - 其它文案未命中曲名 → 返回 None（绝不瞎发）
+    """
+    items = list_persona_sung(user_id=user_id, persona_id=persona_id, limit=20)
+    if not items:
+        return None
+    q_raw = (query or "").strip()
+    q = q_raw.lower()
+    for it in items:
+        title = str(it.get("title") or "").strip()
+        if not title:
+            continue
+        tl = title.lower()
+        if tl in q or (len(q) >= 2 and q in tl):
+            return it
+    # 无曲名：只有明确「再发旧录音」确认才回落最新一首
+    if user_asks_sung_replay(q_raw) or q in ("", "随心情", "之前那首", "那首", "再发"):
+        return items[0]
+    return None
+
+
+def sung_memory_hints(
+    *,
+    user_id: str,
+    persona_id: str,
+    limit: int = 8,
+) -> List[str]:
+    """给人设注入「唱过的歌」短记忆行。"""
+    items = list_persona_sung(user_id=user_id, persona_id=persona_id, limit=limit)
+    out: List[str] = []
+    for it in items:
+        title = str(it.get("title") or "翻唱").strip() or "翻唱"
+        secs = int(it.get("seconds") or 0)
+        if secs > 0:
+            out.append(f"{title}（约{secs}秒）")
+        else:
+            out.append(title)
+    return out
+
+
+def _voice_line_from_reply(text: str, *, fallback: str = "嗯，我在呢。") -> str:
+    """从回复正文抽一句适合念的短语音文案。"""
+    raw = (text or "").strip()
+    if not raw:
+        return fallback
+    # 去掉括号旁白
+    raw = re.sub(r"（（.*?））|\(\(.*?\)\)", "", raw, flags=re.S)
+    raw = re.sub(r"[（(][^）)]{0,40}[）)]", "", raw)
+    for part in re.split(r"[。！？!?\n]+", raw):
+        line = part.strip(" ，,、；;…~\t")
+        if 2 <= len(line) <= 80:
+            return line[:80]
+    compact = re.sub(r"\s+", "", raw)
+    if compact:
+        return compact[:60]
+    return fallback
+
+
+def maybe_augment_voice_intents(
+    reply_text: str,
+    intents: List[dict],
+    *,
+    user_text: str = "",
+    cooled: bool = False,
+    has_fixed_voice: bool = False,
+    voice_pref: str = "sometimes",
+    voice_cap_on: bool = True,
+) -> Tuple[List[dict], Optional[str]]:
+    """语音策略：能力/固定音色门禁 + 主动要点名直发 + sometimes 不定时补发。
+
+    返回 (intents, setup_reason)；setup_reason 为 need_fix / need_cap / None。
+    """
+    out = [dict(i) for i in (intents or [])]
+    pref = (voice_pref or "sometimes").strip().lower()
+    if pref not in ("never", "sometimes", "always"):
+        pref = "sometimes"
+    explicit = user_asks_voice(user_text)
+
+    def _has_voice() -> bool:
+        return any(str(i.get("kind") or "") == "voice" for i in out)
+
+    def _inject(*, forced: bool) -> None:
+        if _has_voice():
+            if forced:
+                for i in out:
+                    if i.get("kind") == "voice":
+                        i["explicit"] = True
+            return
+        line = _voice_line_from_reply(reply_text)
+        item: dict = {"kind": "voice", "prompt": line}
+        if forced:
+            item["explicit"] = True
+        out.append(item)
+
+    if explicit:
+        if not voice_cap_on:
+            return out, "need_cap"
+        if not has_fixed_voice:
+            return out, "need_fix"
+        _inject(forced=True)
+        return out, None
+
+    if pref == "never" or not voice_cap_on or not has_fixed_voice:
+        return out, None
+    if cooled and pref != "always":
+        return out, None
+    if _has_voice():
+        return out, None
+    if pref == "always":
+        _inject(forced=False)
+        return out, None
+    # sometimes：约 1/5 概率补一条短语音（模型没写暗号时）
+    if random.random() < 0.2:
+        _inject(forced=False)
+    return out, None
 
 
 def user_asks_persona_look(text: str) -> bool:
@@ -628,31 +965,57 @@ def speak_instructions_for_engine(
     return speak_instructions(base_prompt, affect)
 
 
+def _voice_payload_is_sing(text: str) -> bool:
+    try:
+        import json
+
+        payload = json.loads(text or "")
+    except Exception:
+        return False
+    return isinstance(payload, dict) and str(payload.get("kind_extra") or "") == "sing"
+
+
 def recent_persona_voice_secs(
     *,
     user_id: str,
     conv_id: str,
     within_seconds: float = 45.0,
+    exclude_sing: bool = False,
+    only_sing: bool = False,
 ) -> bool:
-    """会话里人设是否刚发过语音气泡。"""
-    row = db.fetchone(
+    """会话里人设是否刚发过语音气泡。
+
+    exclude_sing：唱歌不计入普通语音冷却。
+    only_sing：只看唱歌条（唱歌冷却用）。
+    """
+    rows = db.fetchall(
         """
-        SELECT created_at FROM messages
+        SELECT created_at, text FROM messages
         WHERE user_id = ? AND conv_id = ? AND mine = 0 AND kind = 'voice'
-        ORDER BY seq DESC LIMIT 1
+        ORDER BY seq DESC LIMIT 12
         """,
         (user_id, conv_id),
     )
-    if row is None:
+    if not rows:
         return False
     try:
         from datetime import datetime, timezone
 
-        raw = row["created_at"] or ""
-        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - ts).total_seconds()
-        return age < within_seconds
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            raw = row["created_at"] or ""
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (now - ts).total_seconds()
+            if age >= within_seconds:
+                break
+            is_sing = _voice_payload_is_sing(row["text"] or "")
+            if only_sing and not is_sing:
+                continue
+            if exclude_sing and is_sing:
+                continue
+            return True
+        return False
     except Exception:
         return False

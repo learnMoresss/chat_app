@@ -347,23 +347,32 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
         if kind == "sticker_pack" and ctx.sticker_cooled:
             continue
 
-        if kind == "device":
-            await _handle_device(ctx, intent, prompt)
-            continue
-        if kind == "video":
-            await _handle_video(ctx, prompt)
-            continue
-        if kind == "listen":
-            await _handle_listen(ctx, prompt)
-            continue
-        if kind == "nearby":
-            await _handle_nearby(ctx, prompt)
-            continue
-        if kind == "sing":
-            await _handle_sing(ctx, prompt)
-            continue
-        if kind == "voice":
-            await _handle_voice(ctx, prompt)
+        try:
+            if kind == "device":
+                await _handle_device(ctx, intent, prompt)
+                continue
+            if kind == "video":
+                await _handle_video(ctx, prompt)
+                continue
+            if kind == "listen":
+                await _handle_listen(ctx, prompt)
+                continue
+            if kind == "nearby":
+                await _handle_nearby(ctx, prompt)
+                continue
+            if kind == "sing":
+                await _handle_sing(ctx, prompt)
+                continue
+            if kind == "sing_replay":
+                await _handle_sing_replay(ctx, intent, prompt)
+                continue
+            if kind == "voice":
+                await _handle_voice(ctx, prompt)
+                continue
+        except Exception:
+            logger.exception(
+                "dispatch intent failed kind=%s conv=%s", kind, ctx.conv_id
+            )
             continue
         if kind == "sticker":
             await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
@@ -773,10 +782,81 @@ async def _handle_listen(ctx: DispatchCtx, prompt: str) -> None:
     await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
 
 
-async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
+async def _handle_sing_replay(ctx: DispatchCtx, intent: Dict[str, Any], prompt: str) -> None:
+    """复用此人设以前翻唱过的录音再发一条音乐卡片（不新合成）。"""
+    from .media_cards import find_sung_match
     from .routers.chat import _insert_message, _set_typing
     from .ws_hub import hub
-    from .media_store import save_audio_bytes
+
+    if not ctx.sing_enabled:
+        return
+    if not ctx.voice_prompt_fixed:
+        return
+    sung = intent.get("sung") if isinstance(intent.get("sung"), dict) else None
+    fid = str(intent.get("file_id") or (sung or {}).get("file_id") or "").strip()
+    if not fid:
+        hit = find_sung_match(
+            user_id=ctx.user_id, persona_id=ctx.persona_id, query=prompt
+        )
+        sung = hit
+        fid = str((hit or {}).get("file_id") or "").strip()
+    if not fid or not isinstance(sung, dict):
+        fail_msg = _insert_message(
+            user_id=ctx.user_id,
+            conv_id=ctx.conv_id,
+            client_id=new_id("botcli_"),
+            sender_id=ctx.persona_id,
+            mine=False,
+            kind="text",
+            text="我翻了翻，好像还没留这首，要不我重新唱给你？",
+            state="sent",
+        )
+        await hub.send_user(ctx.user_id, "message", fail_msg.model_dump())
+        return
+
+    title = str(sung.get("title") or prompt or "翻唱").strip()[:80] or "翻唱"
+    artist = str(sung.get("artist") or "").strip()[:80]
+    track_id = str(sung.get("track_id") or "").strip()
+    secs = int(sung.get("seconds") or 0)
+    payload_src = sung.get("payload") if isinstance(sung.get("payload"), dict) else {}
+    sing_meta = sung.get("sing") if isinstance(sung.get("sing"), dict) else {}
+    if not sing_meta and isinstance(payload_src.get("sing"), dict):
+        sing_meta = payload_src.get("sing") or {}
+    payload_obj = {
+        "v": 1,
+        "card": "sing_track",
+        "files": [fid],
+        "caption": title,
+        "asr": title,
+        "seconds": secs,
+        "kind_extra": "sing",
+        "title": title,
+        "artist": artist,
+        "track_id": track_id,
+        "sing": sing_meta,
+        "replay": True,
+    }
+    await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
+    await asyncio.sleep(0.15)
+    voice_msg = _insert_message(
+        user_id=ctx.user_id,
+        conv_id=ctx.conv_id,
+        client_id=new_id("botcli_"),
+        sender_id=ctx.persona_id,
+        mine=False,
+        kind="voice",
+        text=json.dumps(payload_obj, ensure_ascii=False),
+        state="sent",
+        seconds=secs,
+    )
+    await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
+    await hub.send_user(ctx.user_id, "message", voice_msg.model_dump())
+
+
+async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
+    from .media_cards import save_audio_bytes
+    from .routers.chat import _insert_message, _set_typing
+    from .ws_hub import hub
 
     if not ctx.sing_enabled or ctx.sing_cooled:
         return
@@ -796,6 +876,7 @@ async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
             prompt=prompt,
         )
     except Exception:
+        logger.exception("sing synth failed conv=%s", ctx.conv_id)
         sung = None
     if sung and sung.get("bytes"):
         fid = (
@@ -810,14 +891,27 @@ async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
         )
         secs = int(sung.get("seconds") or 0)
         if fid:
+            meta = sung.get("meta") or {}
+            sing_meta = meta.get("sing") if isinstance(meta, dict) else {}
+            if not isinstance(sing_meta, dict):
+                sing_meta = {}
+            title = (
+                str(meta.get("title") or sing_meta.get("title") or prompt or "翻唱")
+            ).strip()[:80]
+            artist = str(meta.get("artist") or sing_meta.get("artist") or "").strip()[:80]
+            track_id = str(meta.get("track_id") or sing_meta.get("track_id") or "").strip()
             payload_obj = {
                 "v": 1,
+                "card": "sing_track",
                 "files": [fid],
-                "caption": prompt,
-                "asr": prompt,
+                "caption": title,
+                "asr": title,
                 "seconds": secs,
                 "kind_extra": "sing",
-                "sing": (sung.get("meta") or {}).get("sing") or {},
+                "title": title,
+                "artist": artist,
+                "track_id": track_id,
+                "sing": sing_meta,
             }
             voice_msg = _insert_message(
                 user_id=ctx.user_id,
@@ -842,7 +936,7 @@ async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
         sender_id=ctx.persona_id,
         mine=False,
         kind="text",
-        text="这首暂时唱不好，等会儿再试～",
+        text="曲库里暂时翻不了这首，等会儿再点我唱～",
         state="sent",
     )
     await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
@@ -850,10 +944,9 @@ async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
 
 
 async def _handle_voice(ctx: DispatchCtx, prompt: str) -> None:
+    from .media_cards import save_audio_bytes, speak_instructions_for_engine
     from .routers.chat import _insert_message, _set_typing
-    from .tts_gen import speak_instructions
     from .ws_hub import hub
-    from .media_store import save_audio_bytes
 
     if ctx.voice_cooled or not ctx.voice_prompt_fixed:
         return
@@ -874,11 +967,15 @@ async def _handle_voice(ctx: DispatchCtx, prompt: str) -> None:
     await asyncio.sleep(0.25)
     try:
         from .media_cards import fixed_voice_wav_path
-        from .tts_gen import synthesize_voice_wav
+        from .tts_gen import resolve_tts_engine, synthesize_voice_wav
 
-        speak_instr = speak_instructions(ctx.voice_prompt_fixed, ctx.affect_state)
         ref_wav = (
             fixed_voice_wav_path(user_id=ctx.user_id, persona_id=ctx.persona_id) or ""
+        )
+        # 有固定参考 wav → CosyVoice 克隆；否则走默认说话引擎
+        eng = "cosyvoice" if ref_wav else resolve_tts_engine()
+        speak_instr = speak_instructions_for_engine(
+            ctx.voice_prompt_fixed, ctx.affect_state, engine=eng
         )
         t0 = time.perf_counter()
         wav = await asyncio.to_thread(
@@ -887,19 +984,35 @@ async def _handle_voice(ctx: DispatchCtx, prompt: str) -> None:
             instructions=speak_instr,
             seed=None,
             keep_loaded=True,
+            engine=eng,
             prompt_wav=ref_wav,
         )
         logger.info(
-            "chat_voice synth_ms=%s ok=%s conv=%s",
+            "chat_voice engine=%s synth_ms=%s ok=%s conv=%s",
+            eng,
             int((time.perf_counter() - t0) * 1000),
             bool(wav),
             ctx.conv_id,
         )
     except Exception:
+        logger.exception("voice synth failed conv=%s", ctx.conv_id)
         wav = None
     fid = ""
+    secs = 0
     if wav:
         fid = save_audio_bytes(user_id=ctx.user_id, data=wav) or ""
+        try:
+            import io
+            import wave
+
+            with wave.open(io.BytesIO(wav), "rb") as wf:
+                rate = float(wf.getframerate() or 0)
+                frames = int(wf.getnframes() or 0)
+                if rate > 0 and frames > 0:
+                    secs = max(1, int(round(frames / rate)))
+        except Exception:
+            # 24kHz mono s16le 粗估
+            secs = max(1, int(round(len(wav) / 48000.0)))
     if fid:
         payload = json.dumps(
             {
@@ -907,7 +1020,7 @@ async def _handle_voice(ctx: DispatchCtx, prompt: str) -> None:
                 "files": [fid],
                 "caption": prompt,
                 "asr": prompt,
-                "seconds": 0,
+                "seconds": secs,
             },
             ensure_ascii=False,
         )
@@ -920,7 +1033,7 @@ async def _handle_voice(ctx: DispatchCtx, prompt: str) -> None:
             kind="voice",
             text=payload,
             state="sent",
-            seconds=0,
+            seconds=secs,
         )
         await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
         await hub.send_user(ctx.user_id, "message", voice_msg.model_dump())

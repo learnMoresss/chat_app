@@ -774,6 +774,36 @@ def delete_eraser(
     return {"ok": True}
 
 
+@router.get("/{persona_id}/sung")
+def list_sung_songs(
+    persona_id: str,
+    limit: int = 50,
+    user: Dict[str, Any] = Depends(current_user),
+) -> dict:
+    """此人设唱过的歌（翻唱曲库产出的音乐卡片），按时间倒序。"""
+    from ..media_cards import list_persona_sung
+
+    _owned(user["id"], persona_id)
+    lim = max(1, min(int(limit or 50), 100))
+    raw = list_persona_sung(user_id=user["id"], persona_id=persona_id, limit=lim)
+    items: List[Dict[str, Any]] = []
+    for it in raw:
+        items.append(
+            {
+                "message_id": it.get("message_id"),
+                "conv_id": it.get("conv_id"),
+                "file_id": it.get("file_id") or "",
+                "title": it.get("title") or "翻唱",
+                "artist": it.get("artist") or "",
+                "track_id": it.get("track_id") or "",
+                "seconds": int(it.get("seconds") or 0),
+                "created_at": it.get("created_at"),
+                "sing": it.get("sing") if isinstance(it.get("sing"), dict) else {},
+            }
+        )
+    return {"items": items, "total": len(items)}
+
+
 @router.post("/{persona_id}/open-chat")
 def open_chat(persona_id: str, user: Dict[str, Any] = Depends(current_user)) -> dict:
     """从通讯录发消息：复用会话；若已删聊天则清空软删标记，回到空会话。"""

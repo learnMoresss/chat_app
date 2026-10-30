@@ -13,6 +13,7 @@ import '../api/api_client.dart';
 import '../format.dart';
 import '../media/app_audio.dart';
 import '../media/auth_image.dart';
+import '../media/listen_session.dart';
 import '../media/media_pick.dart';
 import '../media/voice_record.dart';
 import '../models.dart';
@@ -277,6 +278,13 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> _togglePlayVoice(Msg m) async {
+    final meta = m.meta ?? const <String, dynamic>{};
+    final isSing = meta['kind_extra']?.toString() == 'sing' || meta['card']?.toString() == 'sing_track';
+    if (isSing) {
+      await _playSingWithListenPip(m);
+      return;
+    }
+
     _voicePlayTimer?.cancel();
     await _voicePlayer.stop();
     if (playingVoiceId == m.id) {
@@ -289,7 +297,6 @@ class _ChatPageState extends State<ChatPage> {
 
     try {
       await AppAudio.ensureConfigured();
-      final meta = m.meta ?? const <String, dynamic>{};
       final local = meta['local_bytes'];
       Uint8List? bytes;
       var ext = 'm4a';
@@ -303,25 +310,86 @@ class _ChatPageState extends State<ChatPage> {
         }
       }
       if (bytes != null && bytes.isNotEmpty) {
-        // TTS 落盘是 wav；用户录音是 m4a
-        if (bytes.length > 12 &&
-            bytes[0] == 0x52 &&
-            bytes[1] == 0x49 &&
-            bytes[2] == 0x46 &&
-            bytes[3] == 0x46) {
-          ext = 'wav';
-        }
-        await AppAudio.playBytes(_voicePlayer, bytes, ext: ext);
+        // wav / mp3（唱歌）/ m4a（用户录音）按魔数识别，切勿把 mp3 当 m4a 播（会无声）
+        ext = _detectAudioExt(bytes);
+        final mime = switch (ext) {
+          'wav' => 'audio/wav',
+          'mp3' => 'audio/mpeg',
+          _ => 'audio/mp4',
+        };
+        await AppAudio.playBytes(_voicePlayer, bytes, ext: ext, mimeType: mime);
       }
     } catch (_) {
       // 回退：按时长假装播完
     }
 
-    final secs = m.seconds.clamp(1, 60);
+    // 唱歌可很长；跟真实时长走，上限 15 分钟
+    final secs = m.seconds.clamp(1, 15 * 60);
     _voicePlayTimer = Timer(Duration(seconds: secs), () {
       if (!mounted) return;
       if (playingVoiceId == m.id) setState(() => playingVoiceId = null);
     });
+  }
+
+  /// 翻唱：复用一起听悬浮窗（播放/暂停控件），不再用气泡内假进度。
+  Future<void> _playSingWithListenPip(Msg m) async {
+    final api = store.api;
+    if (api == null) return;
+    final meta = m.meta ?? const <String, dynamic>{};
+    final files = meta['files'];
+    final fid = (files is List && files.isNotEmpty) ? files.first.toString() : '';
+    if (fid.isEmpty) return;
+    if (!m.mine) m.heard = true;
+    setState(() => playingVoiceId = m.id);
+    store.ping();
+    final title = (meta['title']?.toString() ?? meta['caption']?.toString() ?? m.text).trim();
+    final artist = (meta['artist']?.toString() ?? '').trim();
+    final persona = store.persona(conv.personaId ?? m.senderId);
+    final secs = m.seconds > 0
+        ? m.seconds
+        : (meta['seconds'] is num ? (meta['seconds'] as num).toInt() : 0);
+    try {
+      await ListenSessionController.instance.playCoverInPip(
+        sessionId: 'sing_${m.id}',
+        audioUrl: api.mediaFileAudioUrl(fid),
+        headers: api.authHeaders(),
+        convId: conv.id,
+        personaName: persona?.display ?? store.nameOfSender(m.senderId),
+        title: title.isEmpty ? '翻唱' : title,
+        artist: artist,
+        duration: secs > 0 ? Duration(seconds: secs) : null,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => playingVoiceId = null);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('播放失败：$e')));
+    }
+  }
+
+  String _detectAudioExt(Uint8List bytes) {
+    if (bytes.length >= 12 &&
+        bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46) {
+      return 'wav';
+    }
+    // ID3 tag or MPEG frame sync
+    if (bytes.length >= 3 && bytes[0] == 0x49 && bytes[1] == 0x44 && bytes[2] == 0x33) {
+      return 'mp3';
+    }
+    if (bytes.length >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0) {
+      return 'mp3';
+    }
+    // ftyp box → m4a/mp4
+    if (bytes.length >= 8 &&
+        bytes[4] == 0x66 &&
+        bytes[5] == 0x74 &&
+        bytes[6] == 0x79 &&
+        bytes[7] == 0x70) {
+      return 'm4a';
+    }
+    return 'm4a';
   }
 
   @override
@@ -1558,45 +1626,47 @@ class _RecordMaskState extends State<_RecordMask> with SingleTickerProviderState
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              AnimatedBuilder(
-                animation: _pulse,
-                builder: (context, child) {
-                  final t = 0.85 + _pulse.value * 0.2;
-                  return Transform.scale(scale: t, child: child);
-                },
-                child: Container(
-                  width: 168,
-                  height: 168,
-                  decoration: BoxDecoration(
-                    color: cancel ? const Color(0xFFFA5151) : const Color(0xFF4C4C4C),
-                    borderRadius: BorderRadius.circular(16),
-                    boxShadow: [
-                      BoxShadow(
-                        color: (cancel ? const Color(0xFFFA5151) : Colors.white).withValues(alpha: 0.25),
-                        blurRadius: 24,
-                        spreadRadius: 2,
+              Container(
+                width: 168,
+                height: 168,
+                decoration: BoxDecoration(
+                  color: cancel ? const Color(0xFFFA5151) : const Color(0xFF4C4C4C),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // 卡片尺寸固定；只让图标轻微呼吸
+                    AnimatedBuilder(
+                      animation: _pulse,
+                      builder: (context, child) {
+                        final t = 0.92 + _pulse.value * 0.12;
+                        final opacity = 0.75 + _pulse.value * 0.25;
+                        return Opacity(
+                          opacity: opacity,
+                          child: Transform.scale(scale: t, child: child),
+                        );
+                      },
+                      child: Icon(
+                        cancel ? Icons.undo : Icons.mic,
+                        color: Colors.white,
+                        size: 56,
                       ),
-                    ],
-                  ),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(cancel ? Icons.undo : Icons.mic, color: Colors.white, size: 56),
-                      const SizedBox(height: 10),
-                      if (!cancel)
-                        const VoiceWaveIcon(
-                          pointRight: true,
-                          playing: true,
-                          color: Colors.white70,
-                          size: 28,
-                        ),
-                      const SizedBox(height: 8),
-                      Text(
-                        cancel ? '松开手指，取消发送' : '正在录音…上滑取消',
-                        style: const TextStyle(color: Colors.white70, fontSize: 13),
+                    ),
+                    const SizedBox(height: 10),
+                    if (!cancel)
+                      const VoiceWaveIcon(
+                        pointRight: true,
+                        playing: true,
+                        color: Colors.white70,
+                        size: 28,
                       ),
-                    ],
-                  ),
+                    const SizedBox(height: 8),
+                    Text(
+                      cancel ? '松开手指，取消发送' : '正在录音…上滑取消',
+                      style: const TextStyle(color: Colors.white70, fontSize: 13),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -2248,8 +2318,13 @@ class _Bubble extends StatelessWidget {
     // 图/视频/链接（含听歌）是独立卡片，不要套绿/白聊天气泡
     // 语音通话气泡走微信绿/白条，不当独立卡片
     final isVoiceCallMsg = msg.kind == MsgKind.link && msg.meta?['card']?.toString() == 'voice_call';
+    final isSingMsg = msg.kind == MsgKind.voice &&
+        (msg.meta?['kind_extra']?.toString() == 'sing' || msg.meta?['card']?.toString() == 'sing_track');
     final standaloneCard = !isVoiceCallMsg &&
-        (msg.kind == MsgKind.image || msg.kind == MsgKind.video || msg.kind == MsgKind.link);
+        (msg.kind == MsgKind.image ||
+            msg.kind == MsgKind.video ||
+            msg.kind == MsgKind.link ||
+            isSingMsg);
 
     Widget body;
     EdgeInsets pad = const EdgeInsets.symmetric(horizontal: 12, vertical: 9);
@@ -2258,8 +2333,18 @@ class _Bubble extends StatelessWidget {
         body = _ImageCard(store: store, msg: msg);
         pad = EdgeInsets.zero;
       case MsgKind.voice:
-        body = _VoiceBubbleBody(msg: msg, mine: mine, voicePlaying: voicePlaying);
-        pad = const EdgeInsets.symmetric(horizontal: 10, vertical: 4);
+        if (isSingMsg) {
+          body = _SingMusicCard(
+            msg: msg,
+            store: store,
+            voicePlaying: voicePlaying,
+            onPlay: onPlayVoice,
+          );
+          pad = EdgeInsets.zero;
+        } else {
+          body = _VoiceBubbleBody(msg: msg, mine: mine, voicePlaying: voicePlaying);
+          pad = const EdgeInsets.symmetric(horizontal: 10, vertical: 4);
+        }
       case MsgKind.file:
         body = SizedBox(
           width: 180,
@@ -2348,8 +2433,10 @@ class _Bubble extends StatelessWidget {
               if (msg.kind == MsgKind.voice) onPlayVoice();
             },
       child: Container(
-        // 语音气泡按时长定宽，不要被外层 Flexible 拉满
-        width: msg.kind == MsgKind.voice ? voiceBubbleWidth(msg.seconds) + 20 : null,
+        // 普通语音按时长定宽；翻唱音乐卡片定宽
+        width: msg.kind == MsgKind.voice
+            ? (isSingMsg ? 248.0 : voiceBubbleWidth(msg.seconds) + 20.0)
+            : null,
         constraints: BoxConstraints(
           maxWidth: standaloneCard ? 280 : 260,
           minHeight: standaloneCard ? 0 : (msg.kind == MsgKind.voice ? 40 : 36),
@@ -2780,30 +2867,122 @@ class _VoiceBubbleBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isSing = msg.meta?['kind_extra']?.toString() == 'sing';
+    final secs = msg.seconds > 0 ? msg.seconds : (msg.meta?['seconds'] is num ? (msg.meta!['seconds'] as num).toInt() : 0);
     return SizedBox(
       height: 40,
       child: Row(
         mainAxisAlignment: mine ? MainAxisAlignment.end : MainAxisAlignment.start,
         children: mine
             ? [
-                if (isSing) ...[
-                  const Text('唱', style: TextStyle(fontSize: 11, color: Color(0xFF666666))),
-                  const SizedBox(width: 4),
-                ],
-                Text('${msg.seconds}"', style: const TextStyle(fontSize: 15, color: Color(0xFF111111))),
+                Text('$secs"', style: const TextStyle(fontSize: 15, color: Color(0xFF111111))),
                 const SizedBox(width: 6),
                 VoiceWaveIcon(pointRight: false, playing: voicePlaying),
               ]
             : [
                 VoiceWaveIcon(pointRight: true, playing: voicePlaying),
                 const SizedBox(width: 6),
-                Text('${msg.seconds}"', style: const TextStyle(fontSize: 15, color: Color(0xFF111111))),
-                if (isSing) ...[
-                  const SizedBox(width: 4),
-                  const Text('唱', style: TextStyle(fontSize: 11, color: Color(0xFF666666))),
-                ],
+                Text('$secs"', style: const TextStyle(fontSize: 15, color: Color(0xFF111111))),
               ],
+      ),
+    );
+  }
+}
+
+/// 翻唱：微信式音乐卡片（点封面/播放钮 → 一起听弹层）。
+class _SingMusicCard extends StatelessWidget {
+  const _SingMusicCard({
+    required this.msg,
+    required this.store,
+    required this.voicePlaying,
+    required this.onPlay,
+  });
+  final Msg msg;
+  final AppStore store;
+  final bool voicePlaying;
+  final VoidCallback onPlay;
+
+  @override
+  Widget build(BuildContext context) {
+    final meta = msg.meta ?? const <String, dynamic>{};
+    final title = (meta['title']?.toString() ?? meta['caption']?.toString() ?? msg.text).trim();
+    final artist = (meta['artist']?.toString() ?? '').trim();
+    final secs = msg.seconds > 0
+        ? msg.seconds
+        : (meta['seconds'] is num ? (meta['seconds'] as num).toInt() : 0);
+    final mm = secs ~/ 60;
+    final ss = (secs % 60).toString().padLeft(2, '0');
+    final dur = secs > 0 ? '$mm:$ss' : '--:--';
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(10),
+      elevation: 0.4,
+      shadowColor: const Color(0x22000000),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(10, 10, 6, 10),
+        child: Row(
+          children: [
+            GestureDetector(
+              onTap: onPlay,
+              child: Container(
+                width: 52,
+                height: 52,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(8),
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [Color(0xFF3D4450), Color(0xFF1C1F26)],
+                  ),
+                ),
+                child: Icon(
+                  voicePlaying ? Icons.pause_rounded : Icons.music_note_rounded,
+                  color: Colors.white.withValues(alpha: 0.92),
+                  size: 28,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: GestureDetector(
+                onTap: onPlay,
+                behavior: HitTestBehavior.opaque,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title.isEmpty ? '翻唱' : title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Color(0xFF111111)),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      [
+                        '翻唱',
+                        if (artist.isNotEmpty) artist,
+                        dur,
+                      ].join(' · '),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12, color: Color(0xFF8E8E93)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+              onPressed: onPlay,
+              icon: Icon(
+                voicePlaying ? Icons.pause_circle_filled_rounded : Icons.play_circle_filled_rounded,
+                size: 34,
+                color: const Color(0xFF07C160),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

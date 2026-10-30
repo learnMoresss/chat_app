@@ -1485,18 +1485,23 @@ class AppStore extends ChangeNotifier {
               if (m['url'] != null) 'url': m['url'],
               if (m['status'] != null) 'status': m['status'],
               if (m['kind_extra'] != null) 'kind_extra': m['kind_extra'],
+              if (m['card'] != null) 'card': m['card'],
+              if (m['title'] != null) 'title': m['title'],
+              if (m['artist'] != null) 'artist': m['artist'],
+              if (m['track_id'] != null) 'track_id': m['track_id'],
               if (m['sing'] != null) 'sing': m['sing'],
             };
             final cap = meta['caption'] as String? ?? '';
-            final isSing = m['kind_extra']?.toString() == 'sing';
+            final isSing = m['kind_extra']?.toString() == 'sing' || m['card']?.toString() == 'sing_track';
+            final singTitle = (m['title']?.toString() ?? '').trim();
             text = cap.isNotEmpty
                 ? cap
                 : (kind == MsgKind.image
-                    ? '[图片×${files.length}]'
+                    ? (files.length > 1 ? '[图片×${files.length}]' : '[图片]')
                     : kind == MsgKind.video
                         ? '[视频]'
                         : kind == MsgKind.voice
-                            ? (isSing ? '唱歌' : '语音')
+                            ? (isSing ? (singTitle.isNotEmpty ? singTitle : '翻唱') : '语音')
                             : '[文件]');
           } else if (m['card'] == 'listen_invite') {
             meta = {

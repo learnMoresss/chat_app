@@ -1285,6 +1285,16 @@ class ApiClient {
     return j['items'] as List? ?? const [];
   }
 
+  Future<List<dynamic>> listPersonaSung(String personaId, {int limit = 50}) async {
+    final j = await _json(
+      'GET',
+      '/api/v1/personas/$personaId/sung',
+      auth: true,
+      query: {'limit': '$limit'},
+    );
+    return j['items'] as List? ?? const [];
+  }
+
   Future<List<dynamic>> drawPersonaVoice(
     String personaId, {
     required String prompt,
@@ -1383,6 +1393,13 @@ class ApiClient {
     final t = accessToken;
     final q = (t == null || t.isEmpty) ? null : {'access_token': t};
     return _u('/api/v1/music/tracks/$trackId/audio', q).toString();
+  }
+
+  /// 媒体文件鉴权流地址（翻唱语音条等），同样带 access_token 方便 iOS 播放。
+  String mediaFileAudioUrl(String fileId) {
+    final t = accessToken;
+    final q = (t == null || t.isEmpty) ? null : {'access_token': t};
+    return _u('/api/v1/media/files/$fileId', q).toString();
   }
 
   Map<String, String> authHeaders() {
