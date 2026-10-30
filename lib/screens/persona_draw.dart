@@ -693,7 +693,8 @@ class _VoiceTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final busy = drawing || uploading || warming;
+    // 预热不锁按钮；生成中仍保持绿色白字，不用浅灰「禁用」观感
+    final locked = drawing || uploading;
     return ListView(
       padding: const EdgeInsets.fromLTRB(0, 4, 0, 24),
       children: [
@@ -731,6 +732,14 @@ class _VoiceTab extends StatelessWidget {
               style: TextStyle(color: AppColors.sub, fontSize: 12, height: 1.35),
             ),
           ),
+          if (warming && !drawing)
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Text(
+                '音色引擎预热中，可直接点生成（首次可能稍慢）。',
+                style: TextStyle(color: AppColors.sub, fontSize: 12),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
             child: Row(
@@ -739,10 +748,12 @@ class _VoiceTab extends StatelessWidget {
                   child: SizedBox(
                     height: 44,
                     child: FilledButton(
-                      onPressed: busy ? null : onDraw,
+                      onPressed: locked ? null : onDraw,
                       style: FilledButton.styleFrom(
                         backgroundColor: AppColors.green,
-                        disabledBackgroundColor: const Color(0xFFA8E0BF),
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: AppColors.green,
+                        disabledForegroundColor: Colors.white,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                       ),
                       child: drawing
@@ -755,10 +766,10 @@ class _VoiceTab extends StatelessWidget {
                                   child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                                 ),
                                 SizedBox(width: 8),
-                                Text('生成中', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                                Text('生成中', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white)),
                               ],
                             )
-                          : const Text('生成', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                          : const Text('生成', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white)),
                     ),
                   ),
                 ),
@@ -766,9 +777,10 @@ class _VoiceTab extends StatelessWidget {
                 SizedBox(
                   height: 44,
                   child: OutlinedButton(
-                    onPressed: busy ? null : onUpload,
+                    onPressed: locked ? null : onUpload,
                     style: OutlinedButton.styleFrom(
                       foregroundColor: AppColors.green,
+                      disabledForegroundColor: AppColors.green,
                       side: const BorderSide(color: AppColors.green),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
@@ -1000,7 +1012,9 @@ class _ImageTab extends StatelessWidget {
                       onPressed: busy ? null : onDraw,
                       style: FilledButton.styleFrom(
                         backgroundColor: AppColors.green,
-                        disabledBackgroundColor: const Color(0xFFA8E0BF),
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: AppColors.green,
+                        disabledForegroundColor: Colors.white,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                       ),
                       child: drawing
@@ -1013,10 +1027,10 @@ class _ImageTab extends StatelessWidget {
                                   child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                                 ),
                                 SizedBox(width: 8),
-                                Text('生成中', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                                Text('生成中', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white)),
                               ],
                             )
-                          : const Text('生成', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                          : const Text('生成', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white)),
                     ),
                   ),
                 ),
@@ -1027,6 +1041,7 @@ class _ImageTab extends StatelessWidget {
                     onPressed: busy ? null : onUpload,
                     style: OutlinedButton.styleFrom(
                       foregroundColor: AppColors.green,
+                      disabledForegroundColor: AppColors.green,
                       side: const BorderSide(color: AppColors.green),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
