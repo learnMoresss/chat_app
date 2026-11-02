@@ -13,6 +13,7 @@ export default function PartnerPage() {
       active_persona_id: prefs.active_persona_id || undefined,
       shape_enabled: prefs.shape_enabled !== false,
       split_send: !!prefs.split_send,
+      sticker_freq: prefs.sticker_freq || 'high',
     })
   }, [prefs, form])
 
@@ -36,6 +37,7 @@ export default function PartnerPage() {
                   active_persona_id: v.active_persona_id || null,
                   shape_enabled: !!v.shape_enabled,
                   split_send: !!v.split_send,
+                  sticker_freq: v.sticker_freq || 'high',
                 }),
               })
               setPrefs(next as typeof prefs)
@@ -58,6 +60,19 @@ export default function PartnerPage() {
           </Form.Item>
           <Form.Item label="长回复分句发送" name="split_send" valuePropName="checked" extra="按句号拆成 2–3 条，间隔模拟打字">
             <Switch />
+          </Form.Item>
+          <Form.Item
+            label="表情触发频率"
+            name="sticker_freq"
+            extra="日常只发单张表情；组图需对方明确要收集。默认高。"
+          >
+            <Select
+              options={[
+                { value: 'high', label: '高（默认）' },
+                { value: 'medium', label: '中' },
+                { value: 'low', label: '低' },
+              ]}
+            />
           </Form.Item>
           <Button type="primary" htmlType="submit">
             保存

@@ -27,7 +27,7 @@ CATALOG: List[CapDef] = [
         "sticker",
         "表情包",
         "发送/收藏表情图",
-        "需要配图情绪时可写 ⟦表情：情绪标签⟧；不要用 Unicode emoji。",
+        "气氛到了写 ⟦表情：标签⟧ 发单张；只有对方明确要一组/收集时才写 ⟦表情组：主题⟧。",
     ),
     CapDef(
         "image",
@@ -44,14 +44,14 @@ CATALOG: List[CapDef] = [
     CapDef(
         "voice",
         "语音回复",
-        "固定音色 TTS 语音气泡",
-        "已固定音色时可偶尔写 ⟦语音：短句⟧；不要句句语音。",
+        "固定音色 TTS 语音气泡 / 实时语音通话",
+        "对方要语音写 ⟦语音：短句⟧；要打电话写 ⟦通话⟧。",
     ),
     CapDef(
         "sing",
         "唱歌",
         "唱歌语音条",
-        "对方要听唱时可写 ⟦唱：曲名⟧；不要句句唱。",
+        "对方要听唱写 ⟦唱：曲名⟧；不要句句唱。",
     ),
     CapDef(
         "listen",
@@ -95,7 +95,7 @@ _DENY_LINES = {
     "listen": "想一起听，可是共听能力还没开通。",
     "image": "想画一张，可是生图还没开通。",
     "video": "想发短片，可是视频能力还没开通。",
-    "voice": "想发语音，可是语音这边还没开好。",
+    "voice": "想发语音/打电话，可是语音这边还没开好。",
     "sticker": "表情包能力还没开通。",
     "virtual_desktop": "虚拟电脑这边还没开通。",
     "virtual_phone": "虚拟手机这边还没开通。",
@@ -238,26 +238,38 @@ def prompt_hints(
     has_fixed_voice: bool = False,
     has_fixed_look: bool = False,
 ) -> str:
-    """只注入已注册能力短暗号；目录检索留给 media_dispatch，不在此罗列文件。"""
+    """只注入已注册能力短暗号；有/无状态写死互斥，另一边不进提示。"""
     enabled = enabled_ids_for_user(user_id, is_admin=is_admin)
     lines: List[str] = ["【已注册能力】只用下列暗号；未列出的不要假装能做。"]
     for c in CATALOG:
         if c.id not in enabled:
             continue
-        if c.id == "voice" and not has_fixed_voice:
+        # 音色 / 唱歌依赖固定音色：只注入当前分支
+        if c.id == "voice":
+            if has_fixed_voice:
+                lines.append("- 语音：对方要语音写 ⟦语音：短句⟧；要打电话写 ⟦通话⟧。")
+            else:
+                lines.append("- 语音：音色不可用。对方要语音/电话时口语提醒去抽卡；不要写 ⟦语音⟧/⟦通话⟧。")
+            continue
+        if c.id == "sing":
+            if has_fixed_voice:
+                lines.append(f"- {c.label}：{c.prompt_hint}")
+            else:
+                lines.append("- 唱歌：不可用（需先固定音色）。对方要听唱时口语提醒去抽卡；不要写 ⟦唱⟧。")
+            continue
+        if c.id == "image":
+            if has_fixed_look:
+                lines.append(
+                    "- 生图：对方要自拍/看你在干啥，先短回「正在拍」，"
+                    "再写 ⟦图：当前场景自拍一句话⟧；风景/物品也可 ⟦图⟧。"
+                )
+            else:
+                lines.append(
+                    "- 生图：形象不可用。对方要自拍/看你时口语提醒去抽卡；"
+                    "不要写自拍类 ⟦图⟧；风景/物品仍可 ⟦图⟧。"
+                )
             continue
         lines.append(f"- {c.label}：{c.prompt_hint}")
-    if "image" in enabled:
-        if has_fixed_look:
-            lines.append(
-                "【形象】已固定。对方要自拍/看你在干啥：先短回「正在拍」，"
-                "再写 ⟦图：当前场景自拍一句话⟧；系统会图生图。表情包才常带字。"
-            )
-        else:
-            lines.append(
-                "【形象】未固定（头像不算）。对方要自拍/看你时不要写自拍 ⟦图⟧、不要假装已发；"
-                "口语提去抽卡固定，系统会引导。"
-            )
     missing = [c.label for c in CATALOG if system_available().get(c.id) and c.id not in enabled]
     if missing:
         lines.append("【未开通】" + "、".join(missing) + "。对方要时如实说还没开。")
@@ -283,6 +295,7 @@ def filter_media_intents(
         "image": "image",
         "video": "video",
         "voice": "voice",
+        "voice_call": "voice",
         "sing": "sing",
         "sing_replay": "sing",
         "listen": "listen",

@@ -36,6 +36,8 @@ export type Prefs = {
   memory_inject?: boolean
   pause_proactive?: boolean
   pause_memory_extract?: boolean
+  /** 表情触发频率：high / medium / low，默认 high */
+  sticker_freq?: string
 }
 
 export function useCore() {

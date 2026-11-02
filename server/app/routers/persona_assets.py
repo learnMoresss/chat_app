@@ -673,7 +673,7 @@ def fix_asset(
     )
     # 形象固定 ≠ 头像：只写入 persona_assets.fixed，不改 personas.avatar_file_id
     # 自拍/出镜图走 fixed look；聊天列表头像仍用单独上传/生成的头像
-    # 语音固定 → 写入 voice_profiles 指针（便于通话/唱歌复用）
+    # 语音固定 → 写入 voice_profiles，并异步建唱歌声线（ready 后才能唱）
     if kind == "voice" and (row["file_id"] or ""):
         media = db.fetchone(
             "SELECT path FROM media_files WHERE id = ? AND user_id = ?",
@@ -687,7 +687,7 @@ def fix_asset(
             INSERT INTO voice_profiles(
               id, user_id, persona_id, filename, path, duration_sec, sample_rate, channels,
               embed_status, embed_note, created_at
-            ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 'fixed', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, 'pending', ?, ?)
             """,
             (
                 vid,
@@ -695,10 +695,18 @@ def fix_asset(
                 persona_id,
                 f"fixed_{asset_id}.wav",
                 path,
-                f"persona_asset:{asset_id}",
+                f"queued:{asset_id}",
                 now,
             ),
         )
+        try:
+            from ..voice_line import start_voice_line_train
+
+            start_voice_line_train(
+                user_id=user["id"], persona_id=persona_id, asset_id=asset_id
+            )
+        except Exception:
+            logger.exception("start voice_line train failed asset=%s", asset_id)
     fixed = db.fetchone("SELECT * FROM persona_assets WHERE id = ?", (asset_id,))
     assert fixed is not None
     return _row_out(fixed)

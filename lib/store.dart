@@ -138,6 +138,8 @@ class AppStore extends ChangeNotifier {
   bool shapeEnabled = true;
   /// 长回复分句发送（可选）。
   bool splitSend = false;
+  /// 表情触发频率：high / medium / low（默认 high）。
+  String stickerFreq = 'high';
   /// 最近一次整形提示（如连续回声）。
   String? shapeHint;
   Timer? _draftTimer;
@@ -776,6 +778,8 @@ class AppStore extends ChangeNotifier {
       final p = await api!.getPrefs();
       shapeEnabled = p['shape_enabled'] as bool? ?? true;
       splitSend = p['split_send'] as bool? ?? false;
+      final sf = (p['sticker_freq'] ?? 'high').toString().trim().toLowerCase();
+      stickerFreq = (sf == 'low' || sf == 'medium') ? sf : 'high';
       ping();
     } catch (_) {}
   }
@@ -786,6 +790,7 @@ class AppStore extends ChangeNotifier {
       await api!.putPrefs({
         'shape_enabled': shapeEnabled,
         'split_send': splitSend,
+        'sticker_freq': stickerFreq,
       });
     } catch (_) {}
   }
@@ -885,10 +890,13 @@ class AppStore extends ChangeNotifier {
     if (me['signature'] != null) meSignature = me['signature'] as String? ?? '';
     if (me['moments_cover_file_id'] != null) meCoverFileId = me['moments_cover_file_id'] as String? ?? '';
 
-    personas = [
-      for (final raw in (data['personas'] as List? ?? const []))
-        _personaFromJson(Map<String, dynamic>.from(raw as Map)),
-    ];
+    // 人设与聊天记录无关：空列表时保留本地，避免 sync/缓存抖动把通讯录刷没
+    final remotePersonas = data['personas'] as List? ?? const [];
+    if (remotePersonas.isNotEmpty) {
+      personas = [
+        for (final raw in remotePersonas) _personaFromJson(Map<String, dynamic>.from(raw as Map)),
+      ];
+    }
 
     conversations = [
       for (final raw in (data['conversations'] as List? ?? const []))
@@ -1204,7 +1212,7 @@ class AppStore extends ChangeNotifier {
       // 列表预览：一起听卡用 body
       final previewText = () {
         final card = m.meta?['card']?.toString();
-        if (card == 'listen_invite' || card == 'voice_call') {
+        if (card == 'listen_invite' || card == 'voice_call' || card == 'voice_call_invite') {
           return m.meta?['body']?.toString() ?? m.text;
         }
         return m.text;
@@ -1524,6 +1532,15 @@ class AppStore extends ChangeNotifier {
               'body': m['body']?.toString() ?? '',
             };
             text = (m['body'] ?? '语音通话').toString();
+          } else if (m['card'] == 'voice_call_invite') {
+            meta = {
+              'card': 'voice_call_invite',
+              'media': m['media']?.toString() ?? 'audio',
+              'status': m['status']?.toString() ?? 'ringing',
+              'body': m['body']?.toString() ?? '邀请你语音通话',
+              'reason': m['reason']?.toString() ?? '',
+            };
+            text = (m['body'] ?? '邀请你语音通话').toString();
           } else if (m['card'] == 'sticker_pack_added') {
             final covers = m['cover_file_ids'];
             meta = {
@@ -2141,11 +2158,23 @@ class AppStore extends ChangeNotifier {
     ping();
   }
 
-  void clearConv(Conv c) {
+  /// 只清空聊天记录；绝不删人设 / 会话本身。
+  Future<void> clearConv(Conv c) async {
     msgs(c.id).clear();
     c.preview = '';
     c.unread = 0;
+    c.draft = '';
     ping();
+    try {
+      final cache = LocalSyncCache(serverUrl, meId);
+      await cache.save(_snapshotForCache(), cursor: (await cache.loadWithCursor())?.cursor);
+    } catch (_) {}
+    if (demo || api == null) return;
+    try {
+      await api!.clearConversationMessages(c.id);
+    } catch (_) {
+      // 本地已清；云端失败下次 sync 可能带回消息，用户可再清一次
+    }
   }
 
   Future<void> postMoment(

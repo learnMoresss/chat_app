@@ -569,12 +569,21 @@ class _BootstrapPageState extends State<BootstrapPage> {
   /// 开屏只做叠加播放：会话恢复并行进行，就绪即淡出，不等完整动画。
   bool _splashDismiss = false;
   bool _splashGone = false;
+  Timer? _splashForceTimer;
 
   @override
   void initState() {
     super.initState();
     // 会话恢复立刻开始，不 await 开屏 WebView
     unawaited(_restore());
+    // 硬兜底：同步/WebView 挂住时也不让用户卡死在开屏
+    _splashForceTimer = Timer(const Duration(seconds: 4), _requestSplashDismiss);
+  }
+
+  @override
+  void dispose() {
+    _splashForceTimer?.cancel();
+    super.dispose();
   }
 
   void _requestSplashDismiss() {
@@ -605,8 +614,8 @@ class _BootstrapPageState extends State<BootstrapPage> {
     };
 
     try {
-      // 401 由 ApiClient 无感 refresh，不再弹令牌过期
-      await api.sync();
+      // 401 由 ApiClient 无感 refresh，不再弹令牌过期；超时则走本地缓存进主页
+      await api.sync().timeout(const Duration(seconds: 8));
       if (api.accessToken != null && api.refreshToken != null) {
         tokens = AuthTokens(
           accessToken: api.accessToken!,
@@ -617,7 +626,7 @@ class _BootstrapPageState extends State<BootstrapPage> {
 
       ServerInfo info;
       try {
-        info = await api.fetchInfo();
+        info = await api.fetchInfo().timeout(const Duration(seconds: 5));
       } catch (_) {
         info = ServerInfo(
           name: _hostOf(saved.serverUrl),

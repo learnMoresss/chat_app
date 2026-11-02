@@ -23,10 +23,9 @@ class _PublicJumpHttpOverrides extends HttpOverrides {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   HttpOverrides.global = _PublicJumpHttpOverrides();
-  // 模拟器 / 真机：playback + 扬声器，声音才从 Mac / 外放出来
-  try {
-    await AppAudio.ensureConfigured();
-  } catch (_) {}
+  // 音频通路异步配置，绝不挡住首帧（通话异常退出后 setAudioContext 偶发卡住）
+  // ignore: unawaited_futures
+  AppAudio.ensureConfigured().timeout(const Duration(seconds: 3)).catchError((_) {});
   runApp(const ChatApp());
 }
 

@@ -207,9 +207,11 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       // 2) warm：ASR + CosyVoice 预热完成前 ready=false，保持 loading 阻塞开麦
       setState(() => _statusOverride = '接通中，正在准备语音…');
       unawaited(api.voiceRealtimeWarm(convId: widget.convId));
-      // 最长约 3 分钟（模型冷启动）
-      for (var i = 0; i < 360; i++) {
-        final r = await api.voiceRealtimeReady(convId: widget.convId);
+      // 最长约 75 秒；超时给可退出提示（挂断随时可点）
+      for (var i = 0; i < 150; i++) {
+        if (!mounted || _hangingUp) return;
+        final r = await api.voiceRealtimeReady(convId: widget.convId)
+            .timeout(const Duration(seconds: 8), onTimeout: () => <String, dynamic>{'ready': false, 'reason': '就绪检查超时'});
         if (!mounted || _hangingUp) return;
 
         if (r['need_fixed_voice'] == true) {
@@ -880,6 +882,8 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
       ..reset()
       ..forward();
 
+    // 接通中勿重复 bootstrap（会叠多路 warm/start，易卡死）
+    if (_phase == VoiceUiPhase.connecting || _hangingUp) return;
     if (_phase == VoiceUiPhase.blocked || !_ready) {
       await _bootstrap();
       return;
@@ -938,24 +942,28 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
     final shouldHangup = _ownsCall;
     _ownsCall = false;
     _callStartedAt = null;
-    await _stopAmp();
+    // 先退出页面，避免预热/挂断 API 卡住导致「按什么都没用」
+    if (mounted) Navigator.of(context).pop();
+    unawaited(_stopAmp());
     if (_recording) {
       _recording = false;
-      await VoiceRecorder.stop(cancel: true);
+      unawaited(VoiceRecorder.stop(cancel: true));
     }
-    await _interruptPlayback();
+    unawaited(_interruptPlayback());
     unawaited(AppAudio.leaveCallAudioMode());
     final api = _api;
     if (shouldHangup && api != null) {
-      try {
-        await api.voiceRealtimeHangup(
-          convId: widget.convId,
-          durationSec: sec,
-          callId: cid,
-        );
-      } catch (_) {}
+      unawaited(
+        api
+            .voiceRealtimeHangup(
+              convId: widget.convId,
+              durationSec: sec,
+              callId: cid,
+            )
+            .timeout(const Duration(seconds: 4))
+            .catchError((_) => <String, dynamic>{}),
+      );
     }
-    if (mounted) Navigator.pop(context);
   }
 
   String get _statusLabel {
@@ -997,31 +1005,38 @@ class _RealtimeVoicePageState extends State<RealtimeVoicePage> with TickerProvid
   @override
   Widget build(BuildContext context) {
     final pad = MediaQuery.paddingOf(context);
-    return AnnotatedRegion<SystemUiOverlayStyle>(
-      value: SystemUiOverlayStyle.light.copyWith(
-        statusBarColor: Colors.transparent,
-        statusBarIconBrightness: Brightness.light,
-        statusBarBrightness: Brightness.dark,
-      ),
-      child: Scaffold(
-        backgroundColor: const Color(0xFF0B0D12),
-        body: Stack(
-          fit: StackFit.expand,
-          children: [
-            _VoiceBackdrop(accent: _accent, breathe: _breathe),
-            SafeArea(
-              bottom: false,
-              child: Column(
-                children: [
-                  _buildTopBar(),
-                  Expanded(child: _buildOrbArea()),
-                  _buildCaptions(),
-                  const SizedBox(height: 8),
-                  _buildControls(pad.bottom),
-                ],
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop || _hangingUp) return;
+        unawaited(_hangup());
+      },
+      child: AnnotatedRegion<SystemUiOverlayStyle>(
+        value: SystemUiOverlayStyle.light.copyWith(
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.light,
+          statusBarBrightness: Brightness.dark,
+        ),
+        child: Scaffold(
+          backgroundColor: const Color(0xFF0B0D12),
+          body: Stack(
+            fit: StackFit.expand,
+            children: [
+              _VoiceBackdrop(accent: _accent, breathe: _breathe),
+              SafeArea(
+                bottom: false,
+                child: Column(
+                  children: [
+                    _buildTopBar(),
+                    Expanded(child: _buildOrbArea()),
+                    _buildCaptions(),
+                    const SizedBox(height: 8),
+                    _buildControls(pad.bottom),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

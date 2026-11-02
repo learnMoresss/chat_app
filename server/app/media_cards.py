@@ -176,10 +176,10 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
         return ""
 
     def _sticker(m: re.Match) -> str:
-        # 单张暗号也升级为表情组推荐（堆叠气泡）
+        # 日常单张表情；组图另走 ⟦表情组⟧，且需对方明确要收集
         tag = (m.group(1) or m.group(2) or "").strip()
         if tag:
-            intents.append({"kind": "sticker_pack", "prompt": tag[:40]})
+            intents.append({"kind": "sticker", "prompt": tag[:40]})
         return ""
 
     def _sticker_pack(m: re.Match) -> str:
@@ -244,6 +244,16 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
         intents.append({"kind": "nearby", "prompt": (line or "推荐")[:40]})
         return ""
 
+    def _voice_call(m: re.Match) -> str:
+        line = ""
+        for i in range(1, (m.lastindex or 0) + 1):
+            g = m.group(i)
+            if g is not None and str(g).strip():
+                line = str(g).strip()
+                break
+        intents.append({"kind": "voice_call", "prompt": (line or "来电")[:80]})
+        return ""
+
     out = re.sub(r"⟦图[:：]\s*(.+?)⟧|\[\[图[:：]\s*(.+?)\]\]", _img, out, flags=re.S)
     # 表情组须先于单张表情匹配
     out = re.sub(
@@ -263,6 +273,13 @@ def extract_media_intents(text: str) -> Tuple[str, list]:
         flags=re.S,
     )
     out = re.sub(r"⟦语音[:：]\s*(.+?)⟧|\[\[语音[:：]\s*(.+?)\]\]", _voice, out, flags=re.S)
+    # 通话邀请：⟦通话⟧ / ⟦电话⟧ / ⟦通话：想聊两句⟧
+    out = re.sub(
+        r"⟦通话[:：]?\s*(.*?)⟧|\[\[通话[:：]?\s*(.*?)\]\]|⟦电话[:：]?\s*(.*?)⟧|\[\[电话[:：]?\s*(.*?)\]\]",
+        _voice_call,
+        out,
+        flags=re.S,
+    )
     out = re.sub(r"⟦视频[:：]\s*(.+?)⟧|\[\[视频[:：]\s*(.+?)\]\]", _video, out, flags=re.S)
     out = re.sub(
         r"⟦设备[:：]\s*(.+?)⟧|\[\[设备[:：]\s*(.+?)\]\]|⟦(电脑)⟧|⟦(手机)⟧",
@@ -349,10 +366,48 @@ def image_needs_persona_look(prompt: str) -> bool:
     return True
 
 
+def user_asks_voice_call(text: str) -> bool:
+    """用户是否要约实时语音通话（打电话），不是要语音条。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    keys = (
+        "打电话",
+        "打个电话",
+        "打个电话吧",
+        "来电话",
+        "打来电话",
+        "语音通话",
+        "语音电话",
+        "实时通话",
+        "一起打电话",
+        "打给你",
+        "打给我",
+        "电话聊",
+        "通话吧",
+        "通个话",
+        "接电话",
+        "来个电话",
+        "call me",
+        "phone call",
+        "voice call",
+    )
+    if any(k in t for k in keys):
+        return True
+    if re.search(r"(打|来|接).{0,3}(个)?电话", t):
+        return True
+    if re.search(r"(语音|实时).{0,2}通话", t):
+        return True
+    return False
+
+
 def user_asks_voice(text: str) -> bool:
     """用户是否点名要听语音（主动要 → 应直接发，不靠模型偶尔写暗号）。"""
     t = (text or "").strip()
     if not t:
+        return False
+    # 打电话优先：不要误当成「发语音条」
+    if user_asks_voice_call(t):
         return False
     keys = (
         "发个语音",
@@ -601,9 +656,57 @@ def sung_memory_hints(
     return out
 
 
+_VOICE_DENY_MARKERS = (
+    "还没固定",
+    "没有固定",
+    "没固定",
+    "未固定",
+    "去抽卡",
+    "先固定",
+    "得先固定",
+    "声线还没",
+    "音色还没",
+    "发不了语音",
+    "发不了",
+    "现在发不了",
+    "等抽卡",
+    "定下来",
+)
+
+
+def voice_text_claims_unfixed(text: str) -> bool:
+    """文案是否在谎称「还没固定音色」。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(m in t for m in _VOICE_DENY_MARKERS) and (
+        "固定" in t or "抽卡" in t or "声线" in t or "音色" in t or "发不了" in t
+    )
+
+
+def scrub_false_unfixed_voice_text(text: str, *, fallback: str = "嗯，我在呢。") -> str:
+    """已固定音色时：删掉模型瞎说的「没固定/去抽卡」句。"""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    kept = []
+    for ln in raw.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if voice_text_claims_unfixed(s):
+            continue
+        kept.append(s)
+    out = "\n".join(kept).strip()
+    if out:
+        return out
+    # 整段都是瞎否认：换成一句正常口吻
+    return fallback
+
+
 def _voice_line_from_reply(text: str, *, fallback: str = "嗯，我在呢。") -> str:
     """从回复正文抽一句适合念的短语音文案。"""
-    raw = (text or "").strip()
+    raw = scrub_false_unfixed_voice_text(text or "", fallback="") or (text or "").strip()
     if not raw:
         return fallback
     # 去掉括号旁白
@@ -611,10 +714,10 @@ def _voice_line_from_reply(text: str, *, fallback: str = "嗯，我在呢。") -
     raw = re.sub(r"[（(][^）)]{0,40}[）)]", "", raw)
     for part in re.split(r"[。！？!?\n]+", raw):
         line = part.strip(" ，,、；;…~\t")
-        if 2 <= len(line) <= 80:
+        if 2 <= len(line) <= 80 and not voice_text_claims_unfixed(line):
             return line[:80]
     compact = re.sub(r"\s+", "", raw)
-    if compact:
+    if compact and not voice_text_claims_unfixed(compact):
         return compact[:60]
     return fallback
 
@@ -648,6 +751,13 @@ def maybe_augment_voice_intents(
                 for i in out:
                     if i.get("kind") == "voice":
                         i["explicit"] = True
+                        # 模型把「没固定」写进语音条：换成正常口语
+                        if has_fixed_voice and voice_text_claims_unfixed(
+                            str(i.get("prompt") or "")
+                        ):
+                            i["prompt"] = _voice_line_from_reply(
+                                reply_text, fallback="嗯，我在呢。"
+                            )
             return
         line = _voice_line_from_reply(reply_text)
         item: dict = {"kind": "voice", "prompt": line}

@@ -340,7 +340,7 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
     for intent in intents[:3]:
         kind = intent.get("kind")
         prompt = str(intent.get("prompt") or "").strip()
-        if kind != "device" and not prompt:
+        if kind not in ("device", "voice_call") and not prompt:
             continue
         if kind == "sticker" and ctx.sticker_cooled:
             continue
@@ -365,6 +365,9 @@ async def dispatch_intents(ctx: DispatchCtx, intents: List[Dict[str, Any]]) -> D
                 continue
             if kind == "sing_replay":
                 await _handle_sing_replay(ctx, intent, prompt)
+                continue
+            if kind == "voice_call":
+                await _handle_voice_call(ctx, prompt)
                 continue
             if kind == "voice":
                 await _handle_voice(ctx, prompt)
@@ -725,6 +728,79 @@ async def _handle_nearby(ctx: DispatchCtx, prompt: str) -> None:
     await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
 
 
+async def _handle_voice_call(ctx: DispatchCtx, prompt: str) -> None:
+    """人设发起通话：插入来电邀请卡，等用户点接听再进实时通话页。"""
+    from .routers.chat import _insert_message, _set_typing
+    from .ws_hub import hub
+
+    await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
+    try:
+        # 无固定音色时不装能打，口语引导去抽卡
+        if not (ctx.voice_prompt_fixed or "").strip():
+            fail = _insert_message(
+                user_id=ctx.user_id,
+                conv_id=ctx.conv_id,
+                client_id=new_id("botcli_"),
+                sender_id=ctx.persona_id,
+                mine=False,
+                kind="text",
+                text="想打给你，可是还没固定声线～你先去抽卡页选一条音色嘛。",
+                state="sent",
+            )
+            await hub.send_user(ctx.user_id, "message", fail.model_dump())
+            return
+        note = (prompt or "").strip()
+        body = "邀请你语音通话" if not note or note in ("来电", "通话") else f"邀请你语音通话 · {note[:40]}"
+        card = json.dumps(
+            {
+                "v": 1,
+                "card": "voice_call_invite",
+                "status": "ringing",
+                "media": "audio",
+                "body": body,
+                "reason": note[:80] if note else "",
+            },
+            ensure_ascii=False,
+        )
+        msg = _insert_message(
+            user_id=ctx.user_id,
+            conv_id=ctx.conv_id,
+            client_id=new_id("botcli_"),
+            sender_id=ctx.persona_id,
+            mine=False,
+            kind="link",
+            text=card,
+            state="sent",
+        )
+        await hub.send_user(ctx.user_id, "message", msg.model_dump())
+        # 跨会话时也弹一下，提示有来电
+        await hub.send_user(
+            ctx.user_id,
+            "voice_call_invite",
+            {
+                "conv_id": ctx.conv_id,
+                "persona_id": ctx.persona_id,
+                "message_id": msg.id,
+                "body": body,
+            },
+        )
+    except Exception:
+        logger.exception("voice_call invite failed conv=%s", ctx.conv_id)
+        fail = _insert_message(
+            user_id=ctx.user_id,
+            conv_id=ctx.conv_id,
+            client_id=new_id("botcli_"),
+            sender_id=ctx.persona_id,
+            mine=False,
+            kind="text",
+            text="这会儿电话打不通，稍后再试～",
+            state="sent",
+        )
+        await hub.send_user(ctx.user_id, "message", fail.model_dump())
+    finally:
+        await _set_typing(ctx.user_id, ctx.conv_id, False, ctx.display)
+
+
 async def _handle_listen(ctx: DispatchCtx, prompt: str) -> None:
     from .routers.chat import _insert_message, _set_typing
     from .ws_hub import hub
@@ -854,16 +930,45 @@ async def _handle_sing_replay(ctx: DispatchCtx, intent: Dict[str, Any], prompt: 
 
 
 async def _handle_sing(ctx: DispatchCtx, prompt: str) -> None:
-    from .media_cards import save_audio_bytes
+    from .media_cards import find_sung_match, save_audio_bytes, user_asks_sung_resing
     from .routers.chat import _insert_message, _set_typing
+    from .voice_line import sing_voice_ready
     from .ws_hub import hub
 
     if not ctx.sing_enabled or ctx.sing_cooled:
         return
     if not ctx.voice_prompt_fixed:
         return
+    if not sing_voice_ready(user_id=ctx.user_id, persona_id=ctx.persona_id):
+        msg = _insert_message(
+            user_id=ctx.user_id,
+            conv_id=ctx.conv_id,
+            client_id=new_id("botcli_"),
+            sender_id=ctx.persona_id,
+            mine=False,
+            kind="text",
+            text="声线还在学习中，等训练好了我再唱给你听～",
+            state="sent",
+        )
+        await hub.send_user(ctx.user_id, "message", msg.model_dump())
+        return
     if len(prompt) > ctx.sing_max:
         prompt = prompt[: ctx.sing_max]
+    # 已唱过同名曲且对方没明确要重唱 → 直接复用，别再开一轮合成
+    try:
+        if not user_asks_sung_resing(ctx.user_text or "") and not user_asks_sung_resing(prompt):
+            hit = find_sung_match(
+                user_id=ctx.user_id, persona_id=ctx.persona_id, query=prompt
+            )
+            if hit and (hit.get("file_id") or "").strip():
+                await _handle_sing_replay(
+                    ctx,
+                    {"kind": "sing_replay", "prompt": prompt, "sung": hit},
+                    prompt,
+                )
+                return
+    except Exception:
+        logger.exception("sing reuse check failed conv=%s", ctx.conv_id)
     await _set_typing(ctx.user_id, ctx.conv_id, True, ctx.display)
     await asyncio.sleep(0.2)
     try:

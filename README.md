@@ -1,13 +1,33 @@
-# 幻信（仓库目录仍为 chat_app）
+# 幻信（chat_app）
 
-微信风格的 **私聊陪伴 App「幻信」**：Flutter 客户端 + FastAPI 产品后端 + **DSH 唯一思考环**。  
-人设、记忆、情绪、媒体暗号在自家库里落地；重推理（生图 / TTS / ASR）可外置，聊天主路径不依赖本地 LLM 回退。
+微信风格的 **私聊 AI 陪伴 App**：Flutter 客户端 + FastAPI 产品后端 + **DSH 思考环**。  
+人设、记忆、情绪、媒体暗号在自家库里落地；重推理（生图 / TTS / ASR）可外置。适合自己部署、养自己的 bot。
 
-> 私有仓库。密钥与运行数据不进 Git（见下方「不会提交什么」）。
+## 快速开始
+
+完整步骤见 **[`docs/DEPLOY.md`](docs/DEPLOY.md)**。最短路径：
+
+```bash
+# 1) 后端
+cd server
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # 改 SECRET_KEY、DSH_GATEWAY_*
+python -m app
+
+# 2) DSH 网关（另开终端，详见 dsh-product/README.md）
+# curl http://127.0.0.1:8787/health
+
+# 3) App
+cd ..
+flutter pub get && flutter run
+```
+
+第一个注册用户即为管理员；创建人设后即可当 bot 聊。
 
 ## 这是什么
 
-面向「和一个 AI 人设长期聊」的产品原型 **幻信**，交互贴近微信：
+面向「和一个 AI 人设长期聊」的产品原型，交互贴近微信：
 
 - 文字流式气泡、表情、图、语音、位置、一起听、看 AI（虚拟电脑 / redroid）
 - 人设抽卡固定音色与形象；入站 ASR / OCR；出站混合语音与唱歌链路
@@ -23,78 +43,41 @@
 | `server/` | FastAPI + SQLite + 媒体执行 + `admin-ui/` |
 | `dsh-product/` | DSH 产品配置与推送（不含 `node_modules`） |
 | `plugins/`、`worker-agent/` | 能力插件协议与启停 |
-| `docs/` | 规划与运维文档（见下） |
+| `docs/` | 规划、部署与运维文档 |
 
 ## 文档
 
 | 文档 | 内容 |
 |------|------|
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | **已实现 / 待做 / 边界**（规划以此为准） |
-| [`docs/CHAT_LOGIC.md`](docs/CHAT_LOGIC.md) | 人设、情绪、记忆、媒体暗号怎么跑 |
-| [`docs/OPS.md`](docs/OPS.md) | 公网穿透、备份切流、看 AI 约定 |
-| [`docs/VOICE_SING.md`](docs/VOICE_SING.md) | 说话 / 唱歌实现路线 |
-| [`docs/USAGE_METRICS.md`](docs/USAGE_METRICS.md) | 用量与缓存命中看板 |
-| [`docs/CHAT_FUTURE.md`](docs/CHAT_FUTURE.md) | 后续可做清单 |
+| [`docs/DEPLOY.md`](docs/DEPLOY.md) | **自建部署**（从零跑通） |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | 已实现 / 待做 / 边界 |
+| [`docs/CHAT_LOGIC.md`](docs/CHAT_LOGIC.md) | 人设、情绪、记忆、媒体暗号 |
+| [`docs/OPS.md`](docs/OPS.md) | 公网穿透、备份切流、看 AI |
+| [`docs/VOICE_SING.md`](docs/VOICE_SING.md) | 说话 / 唱歌路线 |
+| [`docs/USAGE_METRICS.md`](docs/USAGE_METRICS.md) | 用量与缓存命中 |
 
 插件协议：`plugins/README.md`、`worker-agent/README.md`。
 
 ## 能力摘要
 
-以 [`docs/ROADMAP.md`](docs/ROADMAP.md) 勾选为准，当前主要包括：
+以 [`docs/ROADMAP.md`](docs/ROADMAP.md) 为准，主要包括：
 
-- **账号与聊天**：注册登录、邀请、同步 / WS、流式分句、出站整形、入站防注入
-- **人设与记忆**：CRUD、记忆事实 / FTS、陪伴六维情绪、成长模式、管理台看板
-- **媒体**：表情包、生图、识图 OCR、ASR、混合语音、唱歌、一起听、链接 OG 卡、位置选点
-- **看 AI**：虚拟电脑 + redroid 13；监控≠开机；lease + 截图轮询
-- **实时语音页**：本地实时对话 **UI**（动画 / 字幕开关 / 外放 AEC 态）；麦与 WebRTC 媒体未接
-- **通话**：音视频信令骨架有；WebRTC 媒体通道未接
-
-## 本地启动
-
-### 后端
-
-```bash
-cd server
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # 填写 SECRET_KEY、DSH_GATEWAY_*，按需 IMAGE_GEN_* / TTS_* / ASR_* / TENCENT_MAP_KEY
-python -m app
-```
-
-管理台改完需构建：
-
-```bash
-cd server/admin-ui && npm i && npm run build
-```
-
-重置密码：`cd server && python -m app reset-password <用户名> <新密码>`。
-
-### 客户端
-
-```bash
-flutter pub get
-flutter run
-```
-
-DSH 网关默认本机 `:8787`，需先按 `dsh-product/` 与 `docs/OPS.md` 推送并健康检查。
+- **账号与聊天**：注册登录、邀请、同步 / WS、流式分句、出站整形
+- **人设与记忆**：CRUD、记忆事实 / FTS、陪伴情绪、成长模式、管理台
+- **媒体**：表情包、生图、识图 OCR、ASR、混合语音、唱歌、一起听、链接卡、位置
+- **看 AI**：虚拟电脑 + redroid；监控≠开机；lease + 截图轮询
+- **实时语音 / 通话**：半双工语音链路可接；WebRTC 媒体通道仍在演进
 
 ## 不会提交什么
 
 `.gitignore` 已排除：
 
 - `server/.env`、`server/data/`、各类密钥
-- `**/node_modules/`、`**/.venv/`、`/build/`、`/tmp/`、`/vendor/`
+- `**/node_modules/`、`**/.venv/`、`/build/`、`/tmp/`
 - Flutter / Android / iOS 本地构建产物
 
 克隆后自行准备 `.env` 与数据目录。
 
-## 维护约定
-
-- 做完功能：只改 `docs/ROADMAP.md` 勾选（必要时挪到「已实现」）
-- 聊天逻辑变更：改 `docs/CHAT_LOGIC.md`
-- 运维约定：改 `docs/OPS.md`
-- **不要**再堆平行规划文档
-
 ## License
 
-私有仓库，未对外授权。
+[MIT](./LICENSE)

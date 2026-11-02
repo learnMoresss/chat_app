@@ -21,6 +21,8 @@ _URL_ONLY_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 
 # 连发最新优先：会话生成代号；过期轮丢弃输出
 _CONV_GENERATION: Dict[str, int] = {}
+# 短时连发：等安静后再开一轮；合并 pending 全量进上下文，重点回最新一条
+_REPLY_DEBOUNCE_SEC = 1.35
 
 
 def _bump_generation(conv_id: str) -> int:
@@ -37,8 +39,50 @@ def _generation_alive(conv_id: str, gen: int) -> bool:
     return _current_generation(conv_id) == int(gen)
 
 
+async def _generate_reply_debounced(
+    *,
+    user_id: str,
+    conv_id: str,
+    persona_id: str,
+    user_text: str = "",
+    client: str = "app",
+    internal: bool = False,
+    memory_receipt: Optional[Dict[str, Any]] = None,
+    generation: int = 0,
+    delay: float = _REPLY_DEBOUNCE_SEC,
+) -> None:
+    """连发排队：安静 delay 秒后再回复；期间有新消息则本轮作废。
+
+    sleep 结束后从库重拼 pending，保证前面几条也完整进模型，不只最后一条。
+    """
+    gen = int(generation or 0)
+    try:
+        await asyncio.sleep(max(0.0, float(delay)))
+    except Exception:
+        return
+    if gen and not _generation_alive(conv_id, gen):
+        return
+    # 防抖后再合并：覆盖整段连发窗口
+    merged = ""
+    if not internal:
+        try:
+            merged = (_pending_user_texts(user_id, conv_id) or "").strip()
+        except Exception:
+            merged = ""
+    await _generate_reply(
+        user_id=user_id,
+        conv_id=conv_id,
+        persona_id=persona_id,
+        user_text=merged or user_text,
+        client=client,
+        internal=internal,
+        memory_receipt=memory_receipt,
+        generation=gen,
+    )
+
+
 def _pending_user_texts(user_id: str, conv_id: str) -> str:
-    """合并上一轮 bot 之后尚未被回答的用户消息（最新意图优先）。
+    """合并上一轮 bot 之后尚未被回答的用户消息（全部完整 + 最新意图落点）。
 
     必须走 inbound 整形：图片/语音在库里是 JSON 壳，直接拼会把 OCR 结果盖掉，
     模型只看到 files/caption，就会幻觉「图是糊的」。
@@ -76,9 +120,13 @@ def _pending_user_texts(user_id: str, conv_id: str) -> str:
             return ""
         if len(parts) == 1:
             return parts[0]
-        # 多条：前面简要，最后一条完整（最新意图）
-        head = "；".join(p[:40] for p in parts[:-1])
-        return f"（用户连发）{head}\n最新一条：{parts[-1]}"
+        # 前面几条也完整带上（不再截断到 40 字），标明最新一条为回复重点
+        lines = [f"{i}. {p}" for i, p in enumerate(parts, start=1)]
+        return (
+            f"（用户连发共{len(parts)}条，请综合理解全部内容，并重点回应最新一条）\n"
+            + "\n".join(lines)
+            + f"\n（最新一条=第{len(parts)}条）"
+        )
     except Exception:
         return ""
 
@@ -117,12 +165,16 @@ from ..media_cards import (
     image_needs_persona_look,
     maybe_augment_voice_intents,
     recent_persona_voice_secs,
+    scrub_false_unfixed_voice_text,
     sung_memory_hints,
     user_asks_persona_look,
     user_asks_sing,
     user_asks_sung_replay,
     user_asks_sung_resing,
+    user_asks_voice_call,
+    voice_text_claims_unfixed,
 )
+from ..media_cards import _voice_line_from_reply as voice_line_from_reply
 from ..model_route import resolve_dsh_route, usage_model_label
 from ..routers.channels import list_visible, resolve_channel_for_persona
 from ..routers.prefs import bump_echo_streak, get_shape_flags
@@ -565,23 +617,31 @@ async def _generate_reply(
         return
 
     display = persona["remark"] or persona["name"] or "对方"
-    # 连发：合并上一轮 bot 之后的用户消息，回答最新意图
+    # 连发：合并上一轮 bot 之后的用户消息（全部保留，重点回最新）
     if not internal:
         caller_text = (user_text or "").strip()
-        merged = _pending_user_texts(user_id, conv_id)
-        if merged:
-            # 调用方已带 OCR/整形（[对方发来…]），合并结果若仍是 JSON 壳或更短，保留调用方
-            merged_s = merged.strip()
-            caller_rich = (
-                caller_text.startswith("[对方发来")
-                or caller_text.startswith("[对方语音]")
-                or "图中文字" in caller_text
-            )
-            merged_raw_shell = merged_s.startswith("{") and '"files"' in merged_s
-            if caller_rich and (merged_raw_shell or len(merged_s) < len(caller_text)):
-                user_text = caller_text
-            else:
-                user_text = merged
+        # 若调用方已是防抖后的「连发共N条」全文，直接用，避免再被单条 caller 盖掉
+        if caller_text.startswith("（用户连发"):
+            user_text = caller_text
+        else:
+            merged = _pending_user_texts(user_id, conv_id)
+            if merged:
+                merged_s = merged.strip()
+                # 多条连发：永远用合并全文
+                if merged_s.startswith("（用户连发"):
+                    user_text = merged_s
+                else:
+                    # 单条：若合并仍是 JSON 壳而调用方已 OCR/整形，保留调用方
+                    caller_rich = (
+                        caller_text.startswith("[对方发来")
+                        or caller_text.startswith("[对方语音]")
+                        or "图中文字" in caller_text
+                    )
+                    merged_raw_shell = merged_s.startswith("{") and '"files"' in merged_s
+                    if caller_rich and (merged_raw_shell or len(merged_s) < len(caller_text)):
+                        user_text = caller_text
+                    else:
+                        user_text = merged_s
 
     # qq-bridge：免打扰时段可跳过模型（prefs.quiet_blocks_chat=1）→ 只记缓冲
     if not internal:
@@ -1216,9 +1276,17 @@ async def _generate_reply(
             logger.exception("ai reminder tags failed")
         sticker_cooled = False
         voice_cooled = False
+        sticker_prob = 0.82
+        sticker_cd = 22
+        try:
+            from ..routers.prefs import get_sticker_freq
+
+            sticker_prob, sticker_cd = stk.sticker_freq_params(get_sticker_freq(user_id))
+        except Exception:
+            sticker_prob, sticker_cd = 0.82, 22
         try:
             sticker_cooled = stk.recent_persona_sticker_secs(
-                user_id=user_id, conv_id=conv_id, within_seconds=90
+                user_id=user_id, conv_id=conv_id, within_seconds=sticker_cd
             )
         except Exception:
             sticker_cooled = False
@@ -1235,13 +1303,17 @@ async def _generate_reply(
         except Exception:
             voice_cooled = False
         try:
-            # 命中情绪就配图；90s 冷却防刷。同时看用户原话（角色回复未必带关键词）。
+            # 未明确要组图时，模型写的表情组降为单张
+            media_intents = stk.demote_sticker_packs_unless_asked(
+                media_intents, user_text=user_text or ""
+            )
+            # 命中情绪就配单张表情；频率档位控制概率与冷却
             media_intents = stk.maybe_augment_sticker_intents(
                 text,
                 media_intents,
                 cooled=sticker_cooled,
                 user_id=user_id,
-                probability=1.0,
+                probability=float(sticker_prob),
                 extra_text=user_text,
             )
         except Exception:
@@ -1337,8 +1409,64 @@ async def _generate_reply(
             # 点名要语音：本轮忽略冷却
             if any(i.get("kind") == "voice" and i.get("explicit") for i in media_intents):
                 voice_cooled = False
+            # 已固定：清掉模型瞎说的「没固定/去抽卡」，并改写语音条文案
+            if voice_prompt_fixed:
+                if voice_text_claims_unfixed(text or ""):
+                    text = scrub_false_unfixed_voice_text(
+                        text or "", fallback="嗯，我在呢～想听我说什么？"
+                    )
+                fixed_intents = []
+                for intent in media_intents:
+                    if intent.get("kind") == "voice" and voice_text_claims_unfixed(
+                        str(intent.get("prompt") or "")
+                    ):
+                        intent = dict(intent)
+                        intent["prompt"] = voice_line_from_reply(
+                            text, fallback="嗯，我在呢。"
+                        )
+                    fixed_intents.append(intent)
+                media_intents = fixed_intents
         except Exception:
             logger.exception("voice strategy augment failed")
+
+        # 点名要打电话：补 ⟦通话⟧ 来电邀请（不要说「没开通」）
+        try:
+            if user_asks_voice_call(user_text or ""):
+                if not voice_cap_on:
+                    deny = "想打给你，可是语音通话这边还没开好。"
+                    text = (text + "\n" + deny).strip() if text.strip() else deny
+                elif not voice_prompt_fixed:
+                    setup_notices.append(
+                        (
+                            "voice",
+                            "还没固定音色，",
+                            "去抽卡固定",
+                            "想打电话得先固定一条声线，你去抽卡页选一下嘛。",
+                        )
+                    )
+                elif not any(i.get("kind") == "voice_call" for i in media_intents):
+                    media_intents = list(media_intents) + [
+                        {"kind": "voice_call", "prompt": "来电", "explicit": True}
+                    ]
+                    # 模型若瞎说没开通，清掉这类否认句，避免和来电卡打架
+                    scrub = (
+                        "还没开通",
+                        "没有开通",
+                        "没开通呢",
+                        "没开好",
+                        "还没开好",
+                        "不能打电话",
+                        "打不了电话",
+                    )
+                    if any(s in (text or "") for s in scrub):
+                        lines = [
+                            ln
+                            for ln in (text or "").splitlines()
+                            if not any(s in ln for s in scrub)
+                        ]
+                        text = "\n".join(lines).strip() or "好呀，我打给你～"
+        except Exception:
+            logger.exception("voice_call augment failed")
 
         # 点名要唱但模型没写暗号：补 ⟦唱⟧（有曲名更好；否则随心情）
         try:
@@ -1888,6 +2016,36 @@ def patch_conversation(
     return _conv_out(row)
 
 
+@router.post("/conversations/{conv_id}/clear")
+def clear_conversation_messages(
+    conv_id: str,
+    user: Dict[str, Any] = Depends(current_user),
+) -> dict:
+    """只清空聊天记录：删消息，保留会话与人设。与「删除聊天 / 删除联系人」无关。"""
+    _owned_conv(user["id"], conv_id)
+    now = iso()
+    db.execute("DELETE FROM messages WHERE user_id = ? AND conv_id = ?", (user["id"], conv_id))
+    # 会话留在列表；不改 hidden / deleted_at / 人设
+    keys = db.fetchone("SELECT * FROM conversations WHERE id = ?", (conv_id,))
+    if keys is not None:
+        cols = keys.keys()
+        sets = ["preview = ''", "unread = 0", "draft = ''"]
+        args: list[Any] = []
+        if "last_seq" in cols:
+            sets.append("last_seq = 0")
+        if "last_time" in cols:
+            sets.append("last_time = ?")
+            args.append(now)
+        args.extend([conv_id, user["id"]])
+        db.execute(
+            f"UPDATE conversations SET {', '.join(sets)} WHERE id = ? AND user_id = ?",
+            tuple(args),
+        )
+    # 作废进行中的连发回复
+    _bump_generation(conv_id)
+    return {"ok": True}
+
+
 @router.delete("/conversations/{conv_id}")
 def delete_conversation(
     conv_id: str,
@@ -1914,6 +2072,7 @@ def delete_conversation(
             "DELETE FROM conversations WHERE id = ? AND user_id = ?",
             (conv_id, user["id"]),
         )
+    _bump_generation(conv_id)
     return {"ok": True}
 
 
@@ -2275,8 +2434,9 @@ async def send_message(
             except Exception:
                 pass
         gen = _bump_generation(conv_id)
+        # 连发：短防抖后再答；新消息会 bump gen，旧轮在 sleep 后直接丢弃
         background.add_task(
-            _generate_reply,
+            _generate_reply_debounced,
             user_id=user["id"],
             conv_id=conv_id,
             persona_id=conv["persona_id"],
@@ -2284,6 +2444,7 @@ async def send_message(
             client="app",
             memory_receipt=memory_receipt,
             generation=gen,
+            delay=_REPLY_DEBOUNCE_SEC,
         )
 
     return SendMessageResponse(message=mine, replies=[])

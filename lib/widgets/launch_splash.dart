@@ -26,12 +26,31 @@ class _LaunchSplashOverlayState extends State<LaunchSplashOverlay> {
   double _opacity = 1;
   bool _gone = false;
   bool _pageReady = false;
+  Timer? _forceGone;
 
   @override
   void initState() {
     super.initState();
     // 异步装载，绝不挡住 Bootstrap._restore
     unawaited(_boot());
+  }
+
+  @override
+  void dispose() {
+    _forceGone?.cancel();
+    super.dispose();
+  }
+
+  void _forceDismissSoon() {
+    _forceGone?.cancel();
+    _forceGone = Timer(const Duration(milliseconds: 700), () {
+      if (!mounted || _gone) return;
+      setState(() {
+        _opacity = 0;
+        _gone = true;
+      });
+      widget.onDismissed?.call();
+    });
   }
 
   Future<void> _boot() async {
@@ -84,6 +103,7 @@ class _LaunchSplashOverlayState extends State<LaunchSplashOverlay> {
     if (widget.dismiss && !oldWidget.dismiss) {
       _tellFinish();
       _fadeOut();
+      _forceDismissSoon();
     }
   }
 

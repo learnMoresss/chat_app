@@ -235,6 +235,61 @@ suggest_sticker_emotion = suggest_sticker_query
 SEED_EMOTIONS = ("好的", "哈哈哈", "无语", "加油", "晚安")
 
 
+def sticker_freq_params(freq: str) -> tuple[float, int]:
+    """表情触发档位 → (probability, cooldown_seconds)。默认高。"""
+    f = (freq or "high").strip().lower()
+    if f in ("low", "低"):
+        return 0.22, 120
+    if f in ("medium", "mid", "中", "中等"):
+        return 0.48, 55
+    # high / 高
+    return 0.82, 22
+
+
+def user_asks_sticker_pack(text: str) -> bool:
+    """对方是否明确要一组/收集表情（才允许发组图）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    keys = (
+        "一组表情",
+        "表情组",
+        "表情包一组",
+        "发一组表情",
+        "来一组表情",
+        "推荐一组表情",
+        "收集表情",
+        "收藏表情",
+        "整组表情",
+        "表情合集",
+        "贴纸组",
+        "一组贴纸",
+        "打包表情",
+    )
+    if any(k in t for k in keys):
+        return True
+    if re.search(r"(一组|整组|一包|合集).{0,6}(表情|贴纸)", t):
+        return True
+    if re.search(r"(收集|收藏|推荐).{0,4}(一组)?(表情|贴纸)", t):
+        return True
+    return False
+
+
+def demote_sticker_packs_unless_asked(intents: list, *, user_text: str = "") -> list:
+    """未明确要组图时，把 sticker_pack 降为单张 sticker。"""
+    allow_pack = user_asks_sticker_pack(user_text)
+    out = []
+    for i in intents or []:
+        kind = str(i.get("kind") or "")
+        if kind == "sticker_pack" and not allow_pack:
+            item = dict(i)
+            item["kind"] = "sticker"
+            out.append(item)
+        else:
+            out.append(i)
+    return out
+
+
 def maybe_augment_sticker_intents(
     text: str,
     intents: list,
@@ -244,7 +299,7 @@ def maybe_augment_sticker_intents(
     extra_text: str = "",
     user_id: str = "",
 ) -> list:
-    """模型没写表情标记时，按正文里的词/梗补一条 sticker 意图（优先命中库内 OCR 描述）。"""
+    """模型没写表情标记时，按正文里的词/梗补一条单张 sticker（不发组图）。"""
     out = list(intents or [])
     if cooled or any(i.get("kind") in ("sticker", "sticker_pack") for i in out):
         return out
@@ -273,8 +328,8 @@ def maybe_augment_sticker_intents(
         return out
     if random.random() > probability:
         return out
-    # 推荐发一组（堆叠气泡），不发单张
-    out.append({"kind": "sticker_pack", "prompt": q})
+    # 日常只补单张；组图需对方明确要收集
+    out.append({"kind": "sticker", "prompt": q})
     return out
 
 

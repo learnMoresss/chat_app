@@ -1472,6 +1472,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
             )
         conn.execute("UPDATE meta SET value = '36' WHERE key = 'schema_version'")
         conn.commit()
+        version = 36
+
+    if version < 37:
+        # 表情触发频率：high / medium / low（默认 high）
+        up_cols = {r[1] for r in conn.execute("PRAGMA table_info(user_prefs)").fetchall()}
+        if "sticker_freq" not in up_cols:
+            conn.execute(
+                "ALTER TABLE user_prefs ADD COLUMN sticker_freq TEXT NOT NULL DEFAULT 'high'"
+            )
+        conn.execute("UPDATE meta SET value = '37' WHERE key = 'schema_version'")
+        conn.commit()
 
 
 def reset_connection() -> None:

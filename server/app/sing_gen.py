@@ -277,13 +277,23 @@ def synthesize_sing(
     job = f"job_{int(time.time())}_{persona_id[-6:]}"
     out_dir = Path(f"/data/ai/tmp/sing-jobs/{job}")
 
-    # 硬门：必须已固定人设音色，禁止回落默认样音
-    local_ref = resolve_persona_ref_local(user_id=user_id, persona_id=persona_id)
-    if local_ref is None or not local_ref.is_file():
-        log.warning("sing: refuse without fixed persona voice user=%s persona=%s", user_id, persona_id)
+    # 硬门：唱歌声线须训好(ready)；参考音优先 voice_pack
+    from .voice_line import resolve_sing_ref, sing_voice_ready
+
+    if not sing_voice_ready(user_id=user_id, persona_id=persona_id):
+        log.warning(
+            "sing: refuse until voice line ready user=%s persona=%s",
+            user_id,
+            persona_id,
+        )
         return None
-    persona_ref = local_ref
-    ref_source = "persona_fixed"
+    pack_ref = resolve_sing_ref(user_id=user_id, persona_id=persona_id)
+    local_ref = resolve_persona_ref_local(user_id=user_id, persona_id=persona_id)
+    persona_ref = pack_ref if (pack_ref and pack_ref.is_file()) else local_ref
+    if persona_ref is None or not persona_ref.is_file():
+        log.warning("sing: refuse without sing ref user=%s persona=%s", user_id, persona_id)
+        return None
+    ref_source = "voice_pack" if pack_ref and persona_ref == pack_ref else "persona_fixed"
 
     song_path: Optional[Path] = None
     track_id = ""

@@ -410,6 +410,11 @@ class ApiClient {
     await _json('DELETE', '/api/v1/conversations/$convId', auth: true);
   }
 
+  /// 只清空消息，保留会话与人设。
+  Future<void> clearConversationMessages(String convId) async {
+    await _json('POST', '/api/v1/conversations/$convId/clear', auth: true);
+  }
+
   Future<void> deletePersona(String personaId) async {
     await _json('DELETE', '/api/v1/personas/$personaId', auth: true);
   }

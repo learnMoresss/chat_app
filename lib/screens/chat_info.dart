@@ -281,7 +281,7 @@ class _SingleInfoBody extends StatelessWidget {
       ),
     );
     if (ok == true) {
-      store.clearConv(conv);
+      await store.clearConv(conv);
       if (context.mounted) _toast(context, '已清空');
     }
   }
@@ -598,7 +598,7 @@ class _GroupInfoBodyState extends State<_GroupInfoBody> {
       ),
     );
     if (ok == true) {
-      store.clearConv(conv);
+      await store.clearConv(conv);
       if (context.mounted) _toast(context, '已清空');
     }
   }

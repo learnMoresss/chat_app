@@ -180,14 +180,29 @@ def readiness(*, force: bool = False) -> Dict[str, Any]:
         warming = bool(_warm_state.get("warming"))
         warm_err = str(_warm_state.get("error") or "")
         warm_prompt = str(_warm_state.get("prompt_wav") or "")
-    # CosyVoice：以网关 model_loaded + spk_cached 为准，防 IDLE 卸载后本地 TTL 仍显示已热
+    # CosyVoice：网关 model_loaded(+spk) 为真相；本地 TTL 只作缓存，不能挡住已热网关
     if engine == "cosyvoice" and tts_ready:
         gw_warm = cosyvoice_truly_warm(prompt_wav=warm_prompt)
-        warm_ok = local_warm and gw_warm
-        if local_warm and not gw_warm:
+        if gw_warm:
+            warm_ok = True
+            if not local_warm or warming:
+                with _warm_lock:
+                    _warm_state.update(
+                        {
+                            "warming": False,
+                            "ok": True,
+                            "ts": now,
+                            "error": "",
+                            "prompt_wav": warm_prompt or _warm_state.get("prompt_wav") or "",
+                        }
+                    )
+                warming = False
+                warm_err = ""
+        else:
             warm_ok = False
-            with _warm_lock:
-                _warm_state["ok"] = False
+            if local_warm:
+                with _warm_lock:
+                    _warm_state["ok"] = False
                 if not warming:
                     warm_err = warm_err or "语音引擎已冷却，需重新预热"
     else:
@@ -324,8 +339,10 @@ def warm_in_background(*, user_id: str = "", persona_id: str = "", conv_id: str 
 
     一点打电话就拉起 SenseVoice + CosyVoice；完成前 ready=false，
     客户端保持「接通中」loading，绝不在未预热时开麦。
-    单飞：已在预热中则直接返回。跳过条件以网关 model_loaded+spk_cached 为准，
-    不用本地 TTL（IDLE 卸载后 TTL 仍会误判为热）。
+    单飞：已在预热中则直接返回。
+
+    注意：CosyVoice 已热时也必须确保 ASR 在线——以前「TTS 热就整段 return」
+    会跳过识别，导致 ready 永远卡在「识别服务启动中」。
     """
     from . import asr_ondemand
     from .tts_gen import cosyvoice_truly_warm, keepalive_cosyvoice
@@ -345,38 +362,38 @@ def warm_in_background(*, user_id: str = "", persona_id: str = "", conv_id: str 
     with _warm_lock:
         if bool(_warm_state.get("warming")):
             return
-        # 仅当网关真热且音色已缓存时跳过
-        if cosyvoice_truly_warm(prompt_wav=prompt_wav):
-            _warm_state.update(
-                {
-                    "warming": False,
-                    "ok": True,
-                    "ts": time.time(),
-                    "error": "",
-                    "prompt_wav": prompt_wav,
-                }
-            )
-            try:
-                keepalive_cosyvoice()
-            except Exception:
-                pass
-            readiness(force=True)
-            return
         _warm_state["warming"] = True
         _warm_state["error"] = ""
 
+    asr_ok = False
     try:
         asr_ok = asr_ondemand.ensure_asr()
         log.info("asr warm: live=%s", asr_ok)
         if not asr_ok:
             with _warm_lock:
-                _warm_state.update({"warming": False, "ok": False, "error": "识别服务启动失败", "ts": time.time()})
+                _warm_state.update(
+                    {
+                        "warming": False,
+                        "ok": False,
+                        "error": "识别服务启动失败",
+                        "ts": time.time(),
+                        "prompt_wav": prompt_wav,
+                    }
+                )
             readiness(force=True)
             return
     except Exception as e:
         log.warning("asr warm failed: %s", e)
         with _warm_lock:
-            _warm_state.update({"warming": False, "ok": False, "error": f"识别启动异常: {e}", "ts": time.time()})
+            _warm_state.update(
+                {
+                    "warming": False,
+                    "ok": False,
+                    "error": f"识别启动异常: {e}",
+                    "ts": time.time(),
+                    "prompt_wav": prompt_wav,
+                }
+            )
         readiness(force=True)
         return
 
@@ -386,6 +403,26 @@ def warm_in_background(*, user_id: str = "", persona_id: str = "", conv_id: str 
                 prefetch_memory_context(user_id=user_id, persona_id=pid, query="")
             except Exception:
                 log.exception("prefetch memory failed")
+
+        # TTS 已热：续命 + 记本地态，不再重复拉引擎
+        if cosyvoice_truly_warm(prompt_wav=prompt_wav):
+            try:
+                keepalive_cosyvoice()
+            except Exception:
+                pass
+            with _warm_lock:
+                _warm_state.update(
+                    {
+                        "warming": False,
+                        "ok": True,
+                        "ts": time.time(),
+                        "error": "",
+                        "prompt_wav": prompt_wav,
+                    }
+                )
+            readiness(force=True)
+            return
+
         r = warm_tts_engine(prompt_wav=prompt_wav)
         log.info("tts warm: %s", r)
         ok = bool(r.get("ok"))
@@ -409,7 +446,13 @@ def warm_in_background(*, user_id: str = "", persona_id: str = "", conv_id: str 
         log.warning("tts warm failed: %s", e)
         with _warm_lock:
             _warm_state.update(
-                {"warming": False, "ok": False, "error": str(e)[:120], "ts": time.time()}
+                {
+                    "warming": False,
+                    "ok": False,
+                    "error": str(e)[:120],
+                    "ts": time.time(),
+                    "prompt_wav": prompt_wav,
+                }
             )
         readiness(force=True)
 

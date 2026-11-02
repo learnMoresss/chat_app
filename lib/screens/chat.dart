@@ -62,6 +62,100 @@ Future<bool> _ensureMicForCall(BuildContext context) async {
   return false;
 }
 
+/// 发起/接听实时语音：先要麦克风授权，再校验固定音色，最后进通话页。
+Future<void> launchRealtimeVoiceCall(
+  BuildContext context,
+  AppStore store,
+  Conv conv, {
+  bool Function()? isLaunching,
+  void Function(bool)? setLaunching,
+}) async {
+  if (isLaunching?.call() == true) return;
+  setLaunching?.call(true);
+  try {
+    final p = conv.personaId != null ? store.persona(conv.personaId!) : null;
+    final api = store.api;
+    if (api == null) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未登录，无法语音通话')));
+      }
+      return;
+    }
+    if (p == null) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('当前会话没有人设，无法语音通话')));
+      }
+      return;
+    }
+    final micOk = await _ensureMicForCall(context);
+    if (!micOk || !context.mounted) return;
+    var hasFixed = false;
+    try {
+      final ready = await api.voiceRealtimeReady(convId: conv.id);
+      hasFixed = ready['has_fixed_voice'] == true;
+      if (!hasFixed) {
+        final assets = await api.listPersonaAssets(p.id, kind: 'voice');
+        hasFixed = assets.any((a) => a is Map && a['fixed'] == true);
+      }
+    } catch (e) {
+      if (context.mounted) _toastIfNeeded(context, e);
+      return;
+    }
+    if (!hasFixed) {
+      if (!context.mounted) return;
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('先固定音色'),
+          content: Text('语音通话需要先给「${p.display}」固定一条音色，固定后才能开始通话。'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('去固定')),
+          ],
+        ),
+      );
+      if (go != true || !context.mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => PersonaDrawPage(store: store, persona: p)),
+      );
+      if (!context.mounted) return;
+      try {
+        final ready2 = await api.voiceRealtimeReady(convId: conv.id);
+        hasFixed = ready2['has_fixed_voice'] == true;
+        if (!hasFixed) {
+          final assets = await api.listPersonaAssets(p.id, kind: 'voice');
+          hasFixed = assets.any((a) => a is Map && a['fixed'] == true);
+        }
+      } catch (e) {
+        if (context.mounted) _toastIfNeeded(context, e);
+        return;
+      }
+      if (!hasFixed) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('还没有固定音色，通话未开始')),
+          );
+        }
+        return;
+      }
+    }
+    if (!context.mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => RealtimeVoicePage(
+          store: store,
+          convId: conv.id,
+          peerName: p.display,
+          peerColor: p.color,
+          peerAvatarFileId: p.avatarFileId.isNotEmpty ? p.avatarFileId : null,
+        ),
+      ),
+    );
+  } finally {
+    setLaunching?.call(false);
+  }
+}
+
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key, required this.store, required this.conv});
   final AppStore store;
@@ -492,91 +586,13 @@ class _ChatPageState extends State<ChatPage> {
           await startListenTogether(context, store, convId: conv.id);
         case 'voice_call':
           setState(() => moreOpen = false);
-          if (_voiceLaunching) return;
-          _voiceLaunching = true;
-          try {
-          final p = conv.personaId != null ? store.persona(conv.personaId!) : null;
-          final api = store.api;
-          if (api == null) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('未登录，无法语音通话')));
-            }
-            return;
-          }
-          if (p == null) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('当前会话没有人设，无法语音通话')));
-            }
-            return;
-          }
-          // 先检查麦克风权限，没权限直接阻断
-          final micOk = await _ensureMicForCall(context);
-          if (!micOk || !mounted) return;
-          var hasFixed = false;
-          try {
-            final ready = await api.voiceRealtimeReady(convId: conv.id);
-            hasFixed = ready['has_fixed_voice'] == true;
-            if (!hasFixed) {
-              final assets = await api.listPersonaAssets(p.id, kind: 'voice');
-              hasFixed = assets.any((a) => a is Map && a['fixed'] == true);
-            }
-          } catch (e) {
-            if (mounted) _toastIfNeeded(context, e);
-            return;
-          }
-          if (!hasFixed) {
-            if (!mounted) return;
-            final go = await showDialog<bool>(
-              context: context,
-              builder: (ctx) => AlertDialog(
-                title: const Text('先固定音色'),
-                content: Text('语音通话需要先给「${p.display}」固定一条音色，固定后才能开始通话。'),
-                actions: [
-                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-                  TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('去固定')),
-                ],
-              ),
-            );
-            if (go != true || !mounted) return;
-            await Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => PersonaDrawPage(store: store, persona: p)),
-            );
-            if (!mounted) return;
-            try {
-              final ready2 = await api.voiceRealtimeReady(convId: conv.id);
-              hasFixed = ready2['has_fixed_voice'] == true;
-              if (!hasFixed) {
-                final assets = await api.listPersonaAssets(p.id, kind: 'voice');
-                hasFixed = assets.any((a) => a is Map && a['fixed'] == true);
-              }
-            } catch (e) {
-              if (mounted) _toastIfNeeded(context, e);
-              return;
-            }
-            if (!hasFixed) {
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('还没有固定音色，通话未开始')),
-                );
-              }
-              return;
-            }
-          }
-          if (!mounted) return;
-          await Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => RealtimeVoicePage(
-                store: store,
-                convId: conv.id,
-                peerName: p.display,
-                peerColor: p.color,
-                peerAvatarFileId: p.avatarFileId.isNotEmpty ? p.avatarFileId : null,
-              ),
-            ),
+          await launchRealtimeVoiceCall(
+            context,
+            store,
+            conv,
+            isLaunching: () => _voiceLaunching,
+            setLaunching: (v) => _voiceLaunching = v,
           );
-          } finally {
-            _voiceLaunching = false;
-          }
         case 'video_call':
           setState(() => moreOpen = false);
           final api = store.api;
@@ -3238,11 +3254,102 @@ class _LinkCardBody extends StatelessWidget {
     final status = meta['status']?.toString() ?? '';
     final isListen = meta['card']?.toString() == 'listen_invite';
     final isVoiceCall = meta['card']?.toString() == 'voice_call';
+    final isVoiceCallInvite = meta['card']?.toString() == 'voice_call_invite';
     final isPack = meta['card']?.toString() == 'sticker_pack_added';
     final isDeviceReq = meta['card']?.toString() == 'device_create_request';
     final isLoc = meta['card']?.toString() == 'location';
     final isFwd = meta['card']?.toString() == 'forward';
     final isOg = meta['card']?.toString() == 'og' || (meta['url'] != null && meta['job_id'] == null && status.isEmpty);
+
+    if (isVoiceCallInvite) {
+      final st = meta['status']?.toString() ?? 'ringing';
+      final body = (meta['body']?.toString() ?? '').trim().isNotEmpty
+          ? meta['body'].toString().trim()
+          : '邀请你语音通话';
+      final ringing = st == 'ringing' || st.isEmpty;
+      final declined = st == 'declined' || st == 'canceled' || st == 'missed';
+      return SizedBox(
+        width: 228,
+        child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1C2A3A),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: const Color(0xFF3A4A5C)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF07C160).withValues(alpha: 0.9),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.phone_in_talk_rounded, color: Colors.white, size: 20),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('语音通话', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+                        Text(
+                          declined ? '已拒绝' : (st == 'answered' ? '已接听' : body),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(color: Colors.white.withValues(alpha: 0.65), fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              if (ringing) ...[
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextButton(
+                        onPressed: () {
+                          final m = Map<String, dynamic>.from(msg.meta ?? const {});
+                          m['status'] = 'declined';
+                          m['body'] = '已拒绝';
+                          msg.meta = m;
+                          store?.ping();
+                        },
+                        style: TextButton.styleFrom(foregroundColor: const Color(0xFFAEAEB2)),
+                        child: const Text('拒绝'),
+                      ),
+                    ),
+                    Expanded(
+                      child: FilledButton(
+                        onPressed: () async {
+                          final s = store;
+                          final c = conv;
+                          if (s == null || c == null) return;
+                          final m = Map<String, dynamic>.from(msg.meta ?? const {});
+                          m['status'] = 'answered';
+                          m['body'] = '已接听';
+                          msg.meta = m;
+                          s.ping();
+                          await launchRealtimeVoiceCall(context, s, c);
+                        },
+                        style: FilledButton.styleFrom(backgroundColor: const Color(0xFF07C160)),
+                        child: const Text('接听'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+      );
+    }
 
     if (isVoiceCall) {
       // 微信样式：气泡内电话图标 + 文案（通话时长 / 语音通话 / 已取消）

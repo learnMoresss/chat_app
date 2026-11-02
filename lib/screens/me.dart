@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -293,6 +294,47 @@ class SettingsPage extends StatelessWidget {
                     store.splitSend = v;
                     store.ping();
                     store.saveShapePrefs();
+                  },
+                ),
+                ArrowTile(
+                  title: '表情触发频率',
+                  subtitle: store.stickerFreq == 'low'
+                      ? '低 · 偶尔配表情'
+                      : store.stickerFreq == 'medium'
+                          ? '中 · 气氛到了再发'
+                          : '高 · 默认，可较常发单张',
+                  onTap: () async {
+                    final next = await showModalBottomSheet<String>(
+                      context: context,
+                      builder: (ctx) => SafeArea(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const ListTile(
+                              title: Text('表情触发频率', style: TextStyle(fontWeight: FontWeight.w600)),
+                              subtitle: Text('日常只发单张；组图需对方明确要收集'),
+                            ),
+                            for (final e in const [
+                              ('high', '高（默认）', '气氛到了常发单张表情'),
+                              ('medium', '中', '偶尔配表情'),
+                              ('low', '低', '很少自动发表情'),
+                            ])
+                              ListTile(
+                                title: Text(e.$2),
+                                subtitle: Text(e.$3),
+                                trailing: store.stickerFreq == e.$1
+                                    ? const Icon(Icons.check, color: Color(0xFF07C160))
+                                    : null,
+                                onTap: () => Navigator.pop(ctx, e.$1),
+                              ),
+                          ],
+                        ),
+                      ),
+                    );
+                    if (next == null || next == store.stickerFreq) return;
+                    store.stickerFreq = next;
+                    store.ping();
+                    unawaited(store.saveShapePrefs());
                   },
                 ),
                 _WxSwitch(

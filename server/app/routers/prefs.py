@@ -22,6 +22,8 @@ class PrefsOut(BaseModel):
     memory_inject: bool = True
     pause_proactive: bool = False
     pause_memory_extract: bool = False
+    # 表情触发频率：high / medium / low（默认 high）
+    sticker_freq: str = "high"
 
 
 class PrefsIn(BaseModel):
@@ -34,6 +36,7 @@ class PrefsIn(BaseModel):
     memory_inject: Optional[bool] = None
     pause_proactive: Optional[bool] = None
     pause_memory_extract: Optional[bool] = None
+    sticker_freq: Optional[str] = None
 
 
 def _prefs_row(user_id: str):
@@ -54,6 +57,15 @@ def _flag(row, key: str, default: bool = False) -> bool:
         return default
 
 
+def _norm_sticker_freq(raw: Any) -> str:
+    v = str(raw or "high").strip().lower()
+    if v in ("low", "低"):
+        return "low"
+    if v in ("medium", "mid", "中", "中等"):
+        return "medium"
+    return "high"
+
+
 def _out(row) -> PrefsOut:
     if row is None:
         return PrefsOut()
@@ -63,6 +75,7 @@ def _out(row) -> PrefsOut:
     quiet_start, quiet_end = "23:00", "08:00"
     quiet_blocks = False
     mem_inject = True
+    sticker_freq = "high"
     try:
         shape = bool(row["shape_enabled"]) if "shape_enabled" in row.keys() else True
         split = bool(row["split_send"]) if "split_send" in row.keys() else True
@@ -76,6 +89,8 @@ def _out(row) -> PrefsOut:
         if "memory_inject" in row.keys():
             memory_raw = row["memory_inject"]
             mem_inject = True if memory_raw is None else bool(int(memory_raw))
+        if "sticker_freq" in row.keys() and row["sticker_freq"]:
+            sticker_freq = _norm_sticker_freq(row["sticker_freq"])
     except (KeyError, IndexError, TypeError, ValueError):
         pass
     return PrefsOut(
@@ -89,7 +104,13 @@ def _out(row) -> PrefsOut:
         memory_inject=mem_inject,
         pause_proactive=_flag(row, "pause_proactive", False),
         pause_memory_extract=_flag(row, "pause_memory_extract", False),
+        sticker_freq=sticker_freq,
     )
+
+
+def get_sticker_freq(user_id: str) -> str:
+    """表情触发频率档位，默认 high。"""
+    return _out(_prefs_row(user_id)).sticker_freq
 
 
 def get_shape_flags(user_id: str) -> tuple[bool, bool]:
@@ -152,6 +173,11 @@ def put_prefs(body: PrefsIn, user: Dict[str, Any] = Depends(current_user)) -> Pr
     mem_inject = cur.memory_inject if body.memory_inject is None else body.memory_inject
     pause_pro = cur.pause_proactive if body.pause_proactive is None else body.pause_proactive
     pause_ext = cur.pause_memory_extract if body.pause_memory_extract is None else body.pause_memory_extract
+    sticker_freq = (
+        cur.sticker_freq
+        if body.sticker_freq is None
+        else _norm_sticker_freq(body.sticker_freq)
+    )
     active = pid if body.active_persona_id is not None else cur.active_persona_id
     if row is None:
         db.execute(
@@ -159,8 +185,8 @@ def put_prefs(body: PrefsIn, user: Dict[str, Any] = Depends(current_user)) -> Pr
             INSERT INTO user_prefs(
               user_id, active_persona_id, updated_at, shape_enabled, split_send, echo_streak,
               quiet_start, quiet_end, quiet_blocks_chat, memory_inject,
-              pause_proactive, pause_memory_extract
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+              pause_proactive, pause_memory_extract, sticker_freq
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["id"],
@@ -174,6 +200,7 @@ def put_prefs(body: PrefsIn, user: Dict[str, Any] = Depends(current_user)) -> Pr
                 1 if mem_inject else 0,
                 1 if pause_pro else 0,
                 1 if pause_ext else 0,
+                sticker_freq,
             ),
         )
     else:
@@ -182,7 +209,7 @@ def put_prefs(body: PrefsIn, user: Dict[str, Any] = Depends(current_user)) -> Pr
             UPDATE user_prefs
             SET active_persona_id = ?, updated_at = ?, shape_enabled = ?, split_send = ?,
                 quiet_start = ?, quiet_end = ?, quiet_blocks_chat = ?, memory_inject = ?,
-                pause_proactive = ?, pause_memory_extract = ?
+                pause_proactive = ?, pause_memory_extract = ?, sticker_freq = ?
             WHERE user_id = ?
             """,
             (
@@ -196,6 +223,7 @@ def put_prefs(body: PrefsIn, user: Dict[str, Any] = Depends(current_user)) -> Pr
                 1 if mem_inject else 0,
                 1 if pause_pro else 0,
                 1 if pause_ext else 0,
+                sticker_freq,
                 user["id"],
             ),
         )
