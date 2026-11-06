@@ -65,10 +65,6 @@
             name: Qwen3.8 Flash Next
             contextWindow: 262144
             maxTokens: 2048
-          - id: qwen3.8-27b
-            name: Qwen3.8-27B
-            contextWindow: 131072
-            maxTokens: 2048
 
 # 闲聊人设：产品提示会再覆盖；此处避免 coding-agent 默认腔
 - id: system-prompt
